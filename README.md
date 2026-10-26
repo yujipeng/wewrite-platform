@@ -82,6 +82,12 @@ docker-compose run --rm -v wewrite_home:/data -v "$PWD":/backup alpine tar czf /
 
 （无 alpine 镜像时可用 `docker cp` 从运行中的 workbench 容器拷贝 `/data/wewrite`。）
 
+### 可复现构建与镜像体积基线
+
+- 依赖**全部锁定**在仓库根 `requirements.lock`（`uv pip compile pyproject.toml -o requirements.lock --python-version 3.11` 产物，含全部传递依赖精确版本）；Dockerfile 先按锁定文件安装、再 `--no-deps` 装本项目，重建镜像的 `pip freeze` 输出完全一致。
+- **镜像体积基线**：`wewrite-platform_workbench:latest` 实测 **317 MB**（`python:3.11-slim` + 锁定依赖 + 本项目）。体积回退以该基线判断；若无体积硬约束，此项只记基线不做优化。
+- **SBOM / 许可证清单**见 `docs/sbom-licenses.md`：29 个运行依赖无 GPL/AGPL 强 copyleft，2 个 LGPL 依赖（`cssutils`/`encutils`，`wewrite` 传递引入）留裁决项。
+
 ## 发布与安全口径
 
 - `permissions.publish` 默认 `false`，只读默认值，不通过全局配置开启任何 run 的发布权限；`mode=publish` 一律 403。

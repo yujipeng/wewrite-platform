@@ -66,6 +66,32 @@ const STEP_STATUS_TEXT = {
   skipped: "已跳过",
 };
 
+// P6 生成进度常量与轮询句柄（必须声明在 render() 首次调用之前，否则冷启动
+// 直达 #/jobs/{id} 会命中 TDZ，抛 Cannot access '_jobPollTimer' before initialization）。
+const JOB_STATUS_TEXT = {
+  queued: "排队中",
+  running: "进行中",
+  succeeded: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  unknown: "结果未知",
+};
+const STEP_ORDER = ["topic", "write", "review", "visual"];
+const IMAGE_STATUS_TEXT = {
+  pending: "排队中",
+  running: "生成中",
+  succeeded: "已完成",
+  failed: "失败",
+};
+let _jobPollTimer = null;
+
+function stopJobPolling() {
+  if (_jobPollTimer) {
+    clearInterval(_jobPollTimer);
+    _jobPollTimer = null;
+  }
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   if (!res.ok) {
@@ -86,6 +112,12 @@ async function api(path, opts = {}) {
 
 function currentRoute() {
   const hash = location.hash || "#/";
+  // #/jobs/{job_id}
+  const jm = hash.match(/^#\/jobs\/([a-z0-9-]+)$/);
+  if (jm) return { page: "job", jobId: jm[1] };
+  // #/runs/{run_id}/job
+  const rjm = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})\/job$/);
+  if (rjm) return { page: "runJob", runId: rjm[1] };
   // #/runs/{run_id}
   const m = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})$/);
   if (m) return { page: "detail", runId: m[1] };
@@ -100,9 +132,13 @@ function currentRoute() {
 
 async function render() {
   const route = currentRoute();
+  // 离开 P6 时先停掉 job 轮询，否则 setInterval 会把整页反复画回 job 页（导航锁死）。
+  if (route.page !== "job" && route.page !== "runJob") {
+    stopJobPolling();
+  }
   document.querySelectorAll(".nav-link").forEach((n) => {
     const active =
-      (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview")) ||
+      (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview" || route.page === "job" || route.page === "runJob")) ||
       (n.dataset.nav === "hotspots" && route.page === "hotspots") ||
       (n.dataset.nav === "candidates" && route.page === "candidates") ||
       (n.dataset.nav === "config" && route.page === "config");
@@ -120,6 +156,10 @@ async function render() {
     await renderCandidates();
   } else if (route.page === "config") {
     await renderConfig();
+  } else if (route.page === "job") {
+    await renderJob(route.jobId);
+  } else if (route.page === "runJob") {
+    await renderRunJob(route.runId);
   }
 }
 
@@ -134,8 +174,11 @@ async function renderHome() {
     placeholder: "按题名或 run_id 搜索…",
   });
 
+  // 新建任务入口（跳 P4 每日热榜开始选题，不建空 run）
+  const newTaskBtn = el("a", { class: "btn", href: "#/hotspots", text: "新建任务" });
+
   const container = el("div");
-  app.appendChild(search);
+  app.appendChild(el("div", { class: "preview-controls" }, [search, newTaskBtn]));
   app.appendChild(container);
 
   container.appendChild(loadingState("正在加载任务列表…"));
@@ -275,7 +318,48 @@ function detailBody(d) {
     text: "预览产物",
   });
 
-  const sections = [title, kv, previewBtn];
+  // 生成进度入口（存在 job 时提供）
+  const jobLink = el("a", {
+    class: "btn",
+    href: "#/runs/" + d.run_id + "/job",
+    text: "生成进度",
+  });
+
+  const sections = [title, kv, el("div", { class: "preview-controls" }, [previewBtn, jobLink])];
+
+  // P2-F5：失败/取消/未知任务的重试入口
+  if (status === "failed" || status === "cancelled" || status === "unknown") {
+    const retryBtn = el("button", {
+      class: "btn",
+      text: "重试",
+      onclick: async () => {
+        try {
+          const jobs = await api("/api/v1/jobs?run_id=" + encodeURIComponent(d.run_id));
+          const candidates = (jobs.jobs || []).filter((j) => ["failed", "cancelled", "unknown"].indexOf(j.status) >= 0);
+          if (candidates.length === 0) {
+            window.alert("未找到可重试的生成任务");
+            return;
+          }
+          const job = candidates[0];
+          const token = await csrfToken();
+          const res = await fetch(`/api/v1/jobs/${job.job_id}/resume`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+            body: JSON.stringify({}),
+          });
+          if (!res.ok) {
+            let code = "HTTP_" + res.status, message = res.statusText;
+            try { const b = await res.json(); code = b.code || code; message = b.message || message; } catch (_) {}
+            throw Object.assign(new Error(message), { code, status: res.status });
+          }
+          location.hash = "#/runs/" + d.run_id + "/job";
+        } catch (err) {
+          window.alert("重试失败：" + (err.code || err.message));
+        }
+      },
+    });
+    sections.push(el("div", { class: "preview-controls" }, [retryBtn]));
+  }
 
   // 选题
   const topic = d.topic || {};
@@ -512,8 +596,48 @@ async function renderHotspots() {
   actions.appendChild(hint);
   app.appendChild(actions);
 
+  // P4-F3：历史快照浏览（日期选择器，仅最近 30 天）
+  const dateRow = el("div", { class: "preview-controls" });
+  const dateSelect = el("select");
+  dateSelect.appendChild(el("option", { value: "", text: "加载历史日期…" }));
+  const genCandidatesLink = el("a", { class: "btn", href: "#/candidates", text: "生成候选" });
+  dateRow.appendChild(el("span", { class: "muted", text: "历史快照（30 天内）" }));
+  dateRow.appendChild(dateSelect);
+  dateRow.appendChild(genCandidatesLink);
+  app.appendChild(dateRow);
+
   const container = el("div");
   app.appendChild(container);
+
+  const loadDates = async () => {
+    try {
+      const body = await api("/api/v1/hotspot-snapshots");
+      const dates = body.dates || [];
+      dateSelect.innerHTML = "";
+      dateSelect.appendChild(el("option", { value: "", text: "今日（默认）" }));
+      for (const d of dates.slice().reverse()) {
+        dateSelect.appendChild(el("option", { value: d, text: d }));
+      }
+      if (dates.length) dateSelect.value = dates[dates.length - 1];
+    } catch (err) {
+      dateSelect.innerHTML = "";
+      dateSelect.appendChild(el("option", { value: "", text: "历史日期加载失败" }));
+    }
+  };
+  const loadDate = async (date) => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在读取 " + (date || "今日") + " 热榜…"));
+    try {
+      const body = date ? await api("/api/v1/hotspots/" + date) : await api("/api/v1/hotspots");
+      if ((body.items || []).length === 0) { drawEmpty(); } else { drawList(body); }
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.status === 404) container.appendChild(emptyState("该日期没有快照"));
+      else if (err.status === 403) container.appendChild(forbiddenState());
+      else container.appendChild(errorState("加载失败：" + (err.code || err.message), () => loadDate(date)));
+    }
+  };
+  dateSelect.addEventListener("change", () => loadDate(dateSelect.value));
 
   const drawEmpty = () => { container.innerHTML = ""; container.appendChild(emptyState("还没有热榜快照，点「补抓并保存今日快照」或「立即刷新」获取数据")); };
   const drawList = (body) => {
@@ -611,6 +735,7 @@ async function renderHotspots() {
   refreshBtn.addEventListener("click", doRefresh);
   persistBtn.addEventListener("click", doPersist);
 
+  await loadDates();
   await loadSaved();
 }
 
@@ -641,23 +766,29 @@ async function renderCandidates() {
   ]));
 
   const actions = el("div", { class: "preview-controls" });
-  const dateInput = el("input", { type: "date", value: todayLocal(), style: "padding:6px 10px;border:1px solid var(--border);border-radius:6px" });
+  const dateInput = el("input", { type: "date", value: "", style: "padding:6px 10px;border:1px solid var(--border);border-radius:6px" });
   const genBtn = el("button", { class: "btn", text: "生成候选" });
   const forceBtn = el("button", { class: "btn", text: "强制重开候选集" });
+  const compareBtn = el("button", { class: "btn", text: "并排对比（最多 3 条）" });
   const hint = el("span", { class: "muted", text: "相同快照与风格会自动复用既有候选集" });
   actions.appendChild(dateInput);
   actions.appendChild(genBtn);
   actions.appendChild(forceBtn);
+  actions.appendChild(compareBtn);
   actions.appendChild(hint);
   app.appendChild(actions);
 
   const container = el("div");
   app.appendChild(container);
 
-  // 生成候选按钮禁用条件：当日快照全源失败（error 非空 / count==0 / items 空）
+  // P5-F2：勾选最多 3 条候选并排对比
+  const selectedIds = new Set();
+
+  // 默认日期取服务端返回的当日快照 date（避免浏览器本地时区与 Asia/Shanghai 不一致）
   async function refreshGenerateDisabled() {
     try {
       const snap = await api("/api/v1/hotspots");
+      if (snap.date && !dateInput.value) dateInput.value = snap.date;
       const allFailed = !!(snap.error) || (snap.count || 0) === 0 || !(snap.items || []).length;
       const disabled = allFailed || !snap.date;
       genBtn.disabled = disabled;
@@ -715,6 +846,21 @@ async function renderCandidates() {
     const badges = el("div", { class: "artifact-badges" }, [
       el("span", { class: "badge " + badgeClass(it.status), text: CANDIDATE_STATUS_TEXT[it.status] || it.status }),
     ]);
+    // P5-F2 勾选对比（最多 3 条）
+    const compareCb = el("input", { type: "checkbox", title: "加入对比（最多 3 条）" });
+    compareCb.checked = selectedIds.has(it.id);
+    compareCb.addEventListener("change", () => {
+      if (compareCb.checked) {
+        if (selectedIds.size >= 3) {
+          compareCb.checked = false;
+          window.alert("最多并排对比 3 条候选");
+          return;
+        }
+        selectedIds.add(it.id);
+      } else {
+        selectedIds.delete(it.id);
+      }
+    });
     const card = el("div", { class: "card candidate-card" }, [
       el("div", { class: "run-title", text: it.title }),
       el("div", { class: "muted", text: "角度：" + (it.angle || "—") }),
@@ -727,7 +873,9 @@ async function renderCandidates() {
       ]),
       el("div", { class: "muted", text: "评分来源：规则生成（非 AI 评估）" }),
       badges,
+      el("label", { class: "muted", text: "" }, [compareCb, " 加入对比"]),
     ]);
+    card.dataset.candidateId = it.id;
 
     const btnRow = el("div", { class: "preview-controls" });
     if (it.status === "proposed" && set.set_status === "open") {
@@ -836,7 +984,7 @@ async function renderCandidates() {
       const res = await fetch("/api/v1/candidates", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
-        body: JSON.stringify({ date: dateInput.value || todayLocal(), style_revision: "sha256:web-default", force }),
+        body: JSON.stringify({ date: dateInput.value, style_revision: "sha256:web-default", force }),
       });
       if (!res.ok) {
         let code = "HTTP_" + res.status; let message = res.statusText;
@@ -844,6 +992,7 @@ async function renderCandidates() {
         const err = new Error(message); err.code = code; err.status = res.status; throw err;
       }
       const body = await res.json();
+      selectedIds.clear();
       drawSet(body);
     } catch (err) {
       container.innerHTML = "";
@@ -851,18 +1000,46 @@ async function renderCandidates() {
     }
   };
 
+  const doCompare = () => {
+    if (selectedIds.size === 0) {
+      window.alert("请先勾选 1–3 条候选进行对比");
+      return;
+    }
+    if (selectedIds.size > 3) {
+      window.alert("最多并排对比 3 条候选");
+      return;
+    }
+    // 从当前候选集中取勾选项
+    let picked = [];
+    const cards = container.querySelectorAll(".candidate-card");
+    for (const card of cards) {
+      if (selectedIds.has(card.dataset.candidateId)) picked.push(card);
+    }
+    if (picked.length === 0) {
+      window.alert("未找到已勾选的候选，请重新勾选");
+      return;
+    }
+    const modal = el("div", { class: "modal-backdrop" }, [
+      el("div", { class: "modal card", style: "width:min(920px,95vw)" }, [
+        el("h3", { text: "候选对比（" + picked.length + " 条）" }),
+        el("div", { class: "compare-grid" }, picked.map((card) => {
+          const clone = card.cloneNode(true);
+          // 对比视图里去掉按钮行与勾选框，避免误操作
+          clone.querySelectorAll("button, input").forEach((n) => n.remove());
+          return clone;
+        })),
+        el("button", { class: "btn", text: "关闭", onclick: () => { modal.remove(); } }),
+      ]),
+    ]);
+    app.appendChild(modal);
+  };
+
   genBtn.addEventListener("click", () => doGenerate(false));
   forceBtn.addEventListener("click", () => doGenerate(true));
+  compareBtn.addEventListener("click", doCompare);
 
   await refreshGenerateDisabled();
   await load();
-}
-
-function todayLocal() {
-  const d = new Date();
-  const off = d.getTimezoneOffset();
-  const local = new Date(d.getTime() - off * 60000);
-  return local.toISOString().slice(0, 10);
 }
 
 // ============ M4：P8 配置 + P7 发布闸门（页面） ============
@@ -945,6 +1122,72 @@ async function renderConfig() {
       result.classList.add("error-block");
     }
   });
+
+  // ---------- P8-F3 写作风格 ----------
+  container.appendChild(el("div", { class: "section-title", text: "写作风格（style.yaml）" }));
+
+  // 四步 onboarding：缺 style.yaml（仅 version 无风格字段）时按定位→方向→语气→主题引导
+  const styleFields = [
+    ["name", "风格名称", "text"],
+    ["industry", "行业", "text"],
+    ["target_audience", "目标受众", "text"],
+    ["topics", "话题（逗号分隔）", "text"],
+    ["tone", "语气", "text"],
+    ["voice", "声音", "text"],
+    ["word_count", "字数", "number"],
+    ["content_style", "内容风格", "text"],
+    ["writing_persona", "写作人格", "text"],
+    ["theme", "写作主题", "text"],
+    ["blacklist", "黑名单（逗号分隔）", "text"],
+    ["cover_style", "封面风格", "text"],
+    ["author", "署名作者", "text"],
+  ];
+  const styleInputs = {};
+  const styleKvRows = [];
+  for (const [key, label, type] of styleFields) {
+    let value = style[key];
+    if (Array.isArray(value)) value = value.join("，");
+    const input = el("input", { type, value: value == null ? "" : String(value), placeholder: label });
+    styleInputs[key] = input;
+    styleKvRows.push([label, input]);
+  }
+  container.appendChild(kvForm(styleKvRows));
+
+  const styleSaveBtn = el("button", { class: "btn", text: "保存写作风格" });
+  const styleResult = el("div", { class: "muted", text: "" });
+  container.appendChild(el("div", { class: "preview-controls" }, [styleSaveBtn, styleResult]));
+
+  styleSaveBtn.addEventListener("click", async () => {
+    const body = {};
+    for (const [key, _label, type] of styleFields) {
+      const raw = styleInputs[key].value;
+      if (key === "topics" || key === "blacklist") {
+        body[key] = raw ? raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : [];
+      } else if (key === "word_count") {
+        body[key] = raw ? parseInt(raw, 10) : undefined;
+      } else {
+        body[key] = raw || "";
+      }
+    }
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/style", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status, message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      styleResult.textContent = "已保存";
+      setTimeout(renderConfig, 400);
+    } catch (err) {
+      styleResult.textContent = "保存失败：" + (err.code || err.message);
+      styleResult.classList.add("error-block");
+    }
+  });
 }
 
 function kvForm(rows) {
@@ -968,9 +1211,41 @@ function renderPublishGate(runId, detail) {
   const authorizeBtn = el("button", { class: "btn", text: perm ? "撤销发布授权" : "开启发布授权" });
   const preflightBox = el("div", { class: "muted", text: "尚未预检" });
   const submitBox = el("div");
-  section.appendChild(el("div", { class: "preview-controls" }, [authorizeBtn]));
+  // P7-F4：手动「核对草稿箱」（仅只读 get_draft，不自动轮询、不重发）
+  const reconcileBtn = el("button", { class: "btn", text: "核对草稿箱" });
+  const reconcileBox = el("div", { class: "muted" });
+  section.appendChild(el("div", { class: "preview-controls" }, [authorizeBtn, reconcileBtn]));
   section.appendChild(preflightBox);
   section.appendChild(submitBox);
+  section.appendChild(reconcileBox);
+
+  reconcileBtn.addEventListener("click", async () => {
+    const mediaId = window.prompt("请输入要核对的 media_id（留空则用任务已记录的 media_id）", (detail.publish && detail.publish.media_id) || "");
+    if (mediaId === null) return; // 用户取消
+    try {
+      const token = await csrfToken();
+      const body = mediaId.trim() ? { media_id: mediaId.trim() } : {};
+      const res = await fetch(`/api/v1/runs/${runId}/publish/reconcile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status, message = res.statusText;
+        try { const b = await res.json(); code = b.code || code; message = b.message || message; } catch (_) {}
+        throw Object.assign(new Error(message), { code, status: res.status });
+      }
+      const rb = await res.json();
+      if (rb.status === "manual_review") {
+        reconcileBox.textContent = rb.note;
+      } else {
+        reconcileBox.textContent = "核对结果：" + (rb.consistent ? "文本一致" : "文本不一致") + "（" + rb.note + "）";
+      }
+    } catch (err) {
+      reconcileBox.textContent = "核对失败：" + (err.code || err.message);
+      reconcileBox.classList.add("error-block");
+    }
+  });
 
   authorizeBtn.addEventListener("click", async () => {
     try {
@@ -1058,4 +1333,220 @@ function renderPublishGate(runId, detail) {
   setTimeout(() => clearInterval(poll), 10000);
 
   return section;
+}
+
+// ============ M4：P6 生成进行中（job 进度 / 逐图状态 / 取消 / 重试） ============
+
+// 由 run_id 找到最近一个 job 再渲染（P6 页面入口 #/runs/{run_id}/job）
+async function renderRunJob(runId) {
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
+  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+
+  const container = el("div");
+  app.appendChild(container);
+  container.appendChild(loadingState("正在定位生成任务…"));
+
+  let jobs = [];
+  try {
+    const body = await api("/api/v1/jobs?run_id=" + encodeURIComponent(runId));
+    jobs = body.jobs || [];
+  } catch (err) {
+    container.innerHTML = "";
+    if (err.status === 403) container.appendChild(forbiddenState());
+    else container.appendChild(errorState("加载生成任务失败：" + (err.code || err.message), () => renderRunJob(runId)));
+    return;
+  }
+
+  if (jobs.length === 0) {
+    container.innerHTML = "";
+    container.appendChild(emptyState("该任务还没有生成记录，去「选题确认」发起生成"));
+    return;
+  }
+  // 取最近一个 job（列表按 job_id 排序，取末个）
+  const job = jobs[jobs.length - 1];
+  renderJobBody(job, runId);
+}
+
+async function renderJob(jobId) {
+  stopJobPolling();
+  app.innerHTML = "";
+  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+
+  const container = el("div");
+  app.appendChild(container);
+  container.appendChild(loadingState("正在加载生成任务…"));
+
+  let job;
+  try {
+    job = await api("/api/v1/jobs/" + jobId);
+  } catch (err) {
+    container.innerHTML = "";
+    if (err.status === 403) container.appendChild(forbiddenState());
+    else if (err.status === 404) container.appendChild(errorState("生成任务不存在或已被移除", () => renderHome()));
+    else container.appendChild(errorState("加载失败：" + (err.code || err.message), () => renderJob(jobId)));
+    return;
+  }
+
+  container.innerHTML = "";
+  renderJobBody(job, job.run_id);
+}
+
+function renderJobBody(job, runId) {
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
+  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+
+  const status = job.status || "unknown";
+  const meta = el("div", { class: "muted", text: "job_id：" + job.job_id + " · 状态：" + (JOB_STATUS_TEXT[status] || status) + " · 尝试次数：" + (job.attempt || 1) + " · 更新时间：" + (job.updated_at || "—") });
+  app.appendChild(meta);
+
+  // stepper（topic/write/review/visual）
+  const stepper = el("div", { class: "stepper" });
+  const currentStep = job.step || "topic";
+  const stepDone = status === "succeeded";
+  for (const s of STEP_ORDER) {
+    let cls = "step";
+    if (stepDone) cls += " done";
+    else if (STEP_ORDER.indexOf(s) < STEP_ORDER.indexOf(currentStep)) cls += " done";
+    else if (s === currentStep && status === "running") cls += " active";
+    else if (s === currentStep && status === "failed") cls += " failed";
+    stepper.appendChild(el("div", { class: cls, text: STEP_LABELS[s] }));
+  }
+  app.appendChild(stepper);
+
+  // 进度（不伪造百分比，批处理中语义）
+  const progress = job.progress || {};
+  const progressText = progress.kind === "step"
+    ? "步骤 " + (progress.completed || 0) + "/" + (progress.total || 4)
+    : "批处理中";
+  app.appendChild(el("div", { class: "muted", text: "进度：" + progressText }));
+
+  // 失败去向
+  if (job.last_error) {
+    app.appendChild(el("div", { class: "error-block", text: "最后错误：" + (job.last_error.code || "") + " " + (job.last_error.message || "") }));
+  }
+
+  // 逐图状态与缩略图
+  const images = job.images || [];
+  if (images.length) {
+    app.appendChild(el("div", { class: "section-title", text: "配图状态" }));
+    const grid = el("div", { class: "image-grid" });
+    for (const img of images) {
+      const st = img.status || "pending";
+      const cell = el("div", { class: "card image-cell" }, [
+        el("div", { class: "muted", text: "图 " + (img.index + 1) + "：" + (IMAGE_STATUS_TEXT[st] || st) }),
+      ]);
+      if (st === "succeeded") {
+        const thumb = el("img", {
+          class: "image-thumb",
+          src: "/api/v1/runs/" + encodeURIComponent(runId) + "/images/" + (img.index || 0) + ".png",
+          alt: "图 " + (img.index + 1),
+          loading: "lazy",
+        });
+        thumb.addEventListener("error", () => { thumb.style.display = "none"; });
+        cell.appendChild(thumb);
+      } else if (st === "failed") {
+        cell.appendChild(el("div", { class: "step-error", text: img.error ? ("错误：" + img.error) : "生成失败" }));
+        if (!img.retried) {
+          const retryBtn = el("button", { class: "btn", text: "重试失败图", onclick: async () => {
+            try {
+              const token = await csrfToken();
+              const res = await fetch(`/api/v1/jobs/${job.job_id}/images/retry`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+                body: JSON.stringify({ indices: [img.index] }),
+              });
+              if (!res.ok) {
+                let code = "HTTP_" + res.status, message = res.statusText;
+                try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+                throw Object.assign(new Error(message), { code, status: res.status });
+              }
+              refreshJobView();
+            } catch (err) {
+              window.alert("重试失败图失败：" + (err.code || err.message));
+            }
+          } });
+          cell.appendChild(retryBtn);
+        } else {
+          cell.appendChild(el("div", { class: "muted", text: "已重试一次" }));
+        }
+      }
+      grid.appendChild(cell);
+    }
+    app.appendChild(grid);
+  }
+
+  // 取消（仅运行中/排队中）
+  if (status === "running" || status === "queued") {
+    const cancelBtn = el("button", { class: "btn", text: "取消生成", onclick: async () => {
+      if (!window.confirm("取消请求会记录，并在安全边界停止后续步骤；在途外部调用可能继续产生费用。确认取消？")) return;
+      try {
+        const token = await csrfToken();
+        const res = await fetch(`/api/v1/jobs/${job.job_id}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+          let code = "HTTP_" + res.status, message = res.statusText;
+          try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+          throw Object.assign(new Error(message), { code, status: res.status });
+        }
+        window.alert("取消请求已记录，等待安全边界");
+        refreshJobView();
+      } catch (err) {
+        window.alert("取消失败：" + (err.code || err.message));
+      }
+    } });
+    app.appendChild(el("div", { class: "preview-controls" }, [cancelBtn]));
+  }
+
+  // 失败/取消/未知可重试
+  if (status === "failed" || status === "cancelled" || status === "unknown") {
+    const resumeBtn = el("button", { class: "btn", text: "重试生成", onclick: async () => {
+      try {
+        const token = await csrfToken();
+        const res = await fetch(`/api/v1/jobs/${job.job_id}/resume`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+          let code = "HTTP_" + res.status, message = res.statusText;
+          try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+          throw Object.assign(new Error(message), { code, status: res.status });
+        }
+        refreshJobView();
+      } catch (err) {
+        window.alert("重试失败：" + (err.code || err.message));
+      }
+    } });
+    app.appendChild(el("div", { class: "preview-controls" }, [resumeBtn]));
+  }
+
+  // 完成/失败后去向
+  const nav = el("div", { class: "preview-controls" });
+  nav.appendChild(el("a", { class: "btn", href: "#/runs/" + runId, text: "查看任务详情" }));
+  if (status === "succeeded") {
+    nav.appendChild(el("a", { class: "btn", href: "#/runs/" + runId, text: "前往发布确认" }));
+  }
+  app.appendChild(nav);
+
+  // 立即刷新视图（按钮动作后调用）
+  const refreshJobView = () => renderJob(job.job_id);
+
+  // 非终态启动轮询。回调里先校验当前路由仍是 job 页，否则停表——防止
+  // render() 已被 hashchange 调去画别的页面时，本 timer 又把整页盖回 job 页。
+  if (["succeeded", "failed", "cancelled", "unknown"].indexOf(status) < 0) {
+    stopJobPolling();
+    _jobPollTimer = setInterval(() => {
+      const r = currentRoute();
+      if (r.page !== "job" && r.page !== "runJob") {
+        stopJobPolling();
+        return;
+      }
+      renderJob(job.job_id);
+    }, 1500);
+  }
 }

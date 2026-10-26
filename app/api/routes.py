@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -84,6 +85,34 @@ async def get_run(run_id: str, request: Request):
     if detail is None:
         return _error_response(errors.not_found())
     return detail
+
+
+_IMAGE_FILENAME_RE = re.compile(r"^(?:cover|\d{1,3})\.png$")
+
+
+@router.get("/api/v1/runs/{run_id}/images/{filename}")
+async def get_run_image(run_id: str, filename: str):
+    """读取 run 目录下 images/ 的封面或序号图（P6 逐图缩略图用）。
+
+    只允许 ``images/cover.png`` 或 ``images/<n>.png``（n 为 0–999），复用
+    ``safe_read_run_relative`` 的逐级 openat + O_NOFOLLOW 防线，缺失返回 404。
+    """
+    from fastapi.responses import Response
+
+    try:
+        paths.validate_run_id(run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    if not isinstance(filename, str) or not _IMAGE_FILENAME_RE.fullmatch(filename):
+        return _error_response(errors.validation_error("图片文件名不合法", {"field": "filename"}))
+    rel = f"images/{filename}"
+    try:
+        data = paths.safe_read_run_relative(_home(), run_id, rel)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    if data is None:
+        return _error_response(errors.not_found({"reason": "image_not_found"}))
+    return Response(content=data, media_type="image/png")
 
 
 @router.get("/api/v1/runs/{run_id}/artifact/{name}")
@@ -423,6 +452,23 @@ async def retract_candidate(candidate_set_id: str, request: Request):
     except errors.ApiError as exc:
         return _error_response(exc)
     return result
+
+
+@router.get("/api/v1/jobs")
+async def list_jobs(run_id: str | None = None):
+    """按 run_id 过滤列出 job（供 P2 详情页定位重试/进度入口）。"""
+    try:
+        store = jobs.JobStore(_home())
+        all_jobs = store.list_jobs()
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    if run_id is not None:
+        try:
+            paths.validate_run_id(run_id)
+        except errors.ApiError as exc:
+            return _error_response(exc)
+        all_jobs = [j for j in all_jobs if j.get("run_id") == run_id]
+    return {"jobs": all_jobs}
 
 
 @router.get("/api/v1/jobs/{job_id}")

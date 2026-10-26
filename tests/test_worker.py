@@ -208,3 +208,36 @@ def test_job_retry_images_once_only(tmp_path):
         assert False, "应拒绝二次重试"
     except Exception as exc:
         assert exc.code == "CONFLICT"
+
+
+# ---------- GET /api/v1/jobs?run_id= ----------
+
+def test_list_jobs_by_run_id(monkeypatch, tmp_path):
+    """P2 重试/P6 进度入口依赖：按 run_id 过滤 job 列表。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("WEWRITE_HOME", home)
+    monkeypatch.setenv("WEWRITE_PLATFORM_NO_WORKER", "1")
+    app = create_app()
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c.headers.update({"host": "127.0.0.1:8765"})
+
+    r = c.get("/api/v1/jobs?run_id=" + run_id)
+    assert r.status_code == 200
+    jobs = r.json()["jobs"]
+    assert [j["job_id"] for j in jobs] == ["j-test000001"]
+
+    # 无关 run_id → 空
+    r = c.get("/api/v1/jobs?run_id=20261026-010101-000000")
+    assert r.status_code == 200
+    assert r.json()["jobs"] == []
+
+    # 非法 run_id → 400
+    r = c.get("/api/v1/jobs?run_id=not-a-valid-id")
+    assert r.status_code == 400
+    assert r.json()["code"] == "RUN_ID_INVALID"

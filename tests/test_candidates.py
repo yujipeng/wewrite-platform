@@ -307,6 +307,28 @@ def test_generate_all_failed_rejected_no_write(tmp_path, monkeypatch):
     assert not os.path.exists(cand_dir) or not os.listdir(cand_dir)
 
 
+def test_generate_insufficient_items_distinct_reason(tmp_path, monkeypatch):
+    """快照正常但条目不足 10 条：reason=insufficient_items，与全源失败区分。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot()
+    snap["items"] = snap["items"][:1]  # 仅 1 条可用
+    snap["count"] = 1
+    snap["error"] = None
+    write_snapshot(home, "2026-10-26", snap)
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    assert r.json()["details"]["reason"] == "insufficient_items"
+    # candidates/ 不新增文件
+    cand_dir = os.path.join(home, "candidates")
+    assert not os.path.exists(cand_dir) or not os.listdir(cand_dir)
+
+
 def test_candidate_get_by_id(tmp_path, monkeypatch):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)

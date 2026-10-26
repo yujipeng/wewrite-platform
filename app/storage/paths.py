@@ -57,47 +57,63 @@ def validate_run_id(run_id: str) -> str:
 
 @dataclass(frozen=True)
 class HomeIdentity:
-    """状态根在启动时刻的目录身份。"""
+    """状态根目录身份（st_dev / st_ino）。"""
 
     dev: int
     ino: int
 
 
+# 进程级状态根身份缓存：key = 状态根绝对路径（os.path.abspath 结果），value = 首次成功
+# 打开时钉住的 HomeIdentity。身份只在首次成功打开那一刻固定一次，之后每次读取都以
+# `os.open(..., O_DIRECTORY|O_NOFOLLOW)` 重开 fd 并与钉住值比对；不一致即
+# 403 PATH_FORBIDDEN。这是设计第 2 节「启动时记录、读取时比对」的进程级落地——不能放在
+# 每次请求新建的 Paths 实例里，否则比对永远是自己比自己的 no-op。
+#
+# 口径（写入注释，防回归）：
+#   - 状态根在首次成功打开前不存在 → 列表返回空、单 run 返回 404，不钉身份、不 500；
+#   - 状态根首次被 `os.open` 成功打开（且 fstat 为目录）后才把 st_dev/st_ino 钉进缓存；
+#   - 钉住之后运行期把状态根 rename 走、原地换成另一个目录 → 重开 fd 的 inode 与钉住值
+#     不一致 → 403 PATH_FORBIDDEN（details.reason=home_identity_changed）；
+#   - 状态根本身是 symlink → `O_NOFOLLOW` 打开失败（ELOOP）→ 403 PATH_FORBIDDEN。
+_home_identity_cache: dict[str, HomeIdentity] = {}
+
+
 class Paths:
-    """状态根路径层：解析 WEWRITE_HOME、记录身份、逐级安全打开。"""
+    """状态根路径层：解析 WEWRITE_HOME、逐级安全打开、钉住并比对根身份。"""
 
     def __init__(self, home: str | os.PathLike | None = None):
         raw = home if home is not None else os.environ.get("WEWRITE_HOME", "")
         self.home_path = raw if raw else os.path.join(os.path.expanduser("~"), ".wewrite")
         self.home_path = os.path.abspath(self.home_path)
-        self._identity = self._capture_identity()
-
-    def _capture_identity(self) -> HomeIdentity | None:
-        """记录启动时刻状态根身份；不存在时返回 None（读取时按缺失处理）。"""
-        try:
-            st = os.stat(self.home_path, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        except OSError:
-            raise
-        if not stat.S_ISDIR(st.st_mode):
-            raise NotADirectoryError(f"WEWRITE_HOME 不是目录: {self.home_path}")
-        return HomeIdentity(dev=st.st_dev, ino=st.st_ino)
 
     def _open_root(self) -> int:
-        """重开状态根目录 fd 并比对启动身份，不一致即 PATH_FORBIDDEN。"""
-        if self._identity is None:
-            raise errors.path_forbidden({"reason": "enoent", "component": "home"})
+        """重开状态根目录 fd，并在首次成功打开时钉住身份、之后逐次比对。
+
+        所有打开/取身份失败统一映射为 403 PATH_FORBIDDEN，绝不让 OSError 逃到框架层。
+        """
         try:
             fd = os.open(self.home_path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
         except OSError as exc:
-            raise errors.path_forbidden({"reason": _os_error_reason(exc), "component": "home"}) from exc
+            # 状态根不存在 / 是 symlink(ELOOP) / 是文件(ENOTDIR) 等，统一 PATH_FORBIDDEN
+            raise errors.path_forbidden(
+                {"reason": _os_error_reason(exc), "component": "home"}
+            ) from exc
         try:
             st = os.fstat(fd)
             if not stat.S_ISDIR(st.st_mode):
-                raise errors.path_forbidden({"reason": "home_not_directory"})
-            if st.st_dev != self._identity.dev or st.st_ino != self._identity.ino:
-                raise errors.path_forbidden({"reason": "home_identity_changed"})
+                raise errors.path_forbidden({"reason": "home_not_directory", "component": "home"})
+
+            pinned = _home_identity_cache.get(self.home_path)
+            if pinned is None:
+                # 首次成功打开：钉住身份（进程级缓存，按绝对路径为键）
+                _home_identity_cache[self.home_path] = HomeIdentity(
+                    dev=st.st_dev, ino=st.st_ino
+                )
+            elif st.st_dev != pinned.dev or st.st_ino != pinned.ino:
+                # 运行期状态根被替换（rename 走再原地换目录）：身份变了，拒绝
+                raise errors.path_forbidden(
+                    {"reason": "home_identity_changed", "component": "home"}
+                )
         except BaseException:
             os.close(fd)
             raise

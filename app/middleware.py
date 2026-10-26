@@ -70,21 +70,30 @@ def normalize_host_port(host_header: str | None) -> tuple[str, int | None]:
 
 
 def validate_host(host_header: str | None) -> bool:
-    """校验 Host 头只允许回环地址。端口不限（本机可用任意回环端口）。"""
+    """校验 Host 头只允许回环白名单主机：127.0.0.1 / [::1] / localhost。
+
+    端口不参与白名单校验（本机可用任意回环端口），但主机必须精确匹配，
+    不放行整个 127/8（如 127.0.0.2 拒绝）。
+    """
     bare, _port = normalize_host_port(host_header)
     if not bare:
         return False
-    if bare in {"localhost"}:
+    if bare == "localhost":
         return True
     try:
         ip = ipaddress.ip_address(bare)
     except ValueError:
         return False
-    return ip.is_loopback
+    # 只放行回环且必须是 127.0.0.1 或 ::1（拒绝 127.0.0.2 等回环别名）
+    return (ip.is_loopback) and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
 
 
-def origin_host_matches(origin: str | None, host_bare: str) -> bool:
-    """校验 Origin 的 host 与 Host 头的 host 一致，且为回环。"""
+def origin_host_matches(origin: str | None, host_bare: str, host_port: int | None) -> bool:
+    """校验 Origin 与 Host 头同源（host 与端口都一致），且 host 为回环白名单。
+
+    Origin 形如 ``http://127.0.0.1:<port>``；端口须等于 Host 头端口（若 Origin
+    省略默认端口，http=80 / https=443，与本机监听端口不一致即拒绝）。
+    """
     if not origin:
         return False
     from urllib.parse import urlparse
@@ -98,11 +107,24 @@ def origin_host_matches(origin: str | None, host_bare: str) -> bool:
     origin_host = parsed.hostname or ""
     if origin_host != host_bare:
         return False
+
+    # 端口比对：Origin 缺省端口时按 scheme 补默认端口
+    origin_port = parsed.port
+    if origin_port is None:
+        origin_port = 80 if parsed.scheme == "http" else 443
+    if host_port is None:
+        host_port = 80  # Host 无端口视为 80（http）
+    if origin_port != host_port:
+        return False
+
+    # host 白名单（与 validate_host 一致，只允许精确回环地址或 localhost）
+    if origin_host == "localhost":
+        return True
     try:
         ip = ipaddress.ip_address(origin_host)
-        return ip.is_loopback
     except ValueError:
-        return origin_host == "localhost"
+        return False
+    return ip.is_loopback and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
 
 
 class HostCsrfMiddleware:
@@ -138,10 +160,10 @@ class HostCsrfMiddleware:
                 )
                 return
 
-            # 同源 Origin
-            bare_host, _port = normalize_host_port(host_header)
+            # 同源 Origin（host + 端口都一致）
+            bare_host, host_port = normalize_host_port(host_header)
             origin = request.headers.get("origin")
-            if not origin_host_matches(origin, bare_host):
+            if not origin_host_matches(origin, bare_host, host_port):
                 await _respond_json(send, errors.csrf_invalid({"reason": "origin_mismatch"}).body(), 403)
                 return
 

@@ -128,3 +128,94 @@ def test_url_encoded_run_id_rejected_api(client):
 def test_absolute_path_run_id_rejected_api(client):
     r = client.get("/api/v1/runs//etc/passwd")
     assert r.status_code in {400, 404}
+
+
+def test_runtime_home_replacement_rejected_safe_open(three_state_home):
+    """阻断 A：进程级身份钉住后，运行期把 WEWRITE_HOME 换成另一个真实目录，
+    safe_open_run_file 必须 403 PATH_FORBIDDEN 且读不到替换目录内容。"""
+    run_id = "20261026-100000-abcdef"
+    # 首次打开：钉住身份
+    fd, _st = paths.safe_open_run_file(three_state_home, run_id, "article")
+    os.close(fd)
+
+    # 运行期 rename 走原目录，原地换成一个含同名 run + 恶意 article.md 的真实目录
+    backup = three_state_home + ".bak"
+    os.rename(three_state_home, backup)
+    os.makedirs(os.path.join(three_state_home, "runs", run_id), exist_ok=True)
+    with open(os.path.join(three_state_home, "runs", run_id, "article.md"), "w", encoding="utf-8") as f:
+        f.write("EVIL-ARTICLE-CONTENT")
+
+    with pytest.raises(errors.ApiError) as ei:
+        paths.safe_open_run_file(three_state_home, run_id, "article")
+    assert ei.value.code == "PATH_FORBIDDEN"
+    assert ei.value.details.get("reason") == "home_identity_changed"
+
+
+def test_runtime_home_replacement_rejected_api(client, three_state_home):
+    """阻断 A：GET /api/v1/runs 在状态根被替换后必须 403，且不列出替换目录里的 run。"""
+    # 首次读取：钉住身份
+    r = client.get("/api/v1/runs")
+    assert r.status_code == 200
+
+    # 运行期替换状态根
+    backup = three_state_home + ".bak"
+    os.rename(three_state_home, backup)
+    os.makedirs(os.path.join(three_state_home, "runs", "20261026-999999-abcdef"), exist_ok=True)
+    with open(os.path.join(three_state_home, "runs", "20261026-999999-abcdef", "state.yaml"), "w", encoding="utf-8") as f:
+        f.write("run_id: 20261026-999999-abcdef\nstatus: active\n")
+
+    r = client.get("/api/v1/runs")
+    assert r.status_code == 403
+    assert r.json()["code"] == "PATH_FORBIDDEN"
+    assert r.json()["details"]["reason"] == "home_identity_changed"
+
+
+def test_symlink_home_rejected(tmp_path):
+    """阻断 B：WEWRITE_HOME 本身是 symlink 时返回 403 PATH_FORBIDDEN，不得 500。"""
+    real = tmp_path / "real-home"
+    real.mkdir()
+    os.makedirs(real / "runs", exist_ok=True)
+    link = tmp_path / "wewrite-link"
+    os.symlink(str(real), str(link))
+
+    with pytest.raises(errors.ApiError) as ei:
+        paths.safe_open_run_file(str(link), "20261026-100000-abcdef", "article")
+    assert ei.value.code == "PATH_FORBIDDEN"
+    assert ei.value.details.get("reason") in {"eloop", "enotdir"}
+
+
+def test_symlink_home_rejected_api(tmp_path, monkeypatch):
+    """阻断 B：symlink 状态根经 API 请求返回 403，不得 500。"""
+    real = tmp_path / "real-home"
+    real.mkdir()
+    os.makedirs(real / "runs", exist_ok=True)
+    link = tmp_path / "wewrite-link"
+    os.symlink(str(real), str(link))
+
+    monkeypatch.setenv("WEWRITE_HOME", str(link))
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app()
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    r = c.get("/api/v1/runs", headers={"host": "127.0.0.1:8765"})
+    assert r.status_code == 403
+    assert r.json()["code"] == "PATH_FORBIDDEN"
+
+
+def test_empty_home_returns_empty_list_not_500(tmp_path, monkeypatch):
+    """空 WEWRITE_HOME（不存在）仍应返回空列表，不得 500（设计口径）。"""
+    missing = str(tmp_path / "not-yet-created")
+    monkeypatch.setenv("WEWRITE_HOME", missing)
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    app = create_app()
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    r = c.get("/api/v1/runs", headers={"host": "127.0.0.1:8765"})
+    assert r.status_code == 200
+    assert r.json()["runs"] == []
+
+    # 单 run 详情：缺失 → 404 而非 500
+    r = c.get("/api/v1/runs/20261026-100000-abcdef", headers={"host": "127.0.0.1:8765"})
+    assert r.status_code == 404

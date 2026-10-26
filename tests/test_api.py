@@ -127,6 +127,13 @@ def test_bad_host_rejected(client):
     assert r.json()["code"] == "CSRF_INVALID"
 
 
+def test_loopback_alias_host_rejected(client):
+    """非白名单回环别名（127.0.0.2）应拒绝，不放行整个 127/8。"""
+    r = client.get("/healthz", headers={"host": "127.0.0.2:8765"})
+    assert r.status_code == 403
+    assert r.json()["code"] == "CSRF_INVALID"
+
+
 def test_good_hosts_accepted(client):
     for host in ["127.0.0.1:8765", "[::1]:8765", "localhost:8765", "localhost"]:
         r = client.get("/healthz", headers={"host": host})
@@ -173,6 +180,15 @@ def test_post_cross_site_rejected(client):
     headers = auth_headers(client)
     headers["Origin"] = "http://evil.example"
     headers["Sec-Fetch-Site"] = "cross-site"
+    r = client.post("/api/v1/runs", json={}, headers=headers)
+    assert r.status_code == 403
+    assert r.json()["code"] == "CSRF_INVALID"
+
+
+def test_post_origin_port_mismatch_rejected(client):
+    """非阻断项 1：Origin 端口与监听端口不一致应拒绝。"""
+    headers = auth_headers(client)
+    headers["Origin"] = "http://127.0.0.1:9999"
     r = client.post("/api/v1/runs", json={}, headers=headers)
     assert r.status_code == 403
     assert r.json()["code"] == "CSRF_INVALID"

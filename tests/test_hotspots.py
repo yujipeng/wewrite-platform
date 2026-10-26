@@ -365,3 +365,41 @@ def test_hotspot_single_date_invalid(tmp_path, monkeypatch):
     r = c.get("/api/v1/hotspots/not-a-date")
     assert r.status_code == 422
     assert r.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_post_refresh_creates_platform_lock_0600(tmp_path, monkeypatch):
+    """JEE-1923：写入快照成功后 platform.lock 存在且权限 0600。"""
+    home = str(tmp_path)
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, home, fetcher)
+    r = c.post("/api/v1/hotspots/refresh", json={"date": "2026-10-26"}, headers=post_headers(c))
+    assert r.status_code == 200
+
+    lock_path = os.path.join(home, "platform.lock")
+    assert os.path.exists(lock_path), "写快照后 platform.lock 应被创建"
+    assert (os.stat(lock_path).st_mode & 0o777) == 0o600
+
+
+def test_concurrent_refresh_same_date_yields_valid_json(tmp_path):
+    """JEE-1923：两线程并发 refresh 同一日期，最终文件是完整合法 JSON 且可读。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.adapters.hotspots import HotspotStore
+
+    home = str(tmp_path)
+    store = HotspotStore(home)
+
+    def refresh():
+        fetcher = FakeFetcher(ok_payload())
+        store.fetch_and_persist(fetcher, 20, "2026-10-26")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: refresh(), range(2)))
+
+    snap_path = os.path.join(home, "hotspots", "2026-10-26.json")
+    assert os.path.exists(snap_path)
+    with open(snap_path, encoding="utf-8") as f:
+        snap = json.load(f)
+    assert snap["date"] == "2026-10-26"
+    assert snap["count"] == 2
+    assert len(snap["items"]) == 2

@@ -692,64 +692,72 @@ def list_hotspot_filenames(home: str | os.PathLike) -> list[str]:
 def safe_write_hotspot_file(home: str | os.PathLike, date: str, text: str) -> None:
     """安全原子写 ``hotspots/<date>.json``。
 
-    从已打开的根 fd 起安全打开/创建 hotspots 目录，临时文件与目标都在该目录 fd 下
+    写入期间持有平台全局写锁 ``$WEWRITE_HOME/platform.lock``（与 ``candidates/``、
+    ``jobs/`` 共用同一把 ``PlatformLock(home)`` 锁），锁顺序固定「先 platform.lock，
+    再目录 fd」：先在 ``PlatformLock.__enter__`` 里打开并 flock 锁文件，再在锁内
+    从已打开的根 fd 起安全打开/创建 hotspots 目录。临时文件与目标都在该目录 fd 下
     （``O_NOFOLLOW`` + ``dir_fd``），写入 fsync 后 ``os.replace`` 再 fsync 目录，
-    全程不按绝对路径拼接后 open。任一级 symlink/非目录 → PATH_FORBIDDEN。
+    全程不按绝对路径拼接后 open，也不为加锁回退成按绝对路径 ``open()``。任一级
+    symlink/非目录 → PATH_FORBIDDEN。
     """
     _validate_hotspot_date(date)
-    paths = Paths(home)
-    root_fd = paths._open_root()
-    try:
-        try:
-            hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
-        except errors.ApiError as exc:
-            if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
-                try:
-                    os.mkdir("hotspots", dir_fd=root_fd)
-                except FileExistsError:
-                    pass
-                except OSError as e:
-                    raise errors.path_forbidden(
-                        {"reason": _os_error_reason(e), "component": "hotspots"}
-                    ) from e
-                hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
-            else:
-                raise
-        try:
-            # 同目录临时文件：O_CREAT|O_EXCL 保证唯一，权限 0600
-            import secrets as _secrets
+    # 惰性导入避免 storage.atomic ↔ storage.paths 的循环依赖。
+    from app.storage.atomic import PlatformLock
 
-            tmp_name = f".{date}.{_secrets.token_hex(6)}.tmp"
+    paths = Paths(home)
+    with PlatformLock(home):
+        root_fd = paths._open_root()
+        try:
             try:
-                fd = os.open(
-                    tmp_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
-                    0o600,
-                    dir_fd=hotspots_fd,
-                )
-            except OSError as exc:
-                raise errors.path_forbidden(
-                    {"reason": _os_error_reason(exc), "component": "hotspots"}
-                ) from exc
+                hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
+            except errors.ApiError as exc:
+                if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
+                    try:
+                        os.mkdir("hotspots", dir_fd=root_fd)
+                    except FileExistsError:
+                        pass
+                    except OSError as e:
+                        raise errors.path_forbidden(
+                            {"reason": _os_error_reason(e), "component": "hotspots"}
+                        ) from e
+                    hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
+                else:
+                    raise
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(text)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(
-                    tmp_name,
-                    f"{date}.json",
-                    src_dir_fd=hotspots_fd,
-                    dst_dir_fd=hotspots_fd,
-                )
-                os.fsync(hotspots_fd)
-            except BaseException:
+                # 同目录临时文件：O_CREAT|O_EXCL 保证唯一，权限 0600
+                import secrets as _secrets
+
+                tmp_name = f".{date}.{_secrets.token_hex(6)}.tmp"
                 try:
-                    os.unlink(tmp_name, dir_fd=hotspots_fd)
-                except OSError:
-                    pass
-                raise
+                    fd = os.open(
+                        tmp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                        0o600,
+                        dir_fd=hotspots_fd,
+                    )
+                except OSError as exc:
+                    raise errors.path_forbidden(
+                        {"reason": _os_error_reason(exc), "component": "hotspots"}
+                    ) from exc
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(text)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(
+                        tmp_name,
+                        f"{date}.json",
+                        src_dir_fd=hotspots_fd,
+                        dst_dir_fd=hotspots_fd,
+                    )
+                    os.fsync(hotspots_fd)
+                except BaseException:
+                    try:
+                        os.unlink(tmp_name, dir_fd=hotspots_fd)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                os.close(hotspots_fd)
         finally:
-            os.close(hotspots_fd)
-    finally:
-        os.close(root_fd)
+            os.close(root_fd)

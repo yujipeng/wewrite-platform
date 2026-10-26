@@ -225,3 +225,39 @@ main { max-width: 1080px; margin: 0 auto; padding: 24px; }
   border-radius: 6px;
   font-size: 14px;
 }
+
+/* M4：P6 生成进度 stepper / 逐图 / P5 对比 */
+.stepper {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 16px;
+  flex-wrap: wrap;
+}
+.stepper .step {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.stepper .step.done { color: var(--ok); border-color: var(--ok); background: #eef7f0; }
+.stepper .step.active { color: var(--accent); border-color: var(--accent); background: #eef3ff; }
+.stepper .step.failed { color: var(--danger); border-color: var(--danger); background: #fdeeee; }
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.image-cell { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.image-thumb { max-width: 100%; max-height: 120px; border-radius: 6px; }
+
+.compare-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}

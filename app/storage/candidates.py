@@ -221,11 +221,16 @@ class CandidateStore:
         if existing is not None and not force:
             return existing, False
 
-        # 生成候选：全失败（<10 条）则不写
+        # 生成候选：全失败（无任何条目）或条目不足（<10 条）都不写，语义分开
         items = self._generate_items(snapshot)
-        if len(items) < CANDIDATE_COUNT:
+        if not items:
             raise errors.validation_error(
                 "当日快照全源失败或无可用条目，无法生成候选", {"reason": "all_failed"}
+            )
+        if len(items) < CANDIDATE_COUNT:
+            raise errors.validation_error(
+                "当日快照可用条目不足 10 条，无法生成候选",
+                {"reason": "insufficient_items", "available": len(items)},
             )
 
         now = _now_utc()

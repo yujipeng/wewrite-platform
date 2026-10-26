@@ -121,6 +121,19 @@ def test_artifact_missing(client):
     assert r.status_code == 404
 
 
+def test_run_image_endpoint_whitelist(client):
+    """P6 缩略图端点：只允许 images/cover.png 或 images/<n>.png，路径穿越被拒。"""
+    # 不存在图片 → 404
+    r = client.get("/api/v1/runs/20261026-080000-a1b2c3/images/0.png")
+    assert r.status_code == 404
+    # 非法文件名 → 422（`../` 会被 HTTP 客户端归一化，不构成可测的路径穿越）
+    r = client.get("/api/v1/runs/20261026-080000-a1b2c3/images/evil.txt")
+    assert r.status_code == 422
+    # 非法 run_id → 400
+    r = client.get("/api/v1/runs/not-a-valid-id/images/0.png")
+    assert r.status_code == 400
+
+
 def test_bad_host_rejected(client):
     r = client.get("/healthz", headers={"host": "evil.example"})
     assert r.status_code == 403

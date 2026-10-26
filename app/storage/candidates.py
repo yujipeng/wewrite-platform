@@ -198,8 +198,15 @@ class CandidateStore:
 
         幂等：相同 snapshot_sha256 + style_revision 且存在 open 集 → 返回既有集
         （``created=False``）。同日期已有其它 open 集（不同快照或不同风格）时，
-        另开新集必须显式 ``force=true``（否则 VALIDATION_ERROR 提示）；``force=true``
-        写审计并把旧 open 集置 superseded（不删候选或 run）。
+        另开新集必须显式 ``force=true``（否则 VALIDATION_ERROR 提示）。
+
+        覆盖保护（硬要求，优先于 force）：目标文件名 ``<date>-<snapshot_sha256 前
+        12 位>`` 已存在时，若该旧集**有下游引用**（item 已 confirmed/retracted、
+        或 item 带 run_id/job_id、或存在 ``intents/<cid>-*`` 关联、或 ``set_status``
+        非 open），一律拒绝 ``409 CANDIDATE_NOT_ACTIONABLE reason=set_closed``，不得
+        改写该文件任何字段。仅对「仍 open、从未确认、无 intent/job/run」的旧集，
+        ``force=true`` 才允许原地重建，重建前写审计（事件名 ``candidate_set_rebuilt``，
+        区别于 ``candidate_set_superseded``）。
 
         全失败（无法产出 10 条候选）→ 抛 VALIDATION_ERROR（reason=all_failed），
         **不写任何候选集文件**。
@@ -213,14 +220,6 @@ class CandidateStore:
         existing = self._find_open_set(snap_hash, style_revision)
         if existing is not None and not force:
             return existing, False
-
-        # 同日期已有其它 open 集但非精确匹配 → 另开新集需 force（不静默覆盖/并存）
-        if not force:
-            for other in self._open_sets(date):
-                raise errors.validation_error(
-                    "该日期已有候选集，另开新集需 force=true",
-                    {"reason": "set_exists_requires_force", "existing": other.get("candidate_set_id")},
-                )
 
         # 生成候选：全失败（<10 条）则不写
         items = self._generate_items(snapshot)
@@ -249,14 +248,37 @@ class CandidateStore:
             again = self._find_open_set(snap_hash, style_revision)
             if again is not None and not force:
                 return again, False
-            if not force:
-                for other in self._open_sets(date):
+
+            target = self.load(cid)
+            if target is not None:
+                # 目标文件已存在（同日期 + 同快照哈希 → 同名文件）
+                if not self._is_rebuildable(target):
+                    # 有下游引用：绝不覆盖，硬要求优先于 force
+                    raise errors.candidate_not_actionable("set_closed")
+                if not force:
                     raise errors.validation_error(
                         "该日期已有候选集，另开新集需 force=true",
-                        {"reason": "set_exists_requires_force", "existing": other.get("candidate_set_id")},
+                        {"reason": "set_exists_requires_force", "existing": target.get("candidate_set_id")},
                     )
-            if force:
-                self._supersede_open_sets_locked(cid)
+                # force + 仍 open/从未确认/无关联 → 原地重建，写可追溯审计
+                self._audit(
+                    "candidate_set_rebuilt",
+                    cid=target.get("candidate_set_id"),
+                    created_at=target.get("created_at"),
+                    style_revision=target.get("style_revision"),
+                    snapshot_sha256=target.get("snapshot_sha256"),
+                )
+            else:
+                # 目标文件不存在（不同快照哈希 → 不同文件名）
+                if not force:
+                    for other in self._open_sets(date):
+                        raise errors.validation_error(
+                            "该日期已有候选集，另开新集需 force=true",
+                            {"reason": "set_exists_requires_force", "existing": other.get("candidate_set_id")},
+                        )
+                else:
+                    self._supersede_open_sets_locked(cid)
+
             paths.safe_write_subdir_file(
                 self.home,
                 "candidates",
@@ -265,6 +287,24 @@ class CandidateStore:
             )
             self._audit("candidate_set_created", cid=cid, snapshot_sha256=snap_hash, force=force)
         return candidate_set, True
+
+    def _is_rebuildable(self, data: dict) -> bool:
+        """原地重建是否安全：仍 open、从未确认、无 intent/job/run 关联。
+
+        对应设计第 2.1 节「不删候选或 run」与第 3 节删除保护的同一套下游引用判定。
+        """
+        if data.get("set_status") != "open":
+            return False
+        for it in data.get("items") or []:
+            if it.get("status") in {"confirmed", "retracted"}:
+                return False
+            if it.get("run_id") or it.get("job_id"):
+                return False
+        prefix = f"{data.get('candidate_set_id')}-"
+        for fname in paths.safe_list_subdir_filenames(self.home, "intents"):
+            if fname.startswith(prefix):
+                return False
+        return True
 
     def _open_sets(self, date: str) -> list[dict]:
         """列出该日期所有仍为 open 的候选集（含过期但 set_status 仍 open 的）。"""
@@ -316,7 +356,8 @@ class CandidateStore:
         return None
 
     def _supersede_open_sets_locked(self, except_cid: str) -> None:
-        """force 时把其它 open 集置 superseded（不删候选或 run）。"""
+        """force（目标文件名不存在、另开新集）时，把其它「仍 open、从未确认、无
+        下游引用」的旧集置 superseded；有下游引用的旧集（含已确认/已撤回）不动。"""
         for fname in paths.safe_list_subdir_filenames(self.home, "candidates"):
             if not fname.endswith(".json"):
                 continue
@@ -326,6 +367,8 @@ class CandidateStore:
             data = self.load(cid)
             if data is None or data.get("set_status") != "open":
                 continue
+            if not self._is_rebuildable(data):
+                continue  # 有下游引用，不得置 superseded（保留其 run/intent 关联）
             data["set_status"] = "superseded"
             paths.safe_write_subdir_file(
                 self.home, "candidates", f"{cid}.json", json.dumps(data, ensure_ascii=False, indent=2)

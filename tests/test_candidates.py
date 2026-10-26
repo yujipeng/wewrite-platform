@@ -213,6 +213,76 @@ def test_generate_force_supersedes_old(tmp_path, monkeypatch):
     assert by_id[third["candidate_set_id"]] == "open"
 
 
+def test_force_rebuild_open_set_writes_traceable_audit(tmp_path, monkeypatch):
+    """同快照哈希、旧集为未确认 open 集时 force 原地重建成功，审计有可追溯替换记录。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    first = generate_set(c, home)
+
+    # 同快照、不同 style_revision、force=true → 原地重建（同一文件名）
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:new-style", "force": True},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+    rebuilt = r.json()
+    assert rebuilt["candidate_set_id"] == first["candidate_set_id"]
+    assert rebuilt["style_revision"] == "sha256:new-style"
+
+    # 审计里有 candidate_set_rebuilt 事件，且记录被替换集的 cid/created_at/style_revision/snapshot_sha256
+    audit_path = os.path.join(home, "audit", "2026-10-26.jsonl")
+    assert os.path.exists(audit_path)
+    lines = [json.loads(line) for line in open(audit_path, encoding="utf-8") if line.strip()]
+    rebuilt_events = [e for e in lines if e.get("event") == "candidate_set_rebuilt"]
+    assert rebuilt_events, "缺 candidate_set_rebuilt 审计"
+    ev = rebuilt_events[-1]
+    assert ev["cid"] == first["candidate_set_id"]
+    assert ev["created_at"] == first["created_at"]
+    assert ev["style_revision"] == first["style_revision"]
+    assert ev["snapshot_sha256"] == first["snapshot_sha256"]
+
+
+def test_force_confirmed_set_rejected_unchanged(tmp_path, monkeypatch):
+    """同快照哈希、不同 style_revision 的 force 在旧集已确认时被拒（409 set_closed），
+    且旧集 set_status、item 状态、run_id 一字不变（阻断项回归）。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    candidate = body["items"][0]
+
+    # 先确认一个候选 → 集合转 confirmed，item 带 run_id/job_id
+    confirmed = _confirm(c, cid, candidate, "key-force-confirmed").json()
+    run_id = confirmed["run_id"]
+
+    store = candidates_store.CandidateStore(home)
+    before = store.load(cid)
+
+    # 同快照、不同 style_revision、force=true → 必须 409 set_closed
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:new-style", "force": True},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
+    assert r.json()["details"]["reason"] == "set_closed"
+
+    # 旧集一字不变
+    after = store.load(cid)
+    assert after["set_status"] == before["set_status"] == "confirmed"
+    before_items = {it["id"]: it for it in before["items"]}
+    after_items = {it["id"]: it for it in after["items"]}
+    assert after_items[candidate["id"]]["status"] == "confirmed"
+    assert after_items[candidate["id"]]["run_id"] == run_id
+    assert after_items[candidate["id"]]["job_id"] == before_items[candidate["id"]]["job_id"]
+    assert after_items[candidate["id"]] == before_items[candidate["id"]]
+    # run 仍在
+    assert os.path.exists(os.path.join(home, "runs", run_id, "state.yaml"))
+
+
 def test_generate_all_failed_rejected_no_write(tmp_path, monkeypatch):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)

@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.domain import errors
 
@@ -178,6 +180,40 @@ class Paths:
         finally:
             os.close(root_fd)
 
+    def hotspots_dir_fd(self, create: bool = False) -> int:
+        """安全打开 ``hotspots`` 目录 fd；不存在时（create=False）返回 -1 哨兵。
+
+        与 ``runs/`` 同一套逐级 openat + O_NOFOLLOW：从已钉住身份的根 fd 起
+        打开 ``hotspots``，任一级 symlink/非目录统一 PATH_FORBIDDEN，不回退按路径打开。
+        ``create=True`` 仅在写路径用：先在根 fd 下相对 ``mkdir("hotspots")``，再重开。
+        """
+        try:
+            root_fd = self._open_root()
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+                return -1
+            raise
+        try:
+            try:
+                return self._open_dir_at(root_fd, "hotspots", "hotspots")
+            except errors.ApiError as exc:
+                if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
+                    if not create:
+                        return -1
+                    # 在已打开的根 fd 下相对创建（不按绝对路径拼接），再 O_NOFOLLOW 重开。
+                    try:
+                        os.mkdir("hotspots", dir_fd=root_fd)
+                    except FileExistsError:
+                        pass
+                    except OSError as e:
+                        raise errors.path_forbidden(
+                            {"reason": _os_error_reason(e), "component": "hotspots"}
+                        ) from e
+                    return self._open_dir_at(root_fd, "hotspots", "hotspots")
+                raise
+        finally:
+            os.close(root_fd)
+
 
 def _os_error_reason(exc: OSError) -> str:
     if isinstance(exc, FileNotFoundError) or exc.errno == 2:  # ENOENT
@@ -246,6 +282,11 @@ def safe_open_run_file(home: str | os.PathLike, run_id: str, name: str):
         os.close(root_fd)
 
 
+def sha256_hex(data: bytes) -> str:
+    """内容 SHA-256（预览 source_sha256 等复用）。"""
+    return hashlib.sha256(data).hexdigest()
+
+
 def read_state_yaml(home: str | os.PathLike, run_id: str) -> dict | None:
     """只读投影 state.yaml（不调用上游 load_run，避免升级回写副作用）。"""
     import yaml
@@ -305,5 +346,160 @@ def safe_open_state(home: str | os.PathLike, run_id: str):
                 raise
         finally:
             os.close(runs_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _validate_hotspot_date(date: str) -> str:
+    """热榜快照日期格式校验（YYYY-MM-DD）。"""
+    import re as _re
+
+    if not isinstance(date, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise errors.validation_error("date 必须为 YYYY-MM-DD 格式", {"field": "date"})
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise errors.validation_error("date 不是合法日期", {"field": "date"})
+    return date
+
+
+def safe_open_hotspot_file(home: str | os.PathLike, date: str):
+    """安全打开 ``hotspots/<date>.json``，返回 ``(fd, stat_result)``。
+
+    与 ``safe_open_run_file`` 同一套逐级 openat：状态根身份 → hotspots 目录 →
+    ``<date>.json``（O_NOFOLLOW|O_RDONLY）→ fstat(S_ISREG, st_nlink>=1)。
+    目录或文件缺失返回 NOT_FOUND；任一级 symlink/非目录统一 PATH_FORBIDDEN。
+    """
+    _validate_hotspot_date(date)
+    paths = Paths(home)
+    try:
+        root_fd = paths._open_root()
+    except errors.ApiError as exc:
+        if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+            raise errors.not_found() from exc
+        raise
+    try:
+        try:
+            hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent":
+                raise errors.not_found() from exc
+            raise
+        try:
+            try:
+                fd = os.open(
+                    f"{date}.json",
+                    os.O_RDONLY | _O_NOFOLLOW | _O_BINARY,
+                    dir_fd=hotspots_fd,
+                )
+            except OSError as exc:
+                reason = _os_error_reason(exc)
+                if reason == "eloop":
+                    raise errors.path_forbidden({"reason": "eloop", "date": date}) from exc
+                raise errors.not_found({"reason": reason, "date": date}) from exc
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise errors.path_forbidden({"reason": "not_regular_file", "date": date})
+                if st.st_nlink < 1:
+                    raise errors.path_forbidden({"reason": "unlinked_file", "date": date})
+                return fd, st
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            os.close(hotspots_fd)
+    finally:
+        os.close(root_fd)
+
+
+def list_hotspot_filenames(home: str | os.PathLike) -> list[str]:
+    """安全枚举 ``hotspots/`` 下的快照文件名（``<date>.json``），目录不存在返回空列表。
+
+    只做「安全打开目录 + 枚举合法日期名」，保留期过滤由调用方（store）负责。
+    """
+    paths = Paths(home)
+    hotspots_fd = paths.hotspots_dir_fd(create=False)
+    if hotspots_fd == -1:
+        return []
+    names = []
+    try:
+        with os.scandir(hotspots_fd) as it:
+            for entry in it:
+                if not entry.name.endswith(".json"):
+                    continue
+                d = entry.name[:-5]
+                try:
+                    _validate_hotspot_date(d)
+                except errors.ApiError:
+                    continue
+                names.append(d)
+    finally:
+        os.close(hotspots_fd)
+    return names
+
+
+def safe_write_hotspot_file(home: str | os.PathLike, date: str, text: str) -> None:
+    """安全原子写 ``hotspots/<date>.json``。
+
+    从已打开的根 fd 起安全打开/创建 hotspots 目录，临时文件与目标都在该目录 fd 下
+    （``O_NOFOLLOW`` + ``dir_fd``），写入 fsync 后 ``os.replace`` 再 fsync 目录，
+    全程不按绝对路径拼接后 open。任一级 symlink/非目录 → PATH_FORBIDDEN。
+    """
+    _validate_hotspot_date(date)
+    paths = Paths(home)
+    root_fd = paths._open_root()
+    try:
+        try:
+            hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
+        except errors.ApiError as exc:
+            if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
+                try:
+                    os.mkdir("hotspots", dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    raise errors.path_forbidden(
+                        {"reason": _os_error_reason(e), "component": "hotspots"}
+                    ) from e
+                hotspots_fd = paths._open_dir_at(root_fd, "hotspots", "hotspots")
+            else:
+                raise
+        try:
+            # 同目录临时文件：O_CREAT|O_EXCL 保证唯一，权限 0600
+            import secrets as _secrets
+
+            tmp_name = f".{date}.{_secrets.token_hex(6)}.tmp"
+            try:
+                fd = os.open(
+                    tmp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                    0o600,
+                    dir_fd=hotspots_fd,
+                )
+            except OSError as exc:
+                raise errors.path_forbidden(
+                    {"reason": _os_error_reason(exc), "component": "hotspots"}
+                ) from exc
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(
+                    tmp_name,
+                    f"{date}.json",
+                    src_dir_fd=hotspots_fd,
+                    dst_dir_fd=hotspots_fd,
+                )
+                os.fsync(hotspots_fd)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name, dir_fd=hotspots_fd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(hotspots_fd)
     finally:
         os.close(root_fd)

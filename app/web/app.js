@@ -89,18 +89,29 @@ function currentRoute() {
   // #/runs/{run_id}
   const m = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})$/);
   if (m) return { page: "detail", runId: m[1] };
+  // #/runs/{run_id}/preview
+  const pm = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})\/preview$/);
+  if (pm) return { page: "preview", runId: pm[1] };
+  if (hash === "#/hotspots") return { page: "hotspots" };
   return { page: "home" };
 }
 
 async function render() {
   const route = currentRoute();
-  document.querySelectorAll(".nav-link").forEach((n) =>
-    n.classList.toggle("active", n.dataset.nav === "home" && route.page === "home")
-  );
+  document.querySelectorAll(".nav-link").forEach((n) => {
+    const active =
+      (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview")) ||
+      (n.dataset.nav === "hotspots" && route.page === "hotspots");
+    n.classList.toggle("active", active);
+  });
   if (route.page === "home") {
     await renderHome();
-  } else {
+  } else if (route.page === "detail") {
     await renderDetail(route.runId);
+  } else if (route.page === "preview") {
+    await renderPreview(route.runId);
+  } else if (route.page === "hotspots") {
+    await renderHotspots();
   }
 }
 
@@ -250,7 +261,13 @@ function detailBody(d) {
     kv.appendChild(el("dd", { text: v == null || v === "" ? "未提供" : String(v) }));
   }
 
-  const sections = [title, kv];
+  const previewBtn = el("a", {
+    class: "btn",
+    href: "#/runs/" + d.run_id + "/preview",
+    text: "预览产物",
+  });
+
+  const sections = [title, kv, previewBtn];
 
   // 选题
   const topic = d.topic || {};
@@ -350,3 +367,238 @@ function detailBody(d) {
 
 window.addEventListener("hashchange", render);
 render();
+
+// ============ M2：P3 产物预览 ============
+
+function sourceLabel(source) {
+  return { draft: "初稿 draft.md", article: "终稿 article.md", illustrated_article: "带图版 article-illustrated.md" }[source] || source;
+}
+
+async function renderPreview(runId) {
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
+  app.appendChild(el("h1", { class: "page-title", text: "产物预览" }));
+
+  // 常驻口径提示：每个来源/主题切换后提示仍在
+  app.appendChild(el("div", { class: "notice" }, [
+    "本地预览，图片上传后 URL 会被替换",
+    el("br"),
+    "本预览不承诺与微信草稿字节一致",
+  ]));
+
+  const controls = el("div", { class: "preview-controls" });
+  const sourceSelect = el("select");
+  for (const s of ["draft", "article", "illustrated_article"]) {
+    sourceSelect.appendChild(el("option", { value: s, text: sourceLabel(s) }));
+  }
+  const themeSelect = el("select");
+  themeSelect.appendChild(el("option", { value: "", text: "主题加载中…" }));
+  const renderBtn = el("button", { class: "btn", text: "渲染预览" });
+  const copyBtn = el("button", { class: "btn", text: "复制正文 HTML" });
+  copyBtn.disabled = true;
+  const meta = el("div", { class: "muted", text: "" });
+  controls.appendChild(sourceSelect);
+  controls.appendChild(themeSelect);
+  controls.appendChild(renderBtn);
+  controls.appendChild(copyBtn);
+  app.appendChild(controls);
+  app.appendChild(meta);
+
+  const iframeHost = el("div");
+  app.appendChild(iframeHost);
+
+  // 主题列表走 GET /api/v1/themes（名称来自 wewrite 的 list_themes()）
+  let themes = [];
+  try {
+    const data = await api("/api/v1/themes");
+    themes = data.themes || [];
+    themeSelect.innerHTML = "";
+    for (const t of themes) {
+      themeSelect.appendChild(el("option", { value: t.name, text: t.name + (t.description ? " — " + t.description : "") }));
+    }
+  } catch (err) {
+    themeSelect.innerHTML = "";
+    themeSelect.appendChild(el("option", { value: "", text: "主题加载失败" }));
+  }
+
+  let lastHtml = null;
+
+  const renderPreviewIframe = async () => {
+    iframeHost.innerHTML = "";
+    iframeHost.appendChild(loadingState("正在生成预览…"));
+    meta.textContent = "";
+    copyBtn.disabled = true;
+    lastHtml = null;
+    try {
+      const token = (await api("/api/v1/bootstrap")).csrf_token;
+      const res = await fetch("/api/v1/preview", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": token,
+        },
+        body: JSON.stringify({ run_id: runId, source: sourceSelect.value, theme: themeSelect.value }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status;
+        let message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const body = await res.json();
+      // sandbox 且不含 allow-scripts：iframe 只渲染、不执行脚本
+      const iframe = document.createElement("iframe");
+      iframe.setAttribute("sandbox", "");
+      iframe.className = "preview-frame";
+      iframe.srcdoc = body.html;
+      iframeHost.innerHTML = "";
+      iframeHost.appendChild(iframe);
+      meta.textContent = "标题：" + (body.title || "（无）") + "　摘要：" + (body.digest || "（无）") + "　已剥离可执行内容：" + body.filtered_count + " 处";
+      copyBtn.disabled = false;
+      lastHtml = body.paste_safe_html;
+    } catch (err) {
+      iframeHost.innerHTML = "";
+      if (err.status === 403) iframeHost.appendChild(forbiddenState());
+      else if (err.status === 404) iframeHost.appendChild(errorState("产物不存在或尚未生成", () => renderPreviewIframe()));
+      else iframeHost.appendChild(errorState("预览失败：" + (err.code || err.message), renderPreviewIframe));
+    }
+  };
+
+  renderBtn.addEventListener("click", renderPreviewIframe);
+  copyBtn.addEventListener("click", async () => {
+    if (!lastHtml) return;
+    try {
+      await navigator.clipboard.writeText(lastHtml);
+      copyBtn.textContent = "已复制";
+      setTimeout(() => { copyBtn.textContent = "复制正文 HTML"; }, 1500);
+    } catch (_) {
+      copyBtn.textContent = "复制失败";
+    }
+  });
+
+  // 初始自动渲染一次
+  if (themeSelect.value) await renderPreviewIframe();
+}
+
+// ============ M2：P4 每日热榜 ============
+
+const SOURCE_TEXT = { weibo: "微博", baidu: "百度", toutiao: "今日头条" };
+
+async function csrfToken() {
+  return (await api("/api/v1/bootstrap")).csrf_token;
+}
+
+async function renderHotspots() {
+  app.innerHTML = "";
+  app.appendChild(el("h1", { class: "page-title", text: "每日热榜" }));
+
+  const actions = el("div", { class: "preview-controls" });
+  const refreshBtn = el("button", { class: "btn", text: "立即刷新（抓取当下）" });
+  const persistBtn = el("button", { class: "btn", text: "补抓并保存今日快照" });
+  const hint = el("span", { class: "muted", text: "刷新只展示当下数据；保存会写入今日快照" });
+  actions.appendChild(refreshBtn);
+  actions.appendChild(persistBtn);
+  actions.appendChild(hint);
+  app.appendChild(actions);
+
+  const container = el("div");
+  app.appendChild(container);
+
+  const drawEmpty = () => { container.innerHTML = ""; container.appendChild(emptyState("还没有热榜快照，点「补抓并保存今日快照」或「立即刷新」获取数据")); };
+  const drawList = (body) => {
+    container.innerHTML = "";
+    const items = body.items || [];
+    const meta = el("div", { class: "muted", text: "共 " + (body.count || 0) + " 条　来源：" + (body.sources || []).map((s) => SOURCE_TEXT[s] || s).join("、") + (body.sources_failed && body.sources_failed.length ? "　失败源：" + body.sources_failed.map((s) => SOURCE_TEXT[s] || s).join("、") : "") + (body.last_success_at ? "　上次成功：" + body.last_success_at : "") });
+    container.appendChild(meta);
+    if (items.length === 0) {
+      container.appendChild(emptyState("暂无热榜条目"));
+      return;
+    }
+    const list = el("ul", { class: "run-list" });
+    for (const it of items) {
+      const row = el("li", { class: "run-item" }, [
+        el("div", { class: "run-main" }, [
+          el("div", { class: "run-title", text: (it.title || "") }),
+          el("div", { class: "run-meta", text: (it.source_label || it.source || "") + " · 热度 " + (it.hot ?? "—") + (it.hot_normalized != null ? " · 归一化 " + it.hot_normalized : "") }),
+        ]),
+      ]);
+      if (it.url) {
+        row.appendChild(el("a", { class: "btn", href: it.url, target: "_blank", rel: "noopener", text: "原文" }));
+      }
+      list.appendChild(row);
+    }
+    container.appendChild(list);
+  };
+
+  const loadSaved = async () => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在读取热榜快照…"));
+    try {
+      const body = await api("/api/v1/hotspots");
+      if ((body.items || []).length === 0) { drawEmpty(); } else { drawList(body); }
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.status === 403) container.appendChild(forbiddenState());
+      else container.appendChild(errorState("加载失败：" + (err.code || err.message), loadSaved));
+    }
+  };
+
+  const doRefresh = async () => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在抓取当下热榜…"));
+    try {
+      const body = await api("/api/v1/hotspots?limit=20&refresh=1");
+      if ((body.items || []).length === 0 && body.error) {
+        container.innerHTML = "";
+        container.appendChild(errorState("全源抓取失败：" + body.error, doRefresh));
+      } else if ((body.items || []).length === 0) {
+        drawEmpty();
+      } else {
+        drawList(body);
+      }
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.status === 403) container.appendChild(forbiddenState());
+      else container.appendChild(errorState("抓取失败：" + (err.code || err.message), doRefresh));
+    }
+  };
+
+  const doPersist = async () => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在抓取并保存今日快照…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/hotspots/refresh", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": token,
+        },
+        body: JSON.stringify({ limit: 20 }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const body = await res.json();
+      if ((body.items || []).length === 0 && body.error) {
+        container.innerHTML = "";
+        container.appendChild(errorState("全源抓取失败，未写入快照：" + body.error, doPersist));
+      } else if ((body.items || []).length === 0) {
+        drawEmpty();
+      } else {
+        drawList(body);
+      }
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.status === 403) container.appendChild(forbiddenState());
+      else container.appendChild(errorState("保存失败：" + (err.code || err.message), doPersist));
+    }
+  };
+
+  refreshBtn.addEventListener("click", doRefresh);
+  persistBtn.addEventListener("click", doPersist);
+
+  await loadSaved();
+}

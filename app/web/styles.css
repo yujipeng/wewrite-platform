@@ -154,3 +154,37 @@ main { max-width: 1080px; margin: 0 auto; padding: 24px; }
 
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 720px) { .two-col { grid-template-columns: 1fr; } }
+
+/* M2：P3 预览 / P4 热榜 */
+.notice {
+  border: 1px solid var(--warn);
+  background: #fff8e6;
+  color: #7a5200;
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.preview-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.preview-controls select {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+  background: var(--card);
+}
+
+.preview-frame {
+  width: 100%;
+  min-height: 60vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+}

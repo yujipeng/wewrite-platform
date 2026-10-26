@@ -1,8 +1,8 @@
 """统一错误码与异常类型。
 
-设计基线（docs/s2-technical-design.md 第 3 节）约定的稳定错误码，M1 只启用
-RUN_ID_INVALID / PATH_FORBIDDEN / NOT_FOUND / VALIDATION_ERROR / CSRF_INVALID，
-其余错误码在后续里程碑按需启用。
+设计基线（docs/s2-technical-design.md 第 3 节）约定的稳定错误码。M1 启用
+RUN_ID_INVALID / PATH_FORBIDDEN / NOT_FOUND / VALIDATION_ERROR / CSRF_INVALID；
+M2 增加 UPSTREAM_ERROR（热榜抓取失败）。其余错误码在后续里程碑按需启用。
 """
 
 from __future__ import annotations
@@ -39,3 +39,11 @@ def not_found(details: dict | None = None) -> ApiError:
 
 def csrf_invalid(details: dict | None = None) -> ApiError:
     return ApiError("CSRF_INVALID", "跨站请求被拒绝", 403, details)
+
+
+def validation_error(message: str = "请求参数不合法", details: dict | None = None) -> ApiError:
+    return ApiError("VALIDATION_ERROR", message, 422, details)
+
+
+def upstream_error(message: str = "上游服务调用失败", details: dict | None = None) -> ApiError:
+    return ApiError("UPSTREAM_ERROR", message, 502, details)

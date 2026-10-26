@@ -435,6 +435,194 @@ async def get_job(job_id: str):
     return job
 
 
+# ---------- M4：P8 配置 / P7 发布 / P6 job ----------
+
+async def _read_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        raise errors.validation_error("请求体必须为合法 JSON")
+    if not isinstance(body, dict):
+        raise errors.validation_error("请求体必须为 JSON 对象")
+    return body
+
+
+def _config_store() -> "config_store.ConfigStore":
+    from app.storage import config_store
+
+    return config_store.ConfigStore(_home())
+
+
+@router.get("/api/v1/config")
+async def get_config():
+    try:
+        return _config_store().project_config()
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.put("/api/v1/config")
+async def put_config(request: Request):
+    body = await _read_body(request)
+    try:
+        return _config_store().put_config(body)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.get("/api/v1/style")
+async def get_style():
+    try:
+        return _config_store().project_style()
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.put("/api/v1/style")
+async def put_style(request: Request):
+    body = await _read_body(request)
+    try:
+        return _config_store().put_style(body)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.get("/api/v1/runs/{run_id}/publish/preflight")
+async def publish_preflight(run_id: str):
+    from app.domain import preflight as preflight_mod
+
+    try:
+        paths.validate_run_id(run_id)
+        return preflight_mod.check(_home(), run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+def _publish_gate(request: Request):
+    from app.adapters import wechat as wechat_adapter
+    from app.domain import publish_gate
+
+    adapter = getattr(request.app.state, "wechat_adapter", None) or wechat_adapter.WeChatAdapter()
+    return publish_gate.PublishGate(_home(), adapter=adapter)
+
+
+@router.put("/api/v1/runs/{run_id}/publish/permission")
+async def publish_permission(run_id: str, request: Request):
+    body = await _read_body(request)
+    try:
+        paths.validate_run_id(run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    if not isinstance(body.get("allow"), bool):
+        return _error_response(errors.validation_error("allow 必须为布尔", {"field": "allow"}))
+    reason = body.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return _error_response(errors.validation_error("reason 必须为字符串", {"field": "reason"}))
+    try:
+        return await run_in_threadpool(
+            _publish_gate(request).set_permission, run_id, body["allow"], reason
+        )
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/runs/{run_id}/publish/token")
+async def publish_token(run_id: str, request: Request):
+    body = await _read_body(request)
+    try:
+        paths.validate_run_id(run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    revision = body.get("revision")
+    title = body.get("title")
+    if not isinstance(revision, str) or not revision:
+        return _error_response(errors.validation_error("revision 必填", {"field": "revision"}))
+    if not isinstance(title, str) or not title:
+        return _error_response(errors.validation_error("title 必填", {"field": "title"}))
+    if body.get("checked") is not True:
+        return _error_response(errors.validation_error("checked 必须为 true", {"field": "checked"}))
+    try:
+        return await run_in_threadpool(_publish_gate(request).issue_token, run_id, revision, title)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/runs/{run_id}/publish")
+async def publish(run_id: str, request: Request):
+    body = await _read_body(request)
+    try:
+        paths.validate_run_id(run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    token = body.get("token")
+    title = body.get("title")
+    if not isinstance(token, str) or not token:
+        return _error_response(errors.validation_error("token 必填", {"field": "token"}))
+    if not isinstance(title, str) or not title:
+        return _error_response(errors.validation_error("title 必填", {"field": "title"}))
+    if body.get("checked") is not True:
+        return _error_response(errors.validation_error("checked 必须为 true", {"field": "checked"}))
+    try:
+        return await run_in_threadpool(_publish_gate(request).commit_once, run_id, token, title)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/runs/{run_id}/publish/reconcile")
+async def publish_reconcile(run_id: str, request: Request):
+    body = await _read_body(request)
+    try:
+        paths.validate_run_id(run_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    media_id = body.get("media_id")
+    if media_id is not None and not isinstance(media_id, str):
+        return _error_response(errors.validation_error("media_id 必须为字符串", {"field": "media_id"}))
+    try:
+        return await run_in_threadpool(_publish_gate(request).reconcile, run_id, media_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    try:
+        return jobs.JobStore(_home()).cancel(job_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    try:
+        return await run_in_threadpool(jobs.JobStore(_home()).resume, job_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/jobs/{job_id}/accept-existing")
+async def accept_existing_job(job_id: str, request: Request):
+    body = await _read_body(request)
+    if body.get("confirm") is not True:
+        return _error_response(errors.validation_error("confirm 必须为 true", {"field": "confirm"}))
+    try:
+        return jobs.JobStore(_home()).accept_existing(job_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
+@router.post("/api/v1/jobs/{job_id}/images/retry")
+async def retry_job_images(job_id: str, request: Request):
+    body = await _read_body(request)
+    indices = body.get("indices")
+    if not isinstance(indices, list):
+        return _error_response(errors.validation_error("indices 必须为数组", {"field": "indices"}))
+    try:
+        return jobs.JobStore(_home()).retry_images(job_id, indices)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
 def datetime_now_utc():
     from datetime import datetime, timezone
 

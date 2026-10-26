@@ -58,3 +58,17 @@ class WeWriteAdapter:
         if not isinstance(state, dict) or not state.get("run_id"):
             raise errors.upstream_error("上游返回缺少 run_id", {"reason": "missing_run_id"})
         return state
+
+    def resume_run(self, run_id: str) -> dict:
+        """复用上游 ``wewrite.runs.resume_run``（保留已完成产物，生成新 attempt）。"""
+        try:
+            from wewrite.runs import resume_run as _resume
+        except Exception as exc:  # 上游不可用
+            raise errors.upstream_error("wewrite 包不可用", {"reason": "import_failed"}) from exc
+        try:
+            state = _resume(run_id)
+        except ValueError as exc:
+            raise errors.validation_error("上游拒绝恢复 run", {"reason": "upstream_rejected"}) from exc
+        except Exception as exc:
+            raise errors.upstream_error("恢复 run 失败", {"reason": "resume_failed"}) from exc
+        return state

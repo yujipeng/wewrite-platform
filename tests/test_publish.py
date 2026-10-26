@@ -356,8 +356,53 @@ def test_config_unknown_field_rejected(monkeypatch, tmp_path):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)
     r = c.put("/api/v1/config", json={"wechat": {"secret_path": "../../etc"}}, headers=post_headers(c))
-    # 未知字段被忽略（白名单外不落地），但 secret_path 不属于可写字段
-    assert r.status_code == 200
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    assert r.json()["details"]["field"] == "wechat.secret_path"
+    # 未知字段整包拒绝，config.yaml 不得产生任何写入
+    assert not os.path.exists(os.path.join(home, "config.yaml"))
+
+
+def test_config_unknown_field_rejects_whole_package_no_partial_write(monkeypatch, tmp_path):
+    """同包里的合法字段与未知字段混在一起时，整包 422 且合法字段也不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put(
+        "/api/v1/config",
+        json={"permissions": {"publish": True}, "wechat": {"appid": "wx1", "bogus": 1}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    # permissions 是未知顶层键 → 显式拒绝；wechat.bogus 是未知嵌套键
+    assert r.json()["details"]["field"] in {"permissions", "wechat.bogus"}
+    assert not os.path.exists(os.path.join(home, "config.yaml"))
+
+
+def test_config_permissions_rejected(monkeypatch, tmp_path):
+    """permissions 显式拒绝：不允许通过全局配置开启任何 run 的发布权限。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put("/api/v1/config", json={"permissions": {"publish": True}}, headers=post_headers(c))
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    assert r.json()["details"]["field"] == "permissions"
+    assert not os.path.exists(os.path.join(home, "config.yaml"))
+
+
+def test_style_unknown_field_rejected(monkeypatch, tmp_path):
+    """PUT /style 同源缺陷：secret / bogus 等未知键一律 422，不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put(
+        "/api/v1/style",
+        json={"name": "x", "secret": "LEAK", "bogus": 1},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    assert r.json()["details"]["field"] in {"secret", "bogus"}
+    assert not os.path.exists(os.path.join(home, "style.yaml"))
 
 
 def test_publish_permission_bad_run_id(monkeypatch, tmp_path):

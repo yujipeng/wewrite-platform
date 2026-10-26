@@ -62,6 +62,13 @@ WRITABLE_CONFIG_FIELDS = frozenset(
     }
 )
 
+# PUT /config 请求体允许的顶层键；其余（含 permissions）一律 422 未知字段。
+CONFIG_TOP_KEYS = frozenset({"theme", "image", "wechat", "clear", "clear_confirmed"})
+CONFIG_IMAGE_KEYS = frozenset(
+    {"provider", "model", "api_key", "base_url", "max_cost", "estimated_cost_per_image"}
+)
+CONFIG_WECHAT_KEYS = frozenset({"appid", "secret", "author"})
+
 CLEARABLE_FIELDS = frozenset({"wechat.secret", "image.api_key"})
 
 DEFAULT_CONFIG: dict = {
@@ -263,9 +270,18 @@ class ConfigStore:
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
 
+        # 顶层未知键拒绝（permissions 显式拒绝：不允许通过全局配置开启发布权限）
+        for key in body:
+            if key not in CONFIG_TOP_KEYS:
+                raise errors.validation_error("未知字段", {"field": key})
+
         # writer 相关环境配置整体只读，拒绝写入（设计 2.5）
         if isinstance(body.get("writer"), dict) and body.get("writer"):
             raise errors.validation_error("writer 相关环境配置整体只读，不接受写入", {"field": "writer"})
+
+        # 嵌套键未知拒绝（image/wechat 下白名单外的键一律 422）
+        _reject_unknown_nested(body, "image", CONFIG_IMAGE_KEYS)
+        _reject_unknown_nested(body, "wechat", CONFIG_WECHAT_KEYS)
 
         for field in WRITABLE_CONFIG_FIELDS:
             # 只处理出现在 body 里的字段；缺失不改
@@ -331,6 +347,12 @@ class ConfigStore:
         """白名单字段原子写 style.yaml 0600；缺失字段显式保存默认值。"""
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
+
+        # 未知字段拒绝（顶层只允许 STYLE_FIELDS 白名单）
+        for key in body:
+            if key not in self.STYLE_FIELDS:
+                raise errors.validation_error("未知字段", {"field": key})
+
         style = self.load_style()
         style.setdefault("version", 1)
         for field in self.STYLE_FIELDS:
@@ -371,6 +393,22 @@ def _pick_dotted(body: dict, dotted: str):
             return False, None
         cur = cur[key]
     return True, cur
+
+
+def _reject_unknown_nested(body: dict, parent: str, allowed: frozenset) -> None:
+    """拒绝 parent 下的未知嵌套键；parent 缺失或非 dict 时由后续校验处理。
+
+    ``parent`` 出现在 body 里且不是 dict → 由类型校验拒绝；是 dict 则任一
+    不在 ``allowed`` 的键 → 422 VALIDATION_ERROR，``details.field`` 用点分路径。
+    """
+    if parent not in body:
+        return
+    node = body[parent]
+    if not isinstance(node, dict):
+        raise errors.validation_error(f"{parent} 必须为对象", {"field": parent})
+    for key in node:
+        if key not in allowed:
+            raise errors.validation_error("未知字段", {"field": f"{parent}.{key}"})
 
 
 def _merge_default(data: dict) -> dict:

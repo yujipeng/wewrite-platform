@@ -55,6 +55,16 @@ def ok_snapshot():
     }
 
 
+def ok_snapshot_variant():
+    """同日期但内容不同的快照（用于验证 force 取代语义，snapshot hash 不同）。"""
+    snap = ok_snapshot()
+    items = [dict(it) for it in snap["items"]]
+    # 改一条标题使 snapshot hash 不同
+    items[0] = dict(items[0], title="变了标题的热点")
+    snap["items"] = items
+    return snap
+
+
 class FakeWewriteAdapter(wewrite_adapter.WeWriteAdapter):
     """写最小 state.yaml 的假上游，替代真实 create_run。"""
 
@@ -147,6 +157,22 @@ def test_generate_candidates_writes_10_items(tmp_path, monkeypatch):
     assert not [f for f in os.listdir(os.path.join(home, "candidates")) if f.endswith(".tmp")]
 
 
+def test_candidate_file_named_by_snapshot_sha256(tmp_path, monkeypatch):
+    """落盘文件名 == <date>-<snapshot_sha256 前 12 位>.json（阻断项修复回归）。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    body = generate_set(c, home)
+    snap_hash = body["snapshot_sha256"]
+    digest = snap_hash.replace("sha256:", "")
+    expected = f"2026-10-26-{digest[:12]}.json"
+    # candidate_set_id 与文件名一致
+    assert body["candidate_set_id"] == expected[:-5]
+    assert os.path.exists(os.path.join(home, "candidates", expected))
+    # candidates 目录只有这一个文件，且无随机 token 文件
+    files = [f for f in os.listdir(os.path.join(home, "candidates")) if f.endswith(".json")]
+    assert files == [expected]
+
+
 def test_generate_idempotent_same_hash_style(tmp_path, monkeypatch):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)
@@ -161,19 +187,29 @@ def test_generate_force_supersedes_old(tmp_path, monkeypatch):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)
     first = generate_set(c, home)
-    second = generate_set(c, home, style="sha256:other")
-    assert second["candidate_set_id"] != first["candidate_set_id"]
-    # force 后旧集 superseded，新集 open
-    r = c.get("/api/v1/candidates")
-    by_id = {s["candidate_set_id"]: s["set_status"] for s in r.json()["candidates"]}
-    assert by_id[first["candidate_set_id"]] == "open"
-    assert by_id[second["candidate_set_id"]] == "open"
 
-    third = generate_set(c, home, style="sha256:third", force=True)
+    # 同日期、不同 style_revision 且不带 force → 另开新集需 force，拒绝
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:other"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["details"]["reason"] == "set_exists_requires_force"
+
+    # 显式 force + 内容不同的快照 → 写新集（不同 snapshot hash → 不同文件名）并把旧 open 集置 superseded
+    write_snapshot(home, "2026-10-26", ok_snapshot_variant())
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:third", "force": True},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+    third = r.json()
+
     r = c.get("/api/v1/candidates")
     by_id = {s["candidate_set_id"]: s["set_status"] for s in r.json()["candidates"]}
     assert by_id[first["candidate_set_id"]] == "superseded"
-    assert by_id[second["candidate_set_id"]] == "superseded"
     assert by_id[third["candidate_set_id"]] == "open"
 
 
@@ -314,6 +350,39 @@ def test_confirm_hash_changed_rejected(tmp_path, monkeypatch):
     candidate = body["items"][0]
 
     r = _confirm(c, cid, candidate, "key-hash", hash_override="sha256:deadbeef")
+    assert r.status_code == 409
+    assert r.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
+    assert r.json()["details"]["reason"] == "hash_changed"
+    assert adapter.calls == 0
+
+
+def test_confirm_tampered_body_and_saved_hash_rejected(tmp_path, monkeypatch):
+    """篡改正文且同步篡改保存哈希 → 确认仍被拒（重算比对，阻断项修复回归）。
+
+    场景：磁盘候选被篡改（正文标题与保存的 content_hash 字段一并改写成一致），
+    但确认请求仍携带篡改前调用方持有的原始 content_hash。确认门必须按当前正文
+    关键字段重算哈希并与请求值比对，发现不一致即 409 hash_changed。
+    """
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    candidate = body["items"][0]
+    original_hash = candidate["content_hash"]
+
+    # 篡改磁盘正文关键字段，并把保存的 content_hash 同步改成篡改后正文的哈希
+    from app.domain import scoring
+
+    store = candidates_store.CandidateStore(home)
+    data = store.load(cid)
+    item = [it for it in data["items"] if it["id"] == candidate["id"]][0]
+    item["title"] = "被篡改的标题"
+    item["content_hash"] = scoring.content_hash(item)  # 与篡改正文一致
+    store._write_set(data)
+
+    # 调用方仍持原始 content_hash，确认门按当前正文重算后必须拒绝
+    r = _confirm(c, cid, candidate, "key-tamper", hash_override=original_hash)
     assert r.status_code == 409
     assert r.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
     assert r.json()["details"]["reason"] == "hash_changed"

@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import secrets
 from datetime import datetime, timedelta, timezone
 
 from app.domain import errors
@@ -51,6 +50,15 @@ def set_filename(date: str, snapshot_sha256: str) -> str:
     """候选集文件名：``<date>-<hash>.json``，hash 取 snapshot_sha256 前 12 位。"""
     digest = snapshot_sha256.replace("sha256:", "")
     return f"{date}-{digest[:12]}.json"
+
+
+def candidate_set_id_for(date: str, snapshot_sha256: str) -> str:
+    """候选集 ID：``<date>-<snapshot_sha256 前 12 位>``（与落盘文件名一致）。
+
+    设计第 2 节路径 ``candidates/<date>-<hash>.json`` 中 ``<hash>`` 由快照内容
+    稳定哈希派生，保证同一快照幂等地落到同一文件；不是随机 token。
+    """
+    return set_filename(date, snapshot_sha256)[:-5]  # 去掉 .json 后缀
 
 
 def _set_date(candidate_set_id: str) -> str:
@@ -189,7 +197,9 @@ class CandidateStore:
         """从指定日期快照生成候选集（10 条，全失败不写）。
 
         幂等：相同 snapshot_sha256 + style_revision 且存在 open 集 → 返回既有集
-        （``created=False``）。``force=true`` 时写审计并把旧 open 集置 superseded。
+        （``created=False``）。同日期已有其它 open 集（不同快照或不同风格）时，
+        另开新集必须显式 ``force=true``（否则 VALIDATION_ERROR 提示）；``force=true``
+        写审计并把旧 open 集置 superseded（不删候选或 run）。
 
         全失败（无法产出 10 条候选）→ 抛 VALIDATION_ERROR（reason=all_failed），
         **不写任何候选集文件**。
@@ -204,6 +214,14 @@ class CandidateStore:
         if existing is not None and not force:
             return existing, False
 
+        # 同日期已有其它 open 集但非精确匹配 → 另开新集需 force（不静默覆盖/并存）
+        if not force:
+            for other in self._open_sets(date):
+                raise errors.validation_error(
+                    "该日期已有候选集，另开新集需 force=true",
+                    {"reason": "set_exists_requires_force", "existing": other.get("candidate_set_id")},
+                )
+
         # 生成候选：全失败（<10 条）则不写
         items = self._generate_items(snapshot)
         if len(items) < CANDIDATE_COUNT:
@@ -212,7 +230,7 @@ class CandidateStore:
             )
 
         now = _now_utc()
-        cid = f"{date}-{secrets.token_hex(6)}"
+        cid = candidate_set_id_for(date, snap_hash)
         candidate_set = {
             "version": 1,
             "candidate_set_id": cid,
@@ -231,16 +249,36 @@ class CandidateStore:
             again = self._find_open_set(snap_hash, style_revision)
             if again is not None and not force:
                 return again, False
+            if not force:
+                for other in self._open_sets(date):
+                    raise errors.validation_error(
+                        "该日期已有候选集，另开新集需 force=true",
+                        {"reason": "set_exists_requires_force", "existing": other.get("candidate_set_id")},
+                    )
             if force:
                 self._supersede_open_sets_locked(cid)
             paths.safe_write_subdir_file(
                 self.home,
                 "candidates",
-                f"{cid}.json",
+                set_filename(date, snap_hash),
                 json.dumps(candidate_set, ensure_ascii=False, indent=2),
             )
             self._audit("candidate_set_created", cid=cid, snapshot_sha256=snap_hash, force=force)
         return candidate_set, True
+
+    def _open_sets(self, date: str) -> list[dict]:
+        """列出该日期所有仍为 open 的候选集（含过期但 set_status 仍 open 的）。"""
+        result = []
+        for fname in paths.safe_list_subdir_filenames(self.home, "candidates"):
+            if not fname.endswith(".json"):
+                continue
+            cid = fname[:-5]
+            if _set_date(cid) != date:
+                continue
+            data = self.load(cid)
+            if data is not None and data.get("set_status") == "open":
+                result.append(data)
+        return result
 
     def _generate_items(self, snapshot: dict) -> list[dict]:
         """规则生成桩：从快照 items 生成候选（非 AI）。"""

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from app.adapters import wewrite as wewrite_adapter
 from app.domain import errors
+from app.domain import scoring
 from app.storage import atomic
 from app.storage import candidates as candidates_store
 from app.storage import jobs as jobs_store
@@ -153,7 +154,11 @@ class ConfirmGate:
             if reason is not None:
                 raise errors.candidate_not_actionable(reason)
 
-            # content_hash 重算比对
+            # content_hash 重算比对：按候选正文关键字段（title/angle/framework/
+            # source_id/source_url）稳定重算，与请求值比对，防止正文与保存哈希同时被篡改。
+            recomputed = scoring.content_hash(item)
+            if recomputed != settings["content_hash"]:
+                raise errors.candidate_not_actionable("hash_changed")
             if item.get("content_hash") != settings["content_hash"]:
                 raise errors.candidate_not_actionable("hash_changed")
 

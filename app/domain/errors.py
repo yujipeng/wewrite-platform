@@ -47,3 +47,23 @@ def validation_error(message: str = "请求参数不合法", details: dict | Non
 
 def upstream_error(message: str = "上游服务调用失败", details: dict | None = None) -> ApiError:
     return ApiError("UPSTREAM_ERROR", message, 502, details)
+
+
+def conflict(message: str = "资源状态冲突", details: dict | None = None) -> ApiError:
+    return ApiError("CONFLICT", message, 409, details)
+
+
+def candidate_not_actionable(
+    reason: str, message: str = "候选当前不可操作", details: dict | None = None
+) -> ApiError:
+    d = dict(details or {})
+    d.setdefault("reason", reason)
+    return ApiError("CANDIDATE_NOT_ACTIONABLE", message, 409, d)
+
+
+def job_not_retractable(message: str = "该任务当前不可撤回", details: dict | None = None) -> ApiError:
+    return ApiError("JOB_NOT_RETRACTABLE", message, 409, details)
+
+
+def publish_disabled(message: str = "发布模式已禁用", details: dict | None = None) -> ApiError:
+    return ApiError("PUBLISH_DISABLED", message, 403, details)

@@ -93,6 +93,7 @@ function currentRoute() {
   const pm = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})\/preview$/);
   if (pm) return { page: "preview", runId: pm[1] };
   if (hash === "#/hotspots") return { page: "hotspots" };
+  if (hash === "#/candidates") return { page: "candidates" };
   return { page: "home" };
 }
 
@@ -101,7 +102,8 @@ async function render() {
   document.querySelectorAll(".nav-link").forEach((n) => {
     const active =
       (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview")) ||
-      (n.dataset.nav === "hotspots" && route.page === "hotspots");
+      (n.dataset.nav === "hotspots" && route.page === "hotspots") ||
+      (n.dataset.nav === "candidates" && route.page === "candidates");
     n.classList.toggle("active", active);
   });
   if (route.page === "home") {
@@ -112,6 +114,8 @@ async function render() {
     await renderPreview(route.runId);
   } else if (route.page === "hotspots") {
     await renderHotspots();
+  } else if (route.page === "candidates") {
+    await renderCandidates();
   }
 }
 
@@ -601,4 +605,255 @@ async function renderHotspots() {
   persistBtn.addEventListener("click", doPersist);
 
   await loadSaved();
+}
+
+// ============ M3：P5 选题确认（候选对比 + 持久化候选池 + 确认门） ============
+
+const CANDIDATE_STATUS_TEXT = {
+  proposed: "待确认",
+  confirmed: "已确认",
+  retracted: "已撤回",
+  expired: "已过期",
+};
+
+const SET_STATUS_TEXT = {
+  open: "进行中",
+  confirmed: "已确认",
+  superseded: "已取代",
+  deleted: "已删除",
+  expired: "已过期",
+};
+
+async function renderCandidates() {
+  app.innerHTML = "";
+  app.appendChild(el("h1", { class: "page-title", text: "选题确认" }));
+
+  // 规则生成桩口径：分数来源标注（硬性要求）
+  app.appendChild(el("div", { class: "notice" }, [
+    "本页候选由规则生成器从当日热榜快照产出（非 AI 评估），相关度/价值分为规则打分，仅作对比参考。",
+  ]));
+
+  const actions = el("div", { class: "preview-controls" });
+  const dateInput = el("input", { type: "date", value: todayLocal(), style: "padding:6px 10px;border:1px solid var(--border);border-radius:6px" });
+  const genBtn = el("button", { class: "btn", text: "生成候选" });
+  const forceBtn = el("button", { class: "btn", text: "强制重开候选集" });
+  const hint = el("span", { class: "muted", text: "相同快照与风格会自动复用既有候选集" });
+  actions.appendChild(dateInput);
+  actions.appendChild(genBtn);
+  actions.appendChild(forceBtn);
+  actions.appendChild(hint);
+  app.appendChild(actions);
+
+  const container = el("div");
+  app.appendChild(container);
+
+  // 生成候选按钮禁用条件：当日快照全源失败（error 非空 / count==0 / items 空）
+  async function refreshGenerateDisabled() {
+    try {
+      const snap = await api("/api/v1/hotspots");
+      const allFailed = !!(snap.error) || (snap.count || 0) === 0 || !(snap.items || []).length;
+      const disabled = allFailed || !snap.date;
+      genBtn.disabled = disabled;
+      forceBtn.disabled = disabled;
+      if (allFailed) {
+        hint.textContent = "当日快照全源失败，无可用条目，请先补抓";
+        hint.classList.add("error-block");
+      } else if (!snap.date) {
+        hint.textContent = "暂无热榜快照，请先到「每日热榜」补抓";
+        hint.classList.add("error-block");
+      } else {
+        hint.textContent = "相同快照与风格会自动复用既有候选集";
+        hint.classList.remove("error-block");
+      }
+    } catch (_) {
+      genBtn.disabled = true;
+      forceBtn.disabled = true;
+      hint.textContent = "读取热榜快照失败，无法生成候选";
+    }
+  }
+
+  const load = async () => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在加载候选集…"));
+    try {
+      const body = await api("/api/v1/candidates");
+      const sets = body.candidates || [];
+      if (sets.length === 0) {
+        container.appendChild(emptyState("还没有候选集，点「生成候选」从当日热榜快照生成"));
+        return;
+      }
+      const latest = sets[0];
+      drawSet(latest);
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.status === 403) container.appendChild(forbiddenState());
+      else container.appendChild(errorState("加载失败：" + (err.code || err.message), load));
+    }
+  };
+
+  const drawSet = (set) => {
+    container.innerHTML = "";
+    const setMeta = el("div", { class: "muted", text: "候选集 " + set.candidate_set_id + " · 状态 " + (SET_STATUS_TEXT[set.set_status] || set.set_status) + " · 创建 " + (set.created_at || "—") + " · 过期 " + (set.expires_at || "—") });
+    container.appendChild(setMeta);
+
+    const items = (set.items || []).slice().sort((a, b) => (b.scores.total - a.scores.total));
+    const grid = el("div", { class: "candidate-grid" });
+    for (const it of items) {
+      grid.appendChild(candidateCard(set, it));
+    }
+    container.appendChild(grid);
+  };
+
+  const candidateCard = (set, it) => {
+    const badges = el("div", { class: "artifact-badges" }, [
+      el("span", { class: "badge " + badgeClass(it.status), text: CANDIDATE_STATUS_TEXT[it.status] || it.status }),
+    ]);
+    const card = el("div", { class: "card candidate-card" }, [
+      el("div", { class: "run-title", text: it.title }),
+      el("div", { class: "muted", text: "角度：" + (it.angle || "—") }),
+      el("div", { class: "muted", text: "框架：" + (it.framework || "—") + " · 来源：" + (it.source || "—") }),
+      el("div", { class: "scores" }, [
+        scoreLine("总分", it.scores.total),
+        scoreLine("热度", it.scores.hot_normalized),
+        scoreLine("相关度", it.scores.relevance),
+        scoreLine("价值", it.scores.value),
+      ]),
+      el("div", { class: "muted", text: "评分来源：规则生成（非 AI 评估）" }),
+      badges,
+    ]);
+
+    const btnRow = el("div", { class: "preview-controls" });
+    if (it.status === "proposed" && set.set_status === "open") {
+      const confirmBtn = el("button", { class: "btn", text: "确认选题", onclick: () => openConfirm(set, it) });
+      btnRow.appendChild(confirmBtn);
+    }
+    if (it.status === "confirmed") {
+      const retractBtn = el("button", { class: "btn", text: "撤回", onclick: () => doRetract(set, it) });
+      btnRow.appendChild(retractBtn);
+    }
+    card.appendChild(btnRow);
+    return card;
+  };
+
+  const scoreLine = (label, v) => el("div", { class: "muted", text: label + "：" + (v == null ? "—" : v) });
+
+  const badgeClass = (status) => {
+    if (status === "confirmed") return "badge-completed";
+    if (status === "retracted") return "badge-failed";
+    if (status === "expired") return "badge-failed";
+    return "badge-active";
+  };
+
+  const openConfirm = (set, it) => {
+    const modal = el("div", { class: "modal-backdrop" }, [
+      el("div", { class: "modal card" }, [
+        el("h3", { text: "确认选题" }),
+        el("div", { class: "muted", text: "拟定标题：" + it.title }),
+        el("label", { text: "图片上限（0–10）" }),
+        el("input", { type: "number", min: "0", max: "10", value: "4", id: "max-images" }),
+        el("label", { text: "预算（元）" }),
+        el("input", { type: "number", min: "0", step: "0.01", value: "10", id: "max-cost" }),
+        el("div", { class: "muted", text: "mode=draft · visual_mode=full · allow_publish=false（固定，发布前移 MVP 另走 P7 预检）" }),
+        el("div", { class: "preview-controls" }, [
+          el("button", { class: "btn", text: "确认生成", onclick: () => doConfirm(set, it, modal) }),
+          el("button", { class: "btn", text: "取消", onclick: () => { modal.remove(); } }),
+        ]),
+        el("div", { class: "muted", id: "confirm-result", text: "" }),
+      ]),
+    ]);
+    app.appendChild(modal);
+  };
+
+  const doConfirm = async (set, it, modal) => {
+    const maxImages = parseInt(document.getElementById("max-images").value, 10) || 0;
+    const maxCost = parseFloat(document.getElementById("max-cost").value) || 0;
+    const key = "web-" + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + "-" + Math.random().toString(16).slice(2));
+    const resultEl = document.getElementById("confirm-result");
+    try {
+      const token = await csrfToken();
+      const res = await fetch(`/api/v1/candidates/${set.candidate_set_id}/confirm`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": token,
+          "Idempotency-Key": key,
+        },
+        body: JSON.stringify({
+          candidate_id: it.id,
+          content_hash: it.content_hash,
+          max_images: maxImages,
+          max_image_cost: maxCost,
+          mode: "draft",
+          visual_mode: "full",
+        }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const body = await res.json();
+      resultEl.textContent = "已确认：run_id=" + body.run_id + " job_id=" + body.job_id;
+      setTimeout(() => load(), 600);
+    } catch (err) {
+      resultEl.textContent = "确认失败：" + (err.code || err.message);
+      resultEl.classList.add("error-block");
+    }
+  };
+
+  const doRetract = async (set, it) => {
+    if (!window.confirm("确认撤回该选题？run 会保留，仅标记为已撤回。")) return;
+    try {
+      const token = await csrfToken();
+      const res = await fetch(`/api/v1/candidates/${set.candidate_set_id}/retract`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ candidate_id: it.id }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      await load();
+    } catch (err) {
+      window.alert("撤回失败：" + (err.code || err.message));
+    }
+  };
+
+  const doGenerate = async (force) => {
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在生成候选…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/candidates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ date: dateInput.value || todayLocal(), style_revision: "sha256:web-default", force }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const body = await res.json();
+      drawSet(body);
+    } catch (err) {
+      container.innerHTML = "";
+      container.appendChild(errorState("生成失败：" + (err.code || err.message), () => doGenerate(force)));
+    }
+  };
+
+  genBtn.addEventListener("click", () => doGenerate(false));
+  forceBtn.addEventListener("click", () => doGenerate(true));
+
+  await refreshGenerateDisabled();
+  await load();
+}
+
+function todayLocal() {
+  const d = new Date();
+  const off = d.getTimezoneOffset();
+  const local = new Date(d.getTime() - off * 60000);
+  return local.toISOString().slice(0, 10);
 }

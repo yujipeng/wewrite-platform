@@ -6,7 +6,7 @@
 
 - 后端固定 `FastAPI` + `uvicorn`，单进程、`workers=1`；长任务由进程内 asyncio 调度器串行消费一个 durable job 队列，外部慢调用使用受控线程/子进程，重启后由 job 文件恢复。
 - 前端固定原生 HTML/CSS/ES modules，无 Node/Vite 构建；FastAPI 同进程挂载 `web/` 静态文件。这样 M1 在只有 Python 的空仓即可运行，减少前端依赖和跨源问题。
-- Python 依赖 `wewrite==4.2.1`（Python >=3.11）。平台只调用其公开函数/CLI：`runs`、`WeChatConverter`/`make_paste_safe`、`load_theme`、`generate_batch`、`upload_image`/`upload_thumb`、`create_draft`/`get_draft`、`llm-write`。不得复制 converter/theme/publisher/image_gen/runs；需要能力时提上游 PR。
+- Python 依赖 `wewrite==4.2.1`（Python >=3.11）。平台只调用其公开函数/CLI：`runs`、`WeChatConverter`/`make_paste_safe`、`load_theme`、`generate_batch`、`wewrite.toolkit.wechat_api.upload_image`、`wewrite.toolkit.wechat_api.upload_thumb`、`create_draft`/`get_draft`、`llm-write`。不得复制 converter/theme/publisher/image_gen/runs；需要能力时提上游 PR。
 - 状态源为 `$WEWRITE_HOME` 下 YAML/JSON/Markdown/图片文件；不引入 SQLite、Redis、Celery。所有写入由 `platform.lock`（`flock`）保护，临时文件同目录写入、`fsync` 后 `os.replace`，目录也 `fsync`。
 - 单机前提是平台是该 `WEWRITE_HOME` 的唯一写者；外部 `wewrite` CLI 只读或先停止平台。上游 `_atomic_write_text` 自身没有锁，平台不能宣称能约束外部进程。
 - 监听默认 `127.0.0.1:8765`。Docker 进程监听容器 `0.0.0.0`，compose 只映射宿主 `127.0.0.1:8765`。
@@ -34,7 +34,7 @@ $WEWRITE_HOME/
   audit/YYYY-MM-DD.jsonl
 ```
 
-读路径必须在打开时校验：严格校验 `run_id` → 固定产物名白名单 `brief,article,draft,illustrated_article,review_report,images_manifest,sources,preview` → 以 run 目录 fd 为基准用 `openat` + `O_NOFOLLOW` 打开 → `fstat` 复核 inode 仍为目标文件 → 读取。禁止绝对路径、`..`、符号链接和先 `lstat`/`realpath` 后按路径打开的竞态写法；artifact 与 preview 共用该函数。
+读路径必须在打开时校验，artifact 与 preview 共用同一个 `safe_open_run_file` 函数。进程启动时记录 `$WEWRITE_HOME` 的 `st_dev`/`st_ino`；每次读取以 `os.open(WEWRITE_HOME, O_DIRECTORY|O_NOFOLLOW)` 重新取得状态根 fd，并与启动值比对，不一致即 `403 PATH_FORBIDDEN`。从该 fd 起逐级 `os.open(..., dir_fd=parent_fd, flags=O_DIRECTORY|O_NOFOLLOW)` 打开 `runs`、合法 `run_id` 目录；任一级 `ELOOP`、`ENOTDIR` 或非目录均统一为 `403 PATH_FORBIDDEN`，不得回退为按路径打开。最后仅允许固定产物名白名单 `brief,article,draft,illustrated_article,review_report,images_manifest,sources,preview`，用 `os.open(name, O_NOFOLLOW|O_RDONLY, dir_fd=run_fd)` 打开，`fstat` 确认 `S_ISREG` 且 `st_nlink >= 1`，全程从该 fd（如 `os.fdopen`）读取，读完不得再按路径打开。禁止绝对路径、`..`、符号链接、`pathlib` 拼路径和先 `lstat`/`realpath` 后按路径打开的竞态写法。
 
 平台自身每次 JSON/YAML 写入执行：取得全局锁 → 读取并校验版本 → 同目录临时文件 `0600` → UTF-8 写入、`fsync` → `os.replace` → 父目录 `fsync` → 释放锁。单文件锁不能替代全局锁。平台调用上游写接口时同样持有全局锁，返回后对受影响文件及目录补 fsync；不得把上游无锁实现说成天然具备这些保证。崩溃恢复扫描 `jobs/*.json`：`running` 无心跳超过 120 秒转 `unknown`（外部调用可能已发生），`queued` 可撤回；绝不根据未知状态重放微信写入。
 
@@ -84,7 +84,7 @@ secret/API key 永远只给 `*_configured`，不回显明文或末四位；appid
 
 表中路径统一加 `/api/v1` 前缀，唯一例外是根路径 `/healthz`。未带业务参数的变更请求仍发送 JSON `{}`；请求表中 `?` 表示可选字段，其余必填。集合/任务 ID 只允许服务端生成的格式，不接受路径。
 
-`GET /api/v1/bootstrap` 返回 `{csrf_token,version,server_started_at}`；token 只在进程内存保存，重启失效，前端遇 `403 CSRF_INVALID` 自动重新取得一次。只有 POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`、`Sec-Fetch-Site: same-origin` 和 `X-CSRF-Token`；GET 与 `/healthz` 只做 Host 校验。无 CORS。Host 只允许 `127.0.0.1:<port>`、`[::1]:<port>`、`localhost:<port>`，拒绝其它 Host 防 DNS rebinding。错误统一 `{code,message,details?}`；稳定码如下：`RUN_ID_INVALID`/400、`PATH_FORBIDDEN`/403、`NOT_FOUND`/404、`VALIDATION_ERROR`/422、`CONFLICT`/409、`ENV_MANAGED`/409、`CANDIDATE_NOT_ACTIONABLE`/409、`JOB_NOT_RETRACTABLE`/409、`PUBLISH_DISABLED`/403、`PREFLIGHT_FAILED`/422、`TOKEN_INVALID`/409、`PUBLISH_UNKNOWN`/409、`UPSTREAM_ERROR`/502、`BUSY`/503、`CSRF_INVALID`/403。候选不可操作统一 `CANDIDATE_NOT_ACTIONABLE`，`details.reason` 为 `not_proposed|expired|hash_changed|set_closed`。
+`GET /api/v1/bootstrap` 返回 `{csrf_token,version,server_started_at}`；token 只在进程内存保存，重启失效，前端遇 `403 CSRF_INVALID` 自动重新取得一次。只有 POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`、`Sec-Fetch-Site: same-origin` 和 `X-CSRF-Token`；普通 GET 与 `/healthz` 只做 Host 校验。唯一例外是会触发外部抓取的 `GET /api/v1/hotspots?refresh=1`：还必须校验 `Origin` 为 `http://127.0.0.1:<port>`、`http://localhost:<port>` 或 `http://[::1]:<port>` 之一且 `Sec-Fetch-Site: same-origin`；缺失或为 `cross-site`/`same-site` 等其它值时，在调用 fetcher 前返回 `403 CSRF_INVALID` 且 `details.reason=refresh_requires_same_origin`，不得发起出网请求。浏览器同源 `fetch` 会自动携带这两个请求头，不需要 CSRF token。无 CORS。Host 只允许 `127.0.0.1:<port>`、`[::1]:<port>`、`localhost:<port>`，拒绝其它 Host 防 DNS rebinding。错误统一 `{code,message,details?}`；稳定码如下：`RUN_ID_INVALID`/400、`PATH_FORBIDDEN`/403、`NOT_FOUND`/404、`VALIDATION_ERROR`/422、`CONFLICT`/409、`ENV_MANAGED`/409、`CANDIDATE_NOT_ACTIONABLE`/409、`JOB_NOT_RETRACTABLE`/409、`PUBLISH_DISABLED`/403、`PREFLIGHT_FAILED`/422、`TOKEN_INVALID`/409、`PUBLISH_UNKNOWN`/409、`UPSTREAM_ERROR`/502、`BUSY`/503、`CSRF_INVALID`/403。候选不可操作统一 `CANDIDATE_NOT_ACTIONABLE`，`details.reason` 为 `not_proposed|expired|hash_changed|set_closed`。
 
 | 方法与路径 | 请求 | 成功响应与幂等语义 |
 |---|---|---|
@@ -95,7 +95,7 @@ secret/API key 永远只给 `*_configured`，不回显明文或末四位；appid
 | `POST /preview` | `{run_id,source:"draft|article|illustrated_article",theme}` | `{html,paste_safe_html,title,digest,source_sha256,filtered_count}`；同输入 hash 稳定，可缓存；使用 `WeChatConverter` 后过滤 `<script>`、事件属性和 `javascript:` URL，iframe 固定 `sandbox` 且不含 `allow-scripts`。 |
 | `GET /healthz` | 无 | `{status:"ok",version}`；只读、只 Host 校验。 |
 | `GET /themes` | 无 | `{themes:[{name,description}]}`，名称来自 `list_themes`，不接受路径。 |
-| `GET /hotspots?limit=20&refresh=1` | `limit` 1–100；GET 始终只 Host 校验 | `refresh=1` 只抓取并返回当下数据，不写快照或 `last_success_at`；需要持久化时调用 `POST /hotspots/refresh`。否则返回当前快照 `{date,items,sources,sources_failed,last_success_at,error,count}`。 |
+| `GET /hotspots?limit=20&refresh=1` | `limit` 1–100；普通请求只 Host 校验，`refresh=1` 另需同源 `Origin` + `Sec-Fetch-Site: same-origin` | `refresh=1` 先完成同源校验再抓取并返回当下数据，不写快照或 `last_success_at`；缺失/错误请求头返回 `403 CSRF_INVALID`、`details.reason=refresh_requires_same_origin` 且不调用 fetcher。浏览器同源 `fetch` 自动携带请求头，不需 CSRF token。需要持久化时调用 `POST /hotspots/refresh`。否则返回当前快照 `{date,items,sources,sources_failed,last_success_at,error,count}`。 |
 | `GET /hotspot-snapshots` | 无 | `{dates:["YYYY-MM-DD"]}`，仅最近 30 天；`GET /hotspots/{date}` 返回对应快照。 |
 | `GET /hotspots/{date}` | `YYYY-MM-DD` | 返回已保存命名快照，缺失或超过保留期 `404 NOT_FOUND`。 |
 | `POST /hotspots/refresh` | `{date?:"YYYY-MM-DD",limit?:20}` | 同一刷新服务；`date` 只命名文件，抓取当下数据。全失败不覆盖。 |
@@ -113,7 +113,7 @@ secret/API key 永远只给 `*_configured`，不回显明文或末四位；appid
 | `GET /runs/{run_id}/publish/preflight` | 无 | 只读幂等 `{ok,revision,checks:[{name,ok,code,message}]}`；标题非空、digest UTF-8 字节数 <=120、正文 200–20000 字符、图片 <=10 且可读、表格 <=4 列、cover 必需、权限/审稿通过。revision 是被检查内容投影 hash。 |
 | `PUT /runs/{run_id}/publish/permission` | `{allow:true|false,reason?}` | 仅用户主动操作；调用上游 `set_publish_permission`，写 `audit/*.jsonl`（actor=`local-user`、UTC 时间、run_id、前后值、reason）；返回 `{permissions:{publish},revision}`。撤销立即作废该 run 未消费 token。 |
 | `POST /runs/{run_id}/publish/token` | `{revision,checked:true,title}` | revision 必须匹配 GET 预检，权限当前为 true 且标题完全相同才签发 token；不匹配 `409 CONFLICT`；其它预检项失败返回 `422 PREFLIGHT_FAILED`。 |
-| `POST /runs/{run_id}/publish` | `{token,title,checked:true}` | 锁内消费 token，并再次核对权限、revision、内容绑定；上传正文内本地图片 (`upload_image`)，封面 (`upload_thumb`)，最后 `create_draft`。成功 `{status:"succeeded",media_id}`；超时 `{status:"unknown"}`，之后禁止重复提交。 |
+| `POST /runs/{run_id}/publish` | `{token,title,checked:true}` | 锁内消费 token，并再次核对权限、revision、内容绑定；按固定顺序调用 `wewrite.toolkit.wechat_api.upload_image` 上传正文图片，再调用 `wewrite.toolkit.wechat_api.upload_thumb` 上传封面，最后调用 `create_draft`（封面缺失时上游会 `ValueError`，不得先创建草稿）。成功 `{status:"succeeded",media_id}`；超时 `{status:"unknown"}`，之后禁止重复提交。 |
 | `POST /runs/{run_id}/publish/reconcile` | `{media_id}` | 有 media_id 才调用 `get_draft`；双方用 `html_to_plaintext` 归一化后比较文本 hash，只有文本不同才判不一致。仅文本核对，不代表图片与排版一致；无 media_id 只返回人工核对指引。保存提交 HTML、双方归一化文本 hash 与核对时间；对账不能解除 unknown 的重发禁令。 |
 | `GET /config` | 无 | 配置投影与 `env_managed`，无 secret。 |
 | `PUT /config` | `{theme?,image:{provider,model,api_key,base_url,max_cost,estimated_cost_per_image}?,wechat:{appid,secret,author}?,clear:[...]}` | 白名单字段原子写；`appid`/`author` 可编辑，`secret`、`api_key` 允许只写不读；writer 环境配置整体只读并拒绝写入；空值保持原值，显式 clear 二次确认；环境变量接管字段返回 `409 ENV_MANAGED`，整包失败不局部提交。 |
@@ -147,7 +147,7 @@ wewrite-platform/
 ## 5. M1–M4 顺序与 DoD
 
 1. `feat/m1-skeleton`（父任务 stage 3，P1/P2）：空 `WEWRITE_HOME` 可启动首页、bootstrap/healthz、锁/原子写、run 安全投影、运行详情含 publish 投影；本阶段已交付路由返回稳定错误，不要求预造后续功能路由。可独立合并，`python -m pytest -q` 全绿；不含 P8 配置或 Docker 验收。
-2. `feat/m2-preview-hotspots`（stage 4，P3/P4）：themes、preview 安全过滤、热榜 CLI 适配、30 天快照/部分失败、hotspot 日期列表与刷新查询；fixture 能完成“刷新→快照→预览”。可独立合并，`python -m pytest -q` 全绿。
+2. `feat/m2-preview-hotspots`（stage 4，P3/P4）：themes、preview 安全过滤、热榜 CLI 适配、30 天快照/部分失败、hotspot 日期列表与刷新查询；`refresh=1` 的跨站/无头请求必须在 fake fetcher 计数为 0 时返回 `403 CSRF_INVALID`，同源请求正常；fixture 能完成“刷新→快照→预览”。可独立合并，`python -m pytest -q` 全绿。
 3. `feat/m3-topic-gate`（stage 5，P5）：候选生成/回读/删除保护/过期门、评分、force 审计、confirm intent→run→queued、撤回 CAS；只实现首个 job 的持久化与 queued 撤回，不启动 worker 消费，不包含 P6/P7。可独立合并，`python -m pytest -q` 全绿。
 4. `feat/m4-generate-publish`（stage 6，P6/P7/P8/Docker）：启用 worker 自动消费既有 queued job，首次生成仅来自 confirm，不提供独立 generate 端点；resume/批处理图片、写作退出码、预检 GET、发布授权、一次性 token、微信 draft/get 文本对账、config/style、容器化。无凭据走 dry-run，凭据存在才允许真实写。可独立合并，`python -m pytest -q` 全绿。
 
@@ -156,7 +156,7 @@ wewrite-platform/
 ## 6. 测试与本地一键运行
 
 - 单元：评分公式、UTF-8 digest、状态机、路径/symlink、原子写、token fence、预检每个失败项。
-- 返修复验：bootstrap 重启失效/自动重取一次、GET 与 healthz 无 CSRF、路径并发换 symlink、HTML 脚本过滤计数、call_started 各崩溃点不二次创建、授权撤销废 token/提交前变化拒绝、摘要手填 120/121 字节、writer 退出码 3/4 且旧正文不变、热点全失败 exit 0 与中文来源/0-based rank、对账仅文本等，均用 fixture。
+- 返修复验：bootstrap 重启失效/自动重取一次、GET 与 healthz 无 CSRF、`runs/` 被替换为 symlink 和 `runs/<run_id>/` 被替换为 symlink 均返回 `403 PATH_FORBIDDEN`、并发换 symlink 时断言读取的是已打开 fd 快照、`refresh=1` 缺失或 cross-site/same-site 头时在 fake fetcher 计数为 0 的情况下返回 `403 CSRF_INVALID` 且同源请求成功、HTML 脚本过滤计数、call_started 各崩溃点不二次创建、授权撤销废 token/提交前变化拒绝、摘要手填 120/121 字节、writer 退出码 3/4 且旧正文不变、热点全失败 exit 0 与中文来源/0-based rank、对账仅文本等，均用 fixture。
 - 集成：`tmp_path/WEWRITE_HOME` + fake `WeWriteAdapter`，覆盖同日全失败不覆盖、confirm 幂等、queued 撤回、running 拒绝、批处理部分失败、unknown 禁止重复写、env 409。
 - 浏览器：Playwright 验证 P1–P8 关键点击、iframe `sandbox` 无 `allow-scripts`、失败图和发布按钮状态；不依赖公网。
 - `make test`（或 `python -m pytest -q`）先创建临时 HOME、启动 `uvicorn`、运行接口/Playwright、清理临时目录。fixture 至少包含空 HOME、三状态 run、三源部分失败快照、成功/失败图片 manifest、publishable 和 blocked 两篇文章。

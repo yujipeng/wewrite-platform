@@ -85,7 +85,7 @@ def preview(
     from wewrite.toolkit.converter import WeChatConverter, make_paste_safe
     from wewrite.toolkit.theme import list_themes, load_theme
 
-    if source not in PREVIEW_SOURCES:
+    if not isinstance(source, str) or source not in PREVIEW_SOURCES:
         raise errors.validation_error("source 只允许 draft|article|illustrated_article", {"field": "source"})
 
     # 主题名称必须来自 list_themes()，不接受外部传入路径

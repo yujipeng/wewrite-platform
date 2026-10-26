@@ -110,6 +110,23 @@ def test_preview_invalid_source_rejected(client):
     assert r.json()["code"] == "VALIDATION_ERROR"
 
 
+def test_preview_source_non_string_rejected_not_500(client):
+    """阻断 C：source 传 dict/list 必须 422 而非 500。"""
+    for bad in ({"a": 1}, ["article"], 123, None):
+        r = client.post(
+            "/api/v1/preview",
+            json={"run_id": "20261026-100000-abcdef", "source": bad, "theme": "professional-clean"},
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "http://127.0.0.1:8765",
+                "Sec-Fetch-Site": "same-origin",
+                "X-CSRF-Token": client.get("/api/v1/bootstrap").json()["csrf_token"],
+            },
+        )
+        assert r.status_code == 422, bad
+        assert r.json()["code"] == "VALIDATION_ERROR"
+
+
 def test_preview_unknown_theme_rejected(client):
     r = client.post(
         "/api/v1/preview",

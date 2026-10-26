@@ -21,7 +21,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from app.domain import errors
-from app.storage.atomic import atomic_write_text, PlatformLock
+from app.storage import paths
 
 # 中文展示名 -> 英文源 ID 映射表（设计第 2.2 节与 issue 第二节第 4 条）。
 SOURCE_LABEL_TO_ID = {
@@ -30,12 +30,8 @@ SOURCE_LABEL_TO_ID = {
     "今日头条": "toutiao",
 }
 
-# 英文源 ID -> 中文展示名（反向映射，用于把 items[].source 归一化）。
-SOURCE_ID_TO_LABEL = {v: k for k, v in SOURCE_LABEL_TO_ID.items()}
-
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_UTC = timezone.utc
 _SHANGHAI = timezone(timedelta(hours=8))
 
 RETENTION_DAYS = 30
@@ -82,14 +78,21 @@ class HotspotFetcher:
 
         上游全源失败仍以退出码 0 输出含 error/count 的 JSON；本函数只保证
         「抓取动作本身」的成功与否，是否全失败由调用方据 error/count/items 判定。
+        超时（TimeoutExpired）与 OSError（CLI 不存在等）统一映射 UPSTREAM_ERROR，
+        不得逃成 500。
         """
         cmd = [sys.executable, "-m", "wewrite.commands.fetch_hotspots", "--limit", str(limit)]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise errors.upstream_error("热榜抓取超时", {"reason": "timeout"}) from exc
+        except OSError as exc:
+            raise errors.upstream_error("热榜抓取失败", {"reason": "os_error"}) from exc
         if proc.returncode != 0:
             raise errors.upstream_error(
                 "热榜抓取失败", {"reason": "cli_nonzero_exit", "exit_code": proc.returncode}
@@ -149,16 +152,14 @@ def is_all_failed(snapshot: dict) -> bool:
 
 
 class HotspotStore:
-    """热榜快照落盘与读取。所有路径引用基准为 WEWRITE_HOME。"""
+    """热榜快照落盘与读取。
+
+    所有读/写都走 ``app.storage.paths`` 的同一套逐级 openat + O_NOFOLLOW 防线，
+    不再出现 ``os.path.join(self.home, ...)`` 后直接 ``open()``/``os.replace``。
+    """
 
     def __init__(self, home: str):
         self.home = home
-
-    def _snap_dir(self) -> str:
-        return os.path.join(self.home, "hotspots")
-
-    def _snap_path(self, date: str) -> str:
-        return os.path.join(self._snap_dir(), f"{date}.json")
 
     def _now_local_date(self) -> str:
         return _local_date(datetime.now(timezone.utc))
@@ -173,14 +174,12 @@ class HotspotStore:
         snapshot = _build_snapshot(raw, target_date)
 
         if not is_all_failed(snapshot):
-            # 成功：原子写快照（不覆盖性由 atomic_write_text 的 os.replace 保证，
-            # 这里额外用锁保证并发下先到先得且不丢上一份成功数据）
-            os.makedirs(self._snap_dir(), exist_ok=True)
-            with PlatformLock(self.home):
-                atomic_write_text(
-                    self._snap_path(target_date),
-                    json.dumps(snapshot, ensure_ascii=False, indent=2),
-                )
+            # 成功：走 Paths 安全写（同目录临时文件 + os.replace，全程 dir_fd）
+            paths.safe_write_hotspot_file(
+                self.home,
+                target_date,
+                json.dumps(snapshot, ensure_ascii=False, indent=2),
+            )
 
         # 响应统一返回设计第 3 节的字段集
         return {
@@ -231,9 +230,9 @@ class HotspotStore:
         }
 
     def read_date(self, date: str) -> dict:
-        """读单日快照；缺失或超保留期 404。"""
+        """读单日快照；缺失或超保留期 404，symlink/非目录 403。"""
         validate_date(date)
-        # 保留期检查：早于最近 30 天窗口直接 404
+        # 保留期检查：早于最近 30 天窗口或晚于今天，直接 404
         today = datetime.now(_SHANGHAI).date()
         try:
             d = datetime.strptime(date, "%Y-%m-%d").date()
@@ -241,26 +240,24 @@ class HotspotStore:
             raise errors.not_found()
         if d < today - timedelta(days=RETENTION_DAYS - 1):
             raise errors.not_found()
-        path = self._snap_path(date)
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
+        if d > today:
             raise errors.not_found()
+        try:
+            fd, _st = paths.safe_open_hotspot_file(self.home, date)
+        except errors.ApiError as exc:
+            raise
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                raise errors.not_found()
 
     def list_dates(self) -> list[str]:
         """列出快照日期（仅最近 30 天，升序）。"""
-        snap_dir = self._snap_dir()
-        if not os.path.isdir(snap_dir):
-            return []
+        names = paths.list_hotspot_filenames(self.home)
         cutoff = datetime.now(_SHANGHAI).date() - timedelta(days=RETENTION_DAYS - 1)
         dates = []
-        for name in os.listdir(snap_dir):
-            if not name.endswith(".json"):
-                continue
-            d = name[:-5]
-            if not _DATE_RE.fullmatch(d):
-                continue
+        for d in names:
             try:
                 parsed = datetime.strptime(d, "%Y-%m-%d").date()
             except ValueError:

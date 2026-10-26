@@ -435,8 +435,6 @@ async function renderPreview(runId) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Origin": location.origin,
-          "Sec-Fetch-Site": "same-origin",
           "X-CSRF-Token": token,
         },
         body: JSON.stringify({ run_id: runId, source: sourceSelect.value, theme: themeSelect.value }),
@@ -574,8 +572,6 @@ async function renderHotspots() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Origin": location.origin,
-          "Sec-Fetch-Site": "same-origin",
           "X-CSRF-Token": token,
         },
         body: JSON.stringify({ limit: 20 }),

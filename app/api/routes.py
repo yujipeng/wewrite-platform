@@ -7,12 +7,13 @@ import os
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app import __version__
 from app.adapters import hotspots as hotspots_adapter
 from app.adapters import preview as preview_adapter
 from app.domain import errors
-from app.middleware import normalize_host_port, origin_host_matches
+from app.middleware import normalize_host_port, origin_host_matches, referer_host_matches
 from app.storage import paths, projections
 
 router = APIRouter()
@@ -155,17 +156,30 @@ async def preview(request: Request):
 
 
 def _require_same_origin_refresh(request: Request) -> bool:
-    """refresh=1 的同源校验（设计 :87/:98）：Origin 必须是三种回环 host 之一且端口一致，
-    Sec-Fetch-Site 必须 same-origin。返回 False 表示应拒绝（不得发起抓取）。"""
+    """refresh=1 的同源校验（设计 :87/:98，按项目编排返修口径修正）。
+
+    同源 GET 不携带 ``Origin``（仅同源 POST 才带），因此主闸门是
+    ``Sec-Fetch-Site: same-origin``（浏览器强制、页面脚本改不了）：
+
+    1. ``Sec-Fetch-Site`` 必须 ``same-origin``；
+    2. ``Origin`` 存在时必须同源（host+端口）；不存在时校验 ``Referer``
+       的 scheme+host+端口 与 Host 一致；
+    3. 两者都缺失 → 拒绝（非浏览器客户端走这条），不调用 fetcher。
+    """
     host_header = request.headers.get("host")
     bare_host, host_port = normalize_host_port(host_header)
     origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
     sec_fetch_site = request.headers.get("sec-fetch-site")
+
     if sec_fetch_site != "same-origin":
         return False
-    if not origin_host_matches(origin, bare_host, host_port):
-        return False
-    return True
+
+    if origin:
+        return origin_host_matches(origin, bare_host, host_port)
+    if referer:
+        return referer_host_matches(referer, bare_host, host_port)
+    return False
 
 
 @router.get("/api/v1/hotspots")
@@ -186,7 +200,9 @@ async def get_hotspots(request: Request):
                 errors.csrf_invalid({"reason": "refresh_requires_same_origin"})
             )
         try:
-            data = hotspots_adapter.HotspotStore(_home()).fetch_now(_fetcher(request), limit)
+            data = await run_in_threadpool(
+                hotspots_adapter.HotspotStore(_home()).fetch_now, _fetcher(request), limit
+            )
         except errors.ApiError as exc:
             return _error_response(exc)
         return data
@@ -239,8 +255,11 @@ async def refresh_hotspots(request: Request):
             return _error_response(exc)
 
     try:
-        data = hotspots_adapter.HotspotStore(_home()).fetch_and_persist(
-            _fetcher(request), limit, date
+        data = await run_in_threadpool(
+            hotspots_adapter.HotspotStore(_home()).fetch_and_persist,
+            _fetcher(request),
+            limit,
+            date,
         )
     except errors.ApiError as exc:
         return _error_response(exc)

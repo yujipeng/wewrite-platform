@@ -127,6 +127,41 @@ def origin_host_matches(origin: str | None, host_bare: str, host_port: int | Non
     return ip.is_loopback and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
 
 
+def referer_host_matches(referer: str | None, host_bare: str, host_port: int | None) -> bool:
+    """校验 Referer 的 scheme+host+端口 与 Host 一致（同源 GET 无 Origin，用 Referer 兜底）。
+
+    Referer 形如 ``http://127.0.0.1:<port>/path``；仅校验 scheme、host、端口三项，
+    忽略路径。返回 False 表示缺失或不同源。
+    """
+    if not referer:
+        return False
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(referer)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    referer_host = parsed.hostname or ""
+    if referer_host != host_bare:
+        return False
+    referer_port = parsed.port
+    if referer_port is None:
+        referer_port = 80 if parsed.scheme == "http" else 443
+    if host_port is None:
+        host_port = 80
+    if referer_port != host_port:
+        return False
+    if referer_host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(referer_host)
+    except ValueError:
+        return False
+    return ip.is_loopback and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
+
+
 class HostCsrfMiddleware:
     """FastAPI 中间件：Host 校验 + 变更方法 CSRF/Content-Type 校验。
 

@@ -8,6 +8,7 @@ import os
 
 from fastapi.testclient import TestClient
 
+from app.domain import errors
 from app.main import create_app
 
 
@@ -21,6 +22,17 @@ class FakeFetcher:
     def fetch(self, limit):
         self.calls += 1
         return self.payload
+
+
+class TimeoutFetcher:
+    """模拟超时：抛 UPSTREAM_ERROR（reason=timeout）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def fetch(self, limit):
+        self.calls += 1
+        raise errors.upstream_error("热榜抓取超时", {"reason": "timeout"})
 
 
 def ok_payload():
@@ -205,6 +217,109 @@ def test_refresh_get_wrong_origin_port_rejected(tmp_path, monkeypatch):
     assert r.status_code == 403
     assert r.json()["code"] == "CSRF_INVALID"
     assert fetcher.calls == 0
+
+
+def test_refresh_get_browser_shape_no_origin_with_referer_allowed(tmp_path, monkeypatch):
+    """阻断 A 核心回归：真实浏览器同源 GET 不带 Origin，只有
+    Sec-Fetch-Site: same-origin + Referer 同源 → 200 且 fetcher 计数 1。"""
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, str(tmp_path), fetcher)
+    r = c.get(
+        "/api/v1/hotspots",
+        params={"limit": 20, "refresh": 1},
+        headers={"Sec-Fetch-Site": "same-origin", "Referer": "http://127.0.0.1:8765/page1.html"},
+    )
+    assert r.status_code == 200
+    assert fetcher.calls == 1
+
+
+def test_refresh_get_no_origin_cross_site_referer_rejected(tmp_path, monkeypatch):
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, str(tmp_path), fetcher)
+    r = c.get(
+        "/api/v1/hotspots",
+        params={"limit": 20, "refresh": 1},
+        headers={"Sec-Fetch-Site": "same-origin", "Referer": "http://evil.example/page.html"},
+    )
+    assert r.status_code == 403
+    assert r.json()["code"] == "CSRF_INVALID"
+    assert fetcher.calls == 0
+
+
+def test_hotspots_dir_symlink_rejected_reads(tmp_path, monkeypatch):
+    """阻断 B：hotspots/ 整体换成 symlink，三个读端点均 403 且读不到诱饵。"""
+    home = str(tmp_path)
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, home, fetcher)
+    # 先正常写一份快照并钉住状态根身份
+    c.post("/api/v1/hotspots/refresh", json={"date": "2026-10-26"}, headers=post_headers(c))
+    c.get("/api/v1/runs")
+
+    real = os.path.join(home, "hotspots")
+    os.rename(real, os.path.join(home, "hotspots.real"))
+    outside = os.path.join(home, "evil-hotspots")
+    os.makedirs(outside, exist_ok=True)
+    with open(os.path.join(outside, "2026-10-26.json"), "w", encoding="utf-8") as f:
+        f.write('{"date":"2026-10-26","count":99,"items":[{"title":"EVIL","source":"微博","source_id":"weibo"}]}')
+    os.symlink(outside, real)
+
+    for path in ("/api/v1/hotspots/2026-10-26", "/api/v1/hotspot-snapshots", "/api/v1/hotspots"):
+        r = c.get(path)
+        assert r.status_code == 403, path
+        assert r.json()["code"] == "PATH_FORBIDDEN", path
+        assert "EVIL" not in r.text
+
+
+def test_hotspot_file_symlink_rejected(tmp_path, monkeypatch):
+    """阻断 B：hotspots/<date>.json 叶文件换成 symlink → 403 且读不到外部内容。"""
+    home = str(tmp_path)
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, home, fetcher)
+    c.post("/api/v1/hotspots/refresh", json={"date": "2026-10-26"}, headers=post_headers(c))
+    c.get("/api/v1/runs")
+
+    snap = os.path.join(home, "hotspots", "2026-10-26.json")
+    outside = os.path.join(home, "evil-leaf.json")
+    with open(outside, "w", encoding="utf-8") as f:
+        f.write('{"date":"2026-10-26","items":[{"title":"EVIL-LEAF"}]}')
+    os.remove(snap)
+    os.symlink(outside, snap)
+
+    r = c.get("/api/v1/hotspots/2026-10-26")
+    assert r.status_code == 403
+    assert r.json()["code"] == "PATH_FORBIDDEN"
+    assert "EVIL-LEAF" not in r.text
+
+
+def test_hotspots_dir_symlink_rejected_write(tmp_path, monkeypatch):
+    """阻断 B：hotspots/ 为 symlink 时 POST /refresh 拒绝且外部目录不产生文件。"""
+    home = str(tmp_path)
+    fetcher = FakeFetcher(ok_payload())
+    c = make_client(monkeypatch, home, fetcher)
+    c.get("/api/v1/runs")  # 钉住状态根身份
+
+    outside = os.path.join(home, "evil-write")
+    os.makedirs(outside, exist_ok=True)
+    os.symlink(outside, os.path.join(home, "hotspots"))
+
+    r = c.post("/api/v1/hotspots/refresh", json={"date": "2026-10-26"}, headers=post_headers(c))
+    assert r.status_code == 403
+    assert r.json()["code"] == "PATH_FORBIDDEN"
+    assert not os.path.exists(os.path.join(outside, "2026-10-26.json"))
+
+
+def test_hotspot_timeout_fetcher_502(tmp_path, monkeypatch):
+    """阻断 C：超时 fetcher → 502 UPSTREAM_ERROR，且快照目录不产生文件。"""
+    fetcher = TimeoutFetcher()
+    c = make_client(monkeypatch, str(tmp_path), fetcher)
+    r = c.get(
+        "/api/v1/hotspots",
+        params={"limit": 20, "refresh": 1},
+        headers={"Origin": "http://127.0.0.1:8765", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert r.status_code == 502
+    assert r.json()["code"] == "UPSTREAM_ERROR"
+    assert not os.path.exists(os.path.join(str(tmp_path), "hotspots"))
 
 
 def test_hotspots_limit_validation(tmp_path, monkeypatch):

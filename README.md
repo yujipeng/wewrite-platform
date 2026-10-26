@@ -10,9 +10,9 @@
 
 - `GET /healthz` 返回 `{status:"ok",version}`（只做 Host 校验，M4 的 compose healthcheck 依赖它）。
 - `GET /api/v1/bootstrap` 返回 `{csrf_token,version,server_started_at}`（token 只在进程内存，重启失效）。
-- `GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、`GET /api/v1/runs/{run_id}/artifact/{name}`：平台自己的只读投影，不调用上游 `wewrite.runs.load_run`（避免 GET 副作用）。
-- 中间件基线：Host 只允许回环地址；POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`、`Sec-Fetch-Site: same-origin`、`X-CSRF-Token`。无 CORS。
-- 路径安全：启动记录 `$WEWRITE_HOME` 的 `st_dev/st_ino`，读取时逐级 `openat`（`O_DIRECTORY|O_NOFOLLOW`）打开 `runs`、`<run_id>`，任一级 symlink/非目录统一 `403 PATH_FORBIDDEN`；产物白名单 + `O_NOFOLLOW|O_RDONLY` + `fstat(S_ISREG, st_nlink>=1)`，全程从已打开 fd 读取。
+- `GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、`GET /api/v1/runs/{run_id}/artifact/{name}`：平台自己的只读投影，不调用上游 `wewrite.runs.load_run`（避免 GET 副作用）。`GET /api/v1/runs` 的可选 `query` 参数在 M1 由前端过滤实现（题名/run_id），后续里程碑按需补服务端过滤。
+- 中间件基线：Host 只允许 `127.0.0.1` / `[::1]` / `localhost`（不放行整个 127/8）；POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`（host 与端口一致）、`Sec-Fetch-Site: same-origin`、`X-CSRF-Token`。无 CORS。
+- 路径安全：进程级钉住 `$WEWRITE_HOME` 的 `st_dev/st_ino`（首次成功打开时固定，之后每次读取重开 fd 比对，不一致 `403 PATH_FORBIDDEN`）；读取时逐级 `openat`（`O_DIRECTORY|O_NOFOLLOW`）打开 `runs`、`<run_id>`，任一级 symlink/非目录统一 `403 PATH_FORBIDDEN`；产物白名单 + `O_NOFOLLOW|O_RDONLY` + `fstat(S_ISREG, st_nlink>=1)`，全程从已打开 fd 读取。
 - 全局锁与原子写：`$WEWRITE_HOME/platform.lock`（`fcntl.flock`），临时文件同目录 → `fsync` → `os.replace` → 父目录 `fsync`。
 
 ## 本地运行

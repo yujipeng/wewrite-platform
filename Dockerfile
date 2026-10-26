@@ -11,10 +11,11 @@ RUN groupadd --system wewrite && useradd --system --gid wewrite --create-home we
 
 WORKDIR /app
 
-# 先装依赖（锁定版本），利用 Docker 层缓存
-COPY pyproject.toml README.md ./
+# 先装依赖（按 requirements.lock 锁定全部传递依赖，可复现构建），利用 Docker 层缓存
+COPY pyproject.toml README.md requirements.lock ./
 COPY app ./app
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir -r requirements.lock \
+    && pip install --no-cache-dir --no-deps .
 
 # 状态目录：挂载命名卷，属主 wewrite
 RUN mkdir -p /data/wewrite && chown -R wewrite:wewrite /data/wewrite

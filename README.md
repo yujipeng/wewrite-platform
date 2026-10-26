@@ -32,9 +32,12 @@ wewrite-platform serve --port 8765
 
 ## 测试
 
+测试运行口径（venv 建在 checkout 外 + 清华镜像 + `-e ".[test]"`）唯一化在 `docs/dev-test-env.md`，跑测试一律照那里装，不要用系统 `python3` 直跑。快速版：
+
 ```bash
-pip install -e ".[test]" -i https://pypi.tuna.tsinghua.edu.cn/simple/
-WEWRITE_PLATFORM_NO_WORKER=1 python -m pytest -q
+python3 -m venv ../.venv-test
+../.venv-test/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e ".[test]"
+../.venv-test/bin/python -m pytest -q
 ```
 
 fixture 在 `tests/conftest.py`；M4 新增 `tests/test_publish.py`（预检/密钥/token）与 `tests/test_worker.py`（P6 状态机）。

@@ -7,7 +7,15 @@ import yaml
 
 import pytest
 
-from app.main import create_app
+try:
+    from app.main import create_app
+except ModuleNotFoundError as exc:  # pragma: no cover - 环境问题提示，非代码分支
+    raise SystemExit(
+        "依赖未安装或未用项目 venv 的 python 运行测试："
+        "请按仓库根 docs/dev-test-env.md 的唯一装法，在 checkout 之外建 venv、"
+        "用清华镜像执行 pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e \".[test]\"，"
+        f"再用该 venv 的 python 跑 pytest。原始错误：{exc}"
+    ) from exc
 
 
 def _write_run(home, run_id, status, *, mode="draft", title="", artifacts=None, extra=None):

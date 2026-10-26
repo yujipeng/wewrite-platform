@@ -66,6 +66,32 @@ const STEP_STATUS_TEXT = {
   skipped: "已跳过",
 };
 
+// P6 生成进度常量与轮询句柄（必须声明在 render() 首次调用之前，否则冷启动
+// 直达 #/jobs/{id} 会命中 TDZ，抛 Cannot access '_jobPollTimer' before initialization）。
+const JOB_STATUS_TEXT = {
+  queued: "排队中",
+  running: "进行中",
+  succeeded: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  unknown: "结果未知",
+};
+const STEP_ORDER = ["topic", "write", "review", "visual"];
+const IMAGE_STATUS_TEXT = {
+  pending: "排队中",
+  running: "生成中",
+  succeeded: "已完成",
+  failed: "失败",
+};
+let _jobPollTimer = null;
+
+function stopJobPolling() {
+  if (_jobPollTimer) {
+    clearInterval(_jobPollTimer);
+    _jobPollTimer = null;
+  }
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   if (!res.ok) {
@@ -106,6 +132,10 @@ function currentRoute() {
 
 async function render() {
   const route = currentRoute();
+  // 离开 P6 时先停掉 job 轮询，否则 setInterval 会把整页反复画回 job 页（导航锁死）。
+  if (route.page !== "job" && route.page !== "runJob") {
+    stopJobPolling();
+  }
   document.querySelectorAll(".nav-link").forEach((n) => {
     const active =
       (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview" || route.page === "job" || route.page === "runJob")) ||
@@ -1307,25 +1337,6 @@ function renderPublishGate(runId, detail) {
 
 // ============ M4：P6 生成进行中（job 进度 / 逐图状态 / 取消 / 重试） ============
 
-const JOB_STATUS_TEXT = {
-  queued: "排队中",
-  running: "进行中",
-  succeeded: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  unknown: "结果未知",
-};
-
-const STEP_ORDER = ["topic", "write", "review", "visual"];
-const IMAGE_STATUS_TEXT = {
-  pending: "排队中",
-  running: "生成中",
-  succeeded: "已完成",
-  failed: "失败",
-};
-
-let _jobPollTimer = null;
-
 // 由 run_id 找到最近一个 job 再渲染（P6 页面入口 #/runs/{run_id}/job）
 async function renderRunJob(runId) {
   app.innerHTML = "";
@@ -1358,7 +1369,7 @@ async function renderRunJob(runId) {
 }
 
 async function renderJob(jobId) {
-  if (_jobPollTimer) { clearInterval(_jobPollTimer); _jobPollTimer = null; }
+  stopJobPolling();
   app.innerHTML = "";
   app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
 
@@ -1525,8 +1536,17 @@ function renderJobBody(job, runId) {
   // 立即刷新视图（按钮动作后调用）
   const refreshJobView = () => renderJob(job.job_id);
 
-  // 非终态启动轮询（终态由 renderJob 里的状态渲染决定是否继续）
+  // 非终态启动轮询。回调里先校验当前路由仍是 job 页，否则停表——防止
+  // render() 已被 hashchange 调去画别的页面时，本 timer 又把整页盖回 job 页。
   if (["succeeded", "failed", "cancelled", "unknown"].indexOf(status) < 0) {
-    _jobPollTimer = setInterval(() => renderJob(job.job_id), 1500);
+    stopJobPolling();
+    _jobPollTimer = setInterval(() => {
+      const r = currentRoute();
+      if (r.page !== "job" && r.page !== "runJob") {
+        stopJobPolling();
+        return;
+      }
+      renderJob(job.job_id);
+    }, 1500);
   }
 }

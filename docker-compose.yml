@@ -1,0 +1,14 @@
+# docker-compose v1.29 兼容语法（本机只有 docker-compose v1.29.2，无 docker compose v2 插件）
+services:
+  workbench:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - wewrite_home:/data/wewrite
+    environment:
+      - WEWRITE_HOME=/data/wewrite
+    restart: unless-stopped
+
+volumes:
+  wewrite_home: {}

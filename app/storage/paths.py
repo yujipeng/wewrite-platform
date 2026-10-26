@@ -320,6 +320,7 @@ def safe_open_run_file(home: str | os.PathLike, run_id: str, name: str):
 
 _SUBDIR_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_REL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _validate_subdir_file(subdir: str, filename: str) -> None:
@@ -471,6 +472,203 @@ def safe_list_subdir_filenames(home: str | os.PathLike, subdir: str) -> list[str
     finally:
         os.close(dir_fd)
     return sorted(names)
+
+
+def safe_open_run_relative_file(home: str | os.PathLike, run_id: str, relpath: str):
+    """安全打开 ``runs/<run_id>/<relpath>`` 下的文件，返回 ``(fd, stat_result)``。
+
+    用于 P7 发布时读取封面/配图等非白名单产物文件：``relpath`` 只允许
+    若干段 ``[A-Za-z0-9_.-]+``（禁止 ``/`` 开头、``..``、绝对路径、连续斜杠），
+    逐段 ``os.open(..., dir_fd=...)`` 打开（O_NOFOLLOW），任一段 symlink/非目录
+    → PATH_FORBIDDEN，最终文件 O_NOFOLLOW 打开后 fstat 确认 S_ISREG。缺失
+    → NOT_FOUND。
+    """
+    validate_run_id(run_id)
+    if not isinstance(relpath, str) or not relpath or relpath.startswith("/") or relpath.startswith("\\"):
+        raise errors.path_forbidden({"reason": "invalid_relpath", "component": "run_file"})
+    segments = relpath.split("/")
+    if not segments or not all(_REL_SEGMENT_RE.fullmatch(s) for s in segments):
+        raise errors.path_forbidden({"reason": "invalid_relpath", "component": "run_file"})
+
+    paths = Paths(home)
+    try:
+        root_fd = paths._open_root()
+    except errors.ApiError as exc:
+        if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+            raise errors.not_found() from exc
+        raise
+    try:
+        try:
+            runs_fd = paths._open_dir_at(root_fd, "runs", "runs")
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent":
+                raise errors.not_found() from exc
+            raise
+        try:
+            try:
+                run_fd = paths._open_dir_at(runs_fd, run_id, "run_id")
+            except errors.ApiError as exc:
+                if exc.details.get("reason") == "enoent":
+                    raise errors.not_found() from exc
+                raise
+            try:
+                cur_fd = run_fd
+                for segment in segments[:-1]:
+                    nxt_fd = os.open(
+                        segment, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=cur_fd
+                    )
+                    try:
+                        pass
+                    except Exception:
+                        os.close(nxt_fd)
+                        raise
+                    os.close(cur_fd)
+                    cur_fd = nxt_fd
+                try:
+                    fd = os.open(
+                        segments[-1],
+                        os.O_RDONLY | _O_NOFOLLOW | _O_BINARY,
+                        dir_fd=cur_fd,
+                    )
+                finally:
+                    os.close(cur_fd)
+            except OSError as exc:
+                reason = _os_error_reason(exc)
+                if reason == "enoent":
+                    raise errors.not_found() from exc
+                raise errors.path_forbidden(
+                    {"reason": reason, "component": "run_file"}
+                ) from exc
+            finally:
+                pass
+        finally:
+            os.close(runs_fd)
+    finally:
+        os.close(root_fd)
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise errors.path_forbidden({"reason": "not_regular_file", "component": "run_file"})
+        if st.st_nlink < 1:
+            raise errors.path_forbidden({"reason": "unlinked_file", "component": "run_file"})
+        return fd, st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def safe_write_run_file(home: str | os.PathLike, run_id: str, relpath: str, data: bytes) -> None:
+    """安全原子写 ``runs/<run_id>/<relpath>``（图片/带图版等），持有全局锁。
+
+    ``relpath`` 约束同 ``safe_open_run_relative_file``；目录段缺失时在已打开的
+    父 fd 下相对创建，目标文件同目录临时文件 0600 → fsync → os.replace → 目录 fsync。
+    """
+    validate_run_id(run_id)
+    if not isinstance(relpath, str) or not relpath or relpath.startswith("/") or relpath.startswith("\\"):
+        raise errors.path_forbidden({"reason": "invalid_relpath", "component": "run_file"})
+    segments = relpath.split("/")
+    if not segments or not all(_REL_SEGMENT_RE.fullmatch(s) for s in segments):
+        raise errors.path_forbidden({"reason": "invalid_relpath", "component": "run_file"})
+
+    from app.storage.atomic import PlatformLock
+
+    paths = Paths(home)
+    with PlatformLock(home):
+        root_fd = paths._open_root()
+        try:
+            try:
+                runs_fd = paths._open_dir_at(root_fd, "runs", "runs")
+            except errors.ApiError as exc:
+                if exc.details.get("reason") == "enoent":
+                    raise errors.not_found() from exc
+                raise
+            try:
+                try:
+                    run_fd = paths._open_dir_at(runs_fd, run_id, "run_id")
+                except errors.ApiError as exc:
+                    if exc.details.get("reason") == "enoent":
+                        raise errors.not_found() from exc
+                    raise
+                try:
+                    cur_fd = run_fd
+                    cur_fd_is_run = True
+                    for segment in segments[:-1]:
+                        try:
+                            nxt_fd = os.open(
+                                segment, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=cur_fd
+                            )
+                        except OSError as exc:
+                            if _os_error_reason(exc) == "enoent":
+                                try:
+                                    os.mkdir(segment, dir_fd=cur_fd)
+                                except FileExistsError:
+                                    pass
+                                except OSError as e:
+                                    raise errors.path_forbidden(
+                                        {"reason": _os_error_reason(e), "component": "run_file"}
+                                    ) from e
+                                nxt_fd = os.open(
+                                    segment, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=cur_fd
+                                )
+                            else:
+                                raise errors.path_forbidden(
+                                    {"reason": _os_error_reason(exc), "component": "run_file"}
+                                ) from exc
+                        if not cur_fd_is_run:
+                            os.close(cur_fd)
+                        cur_fd = nxt_fd
+                        cur_fd_is_run = False
+                    import secrets as _secrets
+
+                    tmp_name = f".{segments[-1]}.{_secrets.token_hex(6)}.tmp"
+                    try:
+                        fd = os.open(
+                            tmp_name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                            0o600,
+                            dir_fd=cur_fd,
+                        )
+                    except OSError as exc:
+                        raise errors.path_forbidden(
+                            {"reason": _os_error_reason(exc), "component": "run_file"}
+                        ) from exc
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(
+                            tmp_name, segments[-1], src_dir_fd=cur_fd, dst_dir_fd=cur_fd
+                        )
+                        os.fsync(cur_fd)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_name, dir_fd=cur_fd)
+                        except OSError:
+                            pass
+                        raise
+                    finally:
+                        if not cur_fd_is_run:
+                            os.close(cur_fd)
+                finally:
+                    pass  # run_fd 由外层关闭
+            finally:
+                os.close(runs_fd)
+        finally:
+            os.close(root_fd)
+
+
+def safe_read_run_relative(home: str | os.PathLike, run_id: str, relpath: str) -> bytes | None:
+    """安全读取 run 相对文件字节；缺失返回 None（symlink → PATH_FORBIDDEN）。"""
+    try:
+        fd, _st = safe_open_run_relative_file(home, run_id, relpath)
+    except errors.ApiError as exc:
+        if exc.code == "NOT_FOUND":
+            return None
+        raise
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
 
 
 def sha256_hex(data: bytes) -> str:
@@ -759,5 +957,116 @@ def safe_write_hotspot_file(home: str | os.PathLike, date: str, text: str) -> No
                     raise
             finally:
                 os.close(hotspots_fd)
+        finally:
+            os.close(root_fd)
+
+
+# 状态根下的固定一级文件名白名单（config/style，0600）。路径穿越一律拒绝。
+_ROOT_FILES = frozenset({"config.yaml", "style.yaml"})
+
+
+def _validate_root_file(filename: str) -> None:
+    if filename not in _ROOT_FILES:
+        raise errors.path_forbidden({"reason": "invalid_root_file", "component": filename})
+
+
+def safe_read_root_file(home: str | os.PathLike, filename: str) -> str | None:
+    """安全读取状态根下的一级文件（``config.yaml``/``style.yaml``）。
+
+    逐级 openat：先 O_NOFOLLOW|O_DIRECTORY 重开并比对状态根身份，再以
+    ``dir_fd=root_fd`` 打开固定白名单文件名，``fstat`` 确认 ``S_ISREG`` 且
+    ``st_nlink >= 1``，全程从 fd 读取。缺失返回 None，symlink/非目录
+    → PATH_FORBIDDEN，绝不回退按绝对路径 ``open()``。
+    """
+    _validate_root_file(filename)
+    paths = Paths(home)
+    try:
+        root_fd = paths._open_root()
+    except errors.ApiError as exc:
+        if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+            return None
+        raise
+    try:
+        try:
+            fd = os.open(
+                filename, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY, dir_fd=root_fd
+            )
+        except OSError as exc:
+            reason = _os_error_reason(exc)
+            if reason == "enoent":
+                return None
+            if reason == "eloop":
+                raise errors.path_forbidden({"reason": "eloop", "component": filename}) from exc
+            raise errors.path_forbidden({"reason": reason, "component": filename}) from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise errors.path_forbidden({"reason": "not_regular_file", "component": filename})
+            if st.st_nlink < 1:
+                raise errors.path_forbidden({"reason": "unlinked_file", "component": filename})
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                return f.read()
+        finally:
+            pass  # fd 由 fdopen 关闭
+    finally:
+        os.close(root_fd)
+
+
+def safe_write_root_file(home: str | os.PathLike, filename: str, text: str, mode: int = 0o600) -> None:
+    """安全原子写状态根下的一级文件（``config.yaml``/``style.yaml``）。
+
+    持有平台全局写锁 ``platform.lock``，同目录临时文件 ``O_CREAT|O_EXCL|O_NOFOLLOW``
+    （权限 0600）→ UTF-8 写入 → ``fsync`` → ``os.replace``（``src_dir_fd``/
+    ``dst_dir_fd`` 均为 root_fd）→ 对状态根目录 ``fsync``，替换后复验权限。
+    全程 dir_fd，禁止 ``os.path.join`` + 按绝对路径 open/replace。任一级
+    symlink/非目录 → PATH_FORBIDDEN。
+    """
+    _validate_root_file(filename)
+    from app.storage.atomic import PlatformLock
+
+    paths = Paths(home)
+    with PlatformLock(home):
+        root_fd = paths._open_root()
+        try:
+            import secrets as _secrets
+
+            tmp_name = f".{filename}.{_secrets.token_hex(6)}.tmp"
+            try:
+                fd = os.open(
+                    tmp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            except OSError as exc:
+                raise errors.path_forbidden(
+                    {"reason": _os_error_reason(exc), "component": filename}
+                ) from exc
+            try:
+                os.fchmod(fd, mode & 0o777)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, filename, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+                os.fsync(root_fd)
+                # 替换后复验权限（设计第 2.5 节硬要求）
+                check_fd = os.open(
+                    filename, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY, dir_fd=root_fd
+                )
+                try:
+                    st = os.fstat(check_fd)
+                    if not stat.S_ISREG(st.st_mode) or (stat.S_IMODE(st.st_mode) & 0o777) != (mode & 0o777):
+                        raise errors.path_forbidden(
+                            {"reason": "mode_mismatch", "component": filename}
+                        )
+                finally:
+                    os.close(check_fd)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name, dir_fd=root_fd)
+                except OSError:
+                    pass
+                raise
         finally:
             os.close(root_fd)

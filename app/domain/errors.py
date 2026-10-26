@@ -67,3 +67,23 @@ def job_not_retractable(message: str = "该任务当前不可撤回", details: d
 
 def publish_disabled(message: str = "发布模式已禁用", details: dict | None = None) -> ApiError:
     return ApiError("PUBLISH_DISABLED", message, 403, details)
+
+
+def preflight_failed(message: str = "发布预检未通过", details: dict | None = None) -> ApiError:
+    return ApiError("PREFLIGHT_FAILED", message, 422, details)
+
+
+def token_invalid(message: str = "发布凭据无效或已失效", details: dict | None = None) -> ApiError:
+    return ApiError("TOKEN_INVALID", message, 409, details)
+
+
+def publish_unknown(message: str = "发布结果未知，禁止重复提交", details: dict | None = None) -> ApiError:
+    return ApiError("PUBLISH_UNKNOWN", message, 409, details)
+
+
+def env_managed(message: str = "该字段由环境变量接管，不接受写入", details: dict | None = None) -> ApiError:
+    return ApiError("ENV_MANAGED", message, 409, details)
+
+
+def busy(message: str = "资源正被占用，请稍后重试", details: dict | None = None) -> ApiError:
+    return ApiError("BUSY", message, 503, details)

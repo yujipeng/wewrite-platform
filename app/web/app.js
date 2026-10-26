@@ -94,6 +94,7 @@ function currentRoute() {
   if (pm) return { page: "preview", runId: pm[1] };
   if (hash === "#/hotspots") return { page: "hotspots" };
   if (hash === "#/candidates") return { page: "candidates" };
+  if (hash === "#/config") return { page: "config" };
   return { page: "home" };
 }
 
@@ -103,7 +104,8 @@ async function render() {
     const active =
       (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview")) ||
       (n.dataset.nav === "hotspots" && route.page === "hotspots") ||
-      (n.dataset.nav === "candidates" && route.page === "candidates");
+      (n.dataset.nav === "candidates" && route.page === "candidates") ||
+      (n.dataset.nav === "config" && route.page === "config");
     n.classList.toggle("active", active);
   });
   if (route.page === "home") {
@@ -116,6 +118,8 @@ async function render() {
     await renderHotspots();
   } else if (route.page === "candidates") {
     await renderCandidates();
+  } else if (route.page === "config") {
+    await renderConfig();
   }
 }
 
@@ -359,6 +363,9 @@ function detailBody(d) {
     publish.unknown_at ? el("div", { text: "结果未知时间：" + publish.unknown_at }) : null,
   ]);
   sections.push(pubBox);
+
+  // 发布闸门（P7）
+  sections.push(renderPublishGate(d.run_id, d));
 
   // 失败步骤去向
   if (d.last_error) {
@@ -856,4 +863,199 @@ function todayLocal() {
   const off = d.getTimezoneOffset();
   const local = new Date(d.getTime() - off * 60000);
   return local.toISOString().slice(0, 10);
+}
+
+// ============ M4：P8 配置 + P7 发布闸门（页面） ============
+
+async function renderConfig() {
+  app.innerHTML = "";
+  app.appendChild(el("h1", { class: "page-title", text: "配置" }));
+
+  const container = el("div");
+  app.appendChild(container);
+  container.appendChild(loadingState("正在加载配置…"));
+
+  let cfg, style;
+  try {
+    cfg = await api("/api/v1/config");
+    style = await api("/api/v1/style");
+  } catch (err) {
+    container.innerHTML = "";
+    container.appendChild(errorState("加载配置失败：" + (err.code || err.message), renderConfig));
+    return;
+  }
+
+  container.innerHTML = "";
+
+  // 公众号
+  container.appendChild(el("div", { class: "section-title", text: "公众号（secret 只写不读）" }));
+  const appidInput = el("input", { type: "text", value: cfg.wechat.appid || "", placeholder: "AppID" });
+  const authorInput = el("input", { type: "text", value: cfg.wechat.author || "", placeholder: "作者" });
+  const secretInput = el("input", { type: "password", value: "", placeholder: cfg.wechat.secret_configured ? "已配置（留空保持）" : "AppSecret" });
+  container.appendChild(kvForm([["AppID", appidInput], ["作者", authorInput], ["AppSecret", secretInput]]));
+
+  // 图片供应商
+  container.appendChild(el("div", { class: "section-title", text: "图片供应商与 fallback 链（provider 只读展示，model/base_url 可编辑）" }));
+  const providerInput = el("input", { type: "text", value: cfg.image.provider || "", placeholder: "provider（env 接管时只读）", disabled: true });
+  const modelInput = el("input", { type: "text", value: cfg.image.model || "", placeholder: "model" });
+  const baseUrlInput = el("input", { type: "text", value: cfg.image.base_url || "", placeholder: "base_url" });
+  container.appendChild(kvForm([["provider", providerInput], ["model", modelInput], ["base_url", baseUrlInput]]));
+
+  // 主题
+  container.appendChild(el("div", { class: "section-title", text: "主题选择" }));
+  const themeInput = el("input", { type: "text", value: cfg.theme || "professional-clean", placeholder: "主题名" });
+  container.appendChild(kvForm([["theme", themeInput]]));
+
+  // 时区展示
+  container.appendChild(el("div", { class: "muted", text: "时区：Asia/Shanghai（UTC+8）" }));
+
+  // env_managed 提示
+  if (cfg.env_managed && cfg.env_managed.length) {
+    const managed = cfg.env_managed.map((m) => m.field + " ← " + m.env).join("、");
+    container.appendChild(el("div", { class: "notice", text: "以下字段由环境变量接管，写入将返回 409 ENV_MANAGED：" + managed }));
+  }
+
+  const saveBtn = el("button", { class: "btn", text: "保存配置" });
+  const result = el("div", { class: "muted", text: "" });
+  container.appendChild(el("div", { class: "preview-controls" }, [saveBtn, result]));
+
+  saveBtn.addEventListener("click", async () => {
+    const body = {
+      theme: themeInput.value || undefined,
+      image: { model: modelInput.value || undefined, base_url: baseUrlInput.value || undefined },
+      wechat: { appid: appidInput.value || undefined, author: authorInput.value || undefined },
+    };
+    if (secretInput.value) body.wechat.secret = secretInput.value;
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status, message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      result.textContent = "已保存";
+      setTimeout(renderConfig, 400);
+    } catch (err) {
+      result.textContent = "保存失败：" + (err.code || err.message);
+      result.classList.add("error-block");
+    }
+  });
+}
+
+function kvForm(rows) {
+  const dl = el("dl", { class: "kv" });
+  for (const [label, input] of rows) {
+    dl.appendChild(el("dt", { text: label }));
+    input.style.cssText = "padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%";
+    dl.appendChild(el("dd", {}, [input]));
+  }
+  return dl;
+}
+
+function renderPublishGate(runId, detail) {
+  const section = el("div", { class: "card" });
+  section.appendChild(el("div", { class: "section-title", text: "发布闸门（P7）" }));
+
+  const perm = !!(detail.permissions && detail.permissions.publish);
+  const statusLine = el("div", { class: "muted", text: "发布权限：" + (perm ? "已开启" : "未开启") });
+  section.appendChild(statusLine);
+
+  const authorizeBtn = el("button", { class: "btn", text: perm ? "撤销发布授权" : "开启发布授权" });
+  const preflightBox = el("div", { class: "muted", text: "尚未预检" });
+  const submitBox = el("div");
+  section.appendChild(el("div", { class: "preview-controls" }, [authorizeBtn]));
+  section.appendChild(preflightBox);
+  section.appendChild(submitBox);
+
+  authorizeBtn.addEventListener("click", async () => {
+    try {
+      const token = await csrfToken();
+      const res = await fetch(`/api/v1/runs/${runId}/publish/permission`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ allow: !perm }),
+      });
+      if (!res.ok) throw new Error((await res.json()).message || res.statusText);
+      renderDetail(runId);
+    } catch (err) {
+      window.alert("授权失败：" + (err.code || err.message));
+    }
+  });
+
+  const runPreflight = async () => {
+    try {
+      const body = await api(`/api/v1/runs/${runId}/publish/preflight`);
+      const items = (body.checks || []).map((c) => el("div", { class: "muted", text: (c.ok ? "✅" : "❌") + " " + c.name + (c.message ? "：" + c.message : "") }));
+      preflightBox.innerHTML = "";
+      preflightBox.appendChild(el("div", { text: "预检：" + (body.ok ? "通过" : "未通过") }));
+      for (const it of items) preflightBox.appendChild(it);
+      preflightBox.dataset.revision = body.revision;
+      preflightBox.dataset.ok = body.ok ? "1" : "0";
+      return body;
+    } catch (err) {
+      preflightBox.textContent = "预检失败：" + (err.code || err.message);
+      return null;
+    }
+  };
+
+  runPreflight();
+
+  const publishBtn = el("button", { class: "btn", text: "获取一次性凭据并写入草稿箱" });
+  publishBtn.disabled = true;
+  submitBox.appendChild(publishBtn);
+
+  publishBtn.addEventListener("click", async () => {
+    if (!window.confirm("我确认写入公众号草稿箱")) return;
+    const title = window.prompt("请再次输入文章标题（逐字匹配）", detail.title || "");
+    if (!title) return;
+    try {
+      const revision = preflightBox.dataset.revision;
+      const token = await csrfToken();
+      // 1) 取一次性 token
+      const tr = await fetch(`/api/v1/runs/${runId}/publish/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ revision, checked: true, title }),
+      });
+      if (!tr.ok) {
+        let code = "HTTP_" + tr.status, message = tr.statusText;
+        try { const d = await tr.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        throw Object.assign(new Error(message), { code, status: tr.status });
+      }
+      const tbody = await tr.json();
+      // 2) 提交
+      const pr = await fetch(`/api/v1/runs/${runId}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ token: tbody.token, title, checked: true }),
+      });
+      if (!pr.ok) {
+        let code = "HTTP_" + pr.status, message = pr.statusText;
+        try { const d = await pr.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        throw Object.assign(new Error(message), { code, status: pr.status });
+      }
+      const pbody = await pr.json();
+      if (pbody.status === "succeeded") {
+        window.alert("已写入草稿箱，media_id：" + pbody.media_id + "，请到公众号后台处理");
+        renderDetail(runId);
+      } else {
+        window.alert("发布结果未知（unknown），禁止重复提交，请到公众号后台草稿箱核对");
+      }
+    } catch (err) {
+      window.alert("发布失败：" + (err.code || err.message));
+    }
+  });
+
+  // 预检通过且已授权才启用提交按钮
+  const poll = setInterval(() => {
+    publishBtn.disabled = !(preflightBox.dataset.ok === "1" && perm);
+  }, 500);
+  setTimeout(() => clearInterval(poll), 10000);
+
+  return section;
 }

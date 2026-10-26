@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -244,6 +245,11 @@ def safe_open_run_file(home: str | os.PathLike, run_id: str, name: str):
             os.close(runs_fd)
     finally:
         os.close(root_fd)
+
+
+def sha256_hex(data: bytes) -> str:
+    """内容 SHA-256（预览 source_sha256 等复用）。"""
+    return hashlib.sha256(data).hexdigest()
 
 
 def read_state_yaml(home: str | os.PathLike, run_id: str) -> dict | None:

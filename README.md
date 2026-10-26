@@ -4,14 +4,14 @@
 
 设计基线见 Multica 任务 JEE-1887 的《WeWrite 工作台：先看选题，再看可信产物》技术方案 v2，以及仓库内 `docs/s2-technical-design.md`（技术详细设计终版，编码基线）。
 
-## 当前里程碑（M1）
+## 当前里程碑（M2）
 
-已交付：仓库骨架 + P1 工作台首页（run 列表）+ P2 任务详情（只读核心）。
+已交付：M1（仓库骨架 + P1/P2）+ M2（P3 产物预览 + P4 每日热榜与每日快照）。
 
-- `GET /healthz` 返回 `{status:"ok",version}`（只做 Host 校验，M4 的 compose healthcheck 依赖它）。
-- `GET /api/v1/bootstrap` 返回 `{csrf_token,version,server_started_at}`（token 只在进程内存，重启失效）。
-- `GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、`GET /api/v1/runs/{run_id}/artifact/{name}`：平台自己的只读投影，不调用上游 `wewrite.runs.load_run`（避免 GET 副作用）。`GET /api/v1/runs` 的可选 `query` 参数在 M1 由前端过滤实现（题名/run_id），后续里程碑按需补服务端过滤。
-- 中间件基线：Host 只允许 `127.0.0.1` / `[::1]` / `localhost`（不放行整个 127/8）；POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`（host 与端口一致）、`Sec-Fetch-Site: same-origin`、`X-CSRF-Token`。无 CORS。
+- M1：`GET /healthz`、`GET /api/v1/bootstrap`、`GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、`GET /api/v1/runs/{run_id}/artifact/{name}`。
+- P3 预览：`GET /api/v1/themes`（名称来自 `wewrite.toolkit.theme.list_themes()`，不接受外部路径）；`POST /api/v1/preview`（`{run_id,source:draft|article|illustrated_article,theme}`）返回 `{html,paste_safe_html,title,digest,source_sha256,filtered_count}`；复用 M1 的 `safe_open_run_file` 读白名单产物；HTML 已过滤 `<script>`/事件属性/`javascript:` 并记录 `filtered_count`；iframe `sandbox` 且不含 `allow-scripts`。
+- P4 热榜：`GET /api/v1/hotspots?limit=20`（返回已保存快照）、`GET /api/v1/hotspots?limit=20&refresh=1`（只抓当下、不落盘、不更新 `last_success_at`；强制同源 `Origin`+`Sec-Fetch-Site: same-origin`，缺失/`cross-site`/`same-site` 在调用 fetcher 前返回 `403 CSRF_INVALID` + `details.reason=refresh_requires_same_origin`）、`POST /api/v1/hotspots/refresh`（`{date?,limit?}` 落盘，`date` 只命名文件）、`GET /api/v1/hotspot-snapshots`（最近 30 天日期列表）、`GET /api/v1/hotspots/{date}`（单日快照，缺失/超保留期 404）。快照落盘 `$WEWRITE_HOME/hotspots/YYYY-MM-DD.json`（含 UTC 与 Asia/Shanghai 双时间）；来源中英分离（英文 source ID 为机器键、中文 `source_label` 展示）；全源失败即使退出码 0 也判失败、不覆盖上一份成功快照。
+- 中间件基线：Host 只允许 `127.0.0.1` / `[::1]` / `localhost`（不放行整个 127/8）；POST/PUT/DELETE 强制 `Content-Type: application/json`、同源 `Origin`（host 与端口一致）、`Sec-Fetch-Site: same-origin`、`X-CSRF-Token`。无 CORS。`refresh=1` 是唯一需要同源校验的 GET。
 - 路径安全：进程级钉住 `$WEWRITE_HOME` 的 `st_dev/st_ino`（首次成功打开时固定，之后每次读取重开 fd 比对，不一致 `403 PATH_FORBIDDEN`）；读取时逐级 `openat`（`O_DIRECTORY|O_NOFOLLOW`）打开 `runs`、`<run_id>`，任一级 symlink/非目录统一 `403 PATH_FORBIDDEN`；产物白名单 + `O_NOFOLLOW|O_RDONLY` + `fstat(S_ISREG, st_nlink>=1)`，全程从已打开 fd 读取。
 - 全局锁与原子写：`$WEWRITE_HOME/platform.lock`（`fcntl.flock`），临时文件同目录 → `fsync` → `os.replace` → 父目录 `fsync`。
 

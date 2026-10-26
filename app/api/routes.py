@@ -12,8 +12,11 @@ from starlette.concurrency import run_in_threadpool
 from app import __version__
 from app.adapters import hotspots as hotspots_adapter
 from app.adapters import preview as preview_adapter
+from app.domain import confirm_gate
 from app.domain import errors
 from app.middleware import normalize_host_port, origin_host_matches, referer_host_matches
+from app.storage import candidates
+from app.storage import jobs
 from app.storage import paths, projections
 
 router = APIRouter()
@@ -264,3 +267,175 @@ async def refresh_hotspots(request: Request):
     except errors.ApiError as exc:
         return _error_response(exc)
     return data
+
+
+# ---------- M3：P5 选题确认（候选池 + 确认门） ----------
+
+def _candidate_store() -> "candidates.CandidateStore":
+    return candidates.CandidateStore(_home())
+
+
+def _confirm_gate(request: Request) -> "confirm_gate.ConfirmGate":
+    adapter = getattr(request.app.state, "wewrite_adapter", None)
+    gate = confirm_gate.ConfirmGate(_home(), adapter=adapter)
+    return gate
+
+
+@router.get("/api/v1/candidates")
+async def list_candidates(request: Request):
+    """候选集摘要列表，可按 date / status 过滤。"""
+    date = request.query_params.get("date")
+    status = request.query_params.get("status")
+    try:
+        if date is not None:
+            candidates.validate_date(date)
+        if status is not None and status not in {"open", "confirmed", "superseded", "deleted", "expired"}:
+            raise errors.validation_error("status 取值不合法", {"field": "status"})
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    try:
+        sets = _candidate_store().list_sets(date=date, status=status)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return {"candidates": sets}
+
+
+@router.get("/api/v1/candidates/{candidate_set_id}")
+async def get_candidate_set(candidate_set_id: str):
+    """返回完整候选集、过期/关闭状态与 snapshot hash。"""
+    try:
+        candidates.validate_candidate_set_id(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    try:
+        data = _candidate_store().get_or_404(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return _candidate_store()._summary(data, candidates._set_status(data, datetime_now_utc()))
+
+
+@router.post("/api/v1/candidates")
+async def generate_candidates(request: Request):
+    """从指定日期快照生成候选集（10 条，全失败不写）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response(errors.validation_error("请求体必须为合法 JSON"))
+    if not isinstance(body, dict):
+        return _error_response(errors.validation_error("请求体必须为 JSON 对象"))
+
+    date = body.get("date")
+    style_revision = body.get("style_revision")
+    force = bool(body.get("force", False))
+    try:
+        candidates.validate_date(date)
+        from app.domain import scoring
+
+        scoring.validate_style_revision(style_revision)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+    # 读取当日快照（缺失 404）
+    try:
+        snapshot = hotspots_adapter.HotspotStore(_home()).read_date(date)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+    # 全失败快照不得生成（承接 M2 加严项）
+    if hotspots_adapter.is_all_failed(snapshot):
+        return _error_response(
+            errors.validation_error(
+                "当日快照全源失败，无可用条目，请先补抓", {"reason": "all_failed"}
+            )
+        )
+
+    try:
+        result = await run_in_threadpool(
+            _candidate_store().generate, date, style_revision, snapshot, force
+        )
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    candidate_set, created = result
+    return _candidate_store()._summary(candidate_set, candidates._set_status(candidate_set, datetime_now_utc()))
+
+
+@router.delete("/api/v1/candidates/{candidate_set_id}")
+async def delete_candidate_set(candidate_set_id: str):
+    """删除候选集（仅从未确认、无关联的 open 集可置 deleted 墓碑）。"""
+    try:
+        candidates.validate_candidate_set_id(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    try:
+        _candidate_store().delete(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return {"candidate_set_id": candidate_set_id, "set_status": "deleted"}
+
+
+@router.post("/api/v1/candidates/{candidate_set_id}/confirm")
+async def confirm_candidate(candidate_set_id: str, request: Request):
+    """确认门：校验 + intent journal + 上游 create_run + queued job。"""
+    try:
+        candidates.validate_candidate_set_id(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    idempotency_key = request.headers.get("idempotency-key") or request.headers.get("Idempotency-Key")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response(errors.validation_error("请求体必须为合法 JSON"))
+    try:
+        settings = confirm_gate._validate_confirm_body(body)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+    gate = _confirm_gate(request)
+    try:
+        result = await run_in_threadpool(
+            gate.confirm, candidate_set_id, settings, idempotency_key
+        )
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return result
+
+
+@router.post("/api/v1/candidates/{candidate_set_id}/retract")
+async def retract_candidate(candidate_set_id: str, request: Request):
+    """撤回候选：仅 job 仍 queued 时可撤回。"""
+    try:
+        candidates.validate_candidate_set_id(candidate_set_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response(errors.validation_error("请求体必须为合法 JSON"))
+    if not isinstance(body, dict):
+        return _error_response(errors.validation_error("请求体必须为 JSON 对象"))
+    candidate_id = body.get("candidate_id")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        return _error_response(errors.validation_error("candidate_id 必填", {"field": "candidate_id"}))
+
+    gate = _confirm_gate(request)
+    try:
+        result = await run_in_threadpool(gate.retract, candidate_set_id, candidate_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return result
+
+
+@router.get("/api/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    """job 全量投影（M3 只读 queued/cancelled，供 P5 确认后跳转）。"""
+    try:
+        job = jobs.JobStore(_home()).get_or_404(job_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+    return job
+
+
+def datetime_now_utc():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)

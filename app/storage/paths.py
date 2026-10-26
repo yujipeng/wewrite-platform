@@ -180,6 +180,42 @@ class Paths:
         finally:
             os.close(root_fd)
 
+    def subdir_fd(self, name: str, create: bool = False) -> int:
+        """安全打开状态根下的子目录 fd（``candidates``/``jobs``/``intents``/...）。
+
+        与 ``hotspots_dir_fd`` 同一套逐级 openat + O_NOFOLLOW：从已钉住身份的根 fd 起
+        打开 ``name``，任一级 symlink/非目录统一 PATH_FORBIDDEN，不回退按路径打开。
+        不存在时（create=False）返回 -1 哨兵；create=True 先在根 fd 下相对 mkdir。
+        ``name`` 只接受设计布局里的固定一级子目录名，拒绝任何含分隔符的值。
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise errors.path_forbidden({"reason": "invalid_subdir", "component": name})
+        try:
+            root_fd = self._open_root()
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+                return -1
+            raise
+        try:
+            try:
+                return self._open_dir_at(root_fd, name, name)
+            except errors.ApiError as exc:
+                if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
+                    if not create:
+                        return -1
+                    try:
+                        os.mkdir(name, dir_fd=root_fd)
+                    except FileExistsError:
+                        pass
+                    except OSError as e:
+                        raise errors.path_forbidden(
+                            {"reason": _os_error_reason(e), "component": name}
+                        ) from e
+                    return self._open_dir_at(root_fd, name, name)
+                raise
+        finally:
+            os.close(root_fd)
+
     def hotspots_dir_fd(self, create: bool = False) -> int:
         """安全打开 ``hotspots`` 目录 fd；不存在时（create=False）返回 -1 哨兵。
 
@@ -282,9 +318,223 @@ def safe_open_run_file(home: str | os.PathLike, run_id: str, name: str):
         os.close(root_fd)
 
 
+_SUBDIR_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _validate_subdir_file(subdir: str, filename: str) -> None:
+    """子目录名与文件名只允许固定安全字符，禁止 ``/``、``..`` 等穿越。"""
+    if not _SUBDIR_NAME_RE.fullmatch(subdir):
+        raise errors.path_forbidden({"reason": "invalid_subdir", "component": subdir})
+    if not _FILE_NAME_RE.fullmatch(filename):
+        raise errors.path_forbidden({"reason": "invalid_filename", "component": subdir})
+
+
+def safe_open_subdir_file(home: str | os.PathLike, subdir: str, filename: str):
+    """安全打开状态根子目录下的文件（``candidates``/``jobs``/``intents``/...），
+    返回 ``(fd, stat_result)``。缺失 NOT_FOUND，symlink/非目录 PATH_FORBIDDEN。"""
+    _validate_subdir_file(subdir, filename)
+    paths = Paths(home)
+    try:
+        root_fd = paths._open_root()
+    except errors.ApiError as exc:
+        if exc.details.get("reason") == "enoent" and exc.details.get("component") == "home":
+            raise errors.not_found() from exc
+        raise
+    try:
+        try:
+            dir_fd = paths._open_dir_at(root_fd, subdir, subdir)
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent":
+                raise errors.not_found() from exc
+            raise
+        try:
+            try:
+                fd = os.open(
+                    filename,
+                    os.O_RDONLY | _O_NOFOLLOW | _O_BINARY,
+                    dir_fd=dir_fd,
+                )
+            except OSError as exc:
+                reason = _os_error_reason(exc)
+                if reason == "eloop":
+                    raise errors.path_forbidden(
+                        {"reason": "eloop", "component": subdir}
+                    ) from exc
+                raise errors.not_found({"reason": reason, "component": subdir}) from exc
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise errors.path_forbidden({"reason": "not_regular_file", "component": subdir})
+                if st.st_nlink < 1:
+                    raise errors.path_forbidden({"reason": "unlinked_file", "component": subdir})
+                return fd, st
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+
+def safe_write_subdir_file(home: str | os.PathLike, subdir: str, filename: str, text: str) -> None:
+    """安全原子写状态根子目录文件（``candidates``/``jobs``/``intents``/...）。
+
+    同目录临时文件 0600 → fsync → ``os.replace`` → 目录 fsync，全程 dir_fd，
+    任一级 symlink/非目录 → PATH_FORBIDDEN，禁止 ``os.path.join`` 后直接 open。
+    """
+    _validate_subdir_file(subdir, filename)
+    paths = Paths(home)
+    root_fd = paths._open_root()
+    try:
+        try:
+            dir_fd = paths._open_dir_at(root_fd, subdir, subdir)
+        except errors.ApiError as exc:
+            if exc.code == "PATH_FORBIDDEN" and exc.details.get("reason") == "enoent":
+                try:
+                    os.mkdir(subdir, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    raise errors.path_forbidden(
+                        {"reason": _os_error_reason(e), "component": subdir}
+                    ) from e
+                dir_fd = paths._open_dir_at(root_fd, subdir, subdir)
+            else:
+                raise
+        try:
+            import secrets as _secrets
+
+            tmp_name = f".{filename}.{_secrets.token_hex(6)}.tmp"
+            try:
+                fd = os.open(
+                    tmp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+            except OSError as exc:
+                raise errors.path_forbidden(
+                    {"reason": _os_error_reason(exc), "component": subdir}
+                ) from exc
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(
+                    tmp_name,
+                    filename,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                os.fsync(dir_fd)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+
+def safe_read_subdir_text(home: str | os.PathLike, subdir: str, filename: str) -> str | None:
+    """读取子目录文件文本；缺失返回 None，symlink 抛 PATH_FORBIDDEN。"""
+    try:
+        fd, _st = safe_open_subdir_file(home, subdir, filename)
+    except errors.ApiError as exc:
+        if exc.code == "NOT_FOUND":
+            return None
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def safe_list_subdir_filenames(home: str | os.PathLike, subdir: str) -> list[str]:
+    """安全枚举子目录下文件名；目录不存在返回空列表。"""
+    _validate_subdir_file(subdir, "x")  # 校验 subdir 名
+    paths = Paths(home)
+    dir_fd = paths.subdir_fd(subdir, create=False)
+    if dir_fd == -1:
+        return []
+    names = []
+    try:
+        with os.scandir(dir_fd) as it:
+            for entry in it:
+                if entry.name.startswith("."):
+                    continue
+                names.append(entry.name)
+    finally:
+        os.close(dir_fd)
+    return sorted(names)
+
+
 def sha256_hex(data: bytes) -> str:
     """内容 SHA-256（预览 source_sha256 等复用）。"""
     return hashlib.sha256(data).hexdigest()
+
+
+def safe_write_run_state(home: str | os.PathLike, run_id: str, text: str) -> None:
+    """安全原子写回 ``runs/<run_id>/state.yaml``（撤回标 topic.retracted 等用）。
+
+    与 ``safe_write_hotspot_file`` 同一套：从根 fd 起逐级打开 runs/<run_id>，
+    同目录临时文件 0600 → fsync → os.replace → 目录 fsync，全程 dir_fd。
+    """
+    validate_run_id(run_id)
+    paths = Paths(home)
+    root_fd = paths._open_root()
+    try:
+        try:
+            runs_fd = paths._open_dir_at(root_fd, "runs", "runs")
+        except errors.ApiError as exc:
+            if exc.details.get("reason") == "enoent":
+                raise errors.not_found() from exc
+            raise
+        try:
+            run_fd = paths._open_dir_at(runs_fd, run_id, "run_id")
+            try:
+                import secrets as _secrets
+
+                tmp_name = f".state.{_secrets.token_hex(6)}.tmp"
+                try:
+                    fd = os.open(
+                        tmp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                        0o600,
+                        dir_fd=run_fd,
+                    )
+                except OSError as exc:
+                    raise errors.path_forbidden(
+                        {"reason": _os_error_reason(exc), "component": "run_state"}
+                    ) from exc
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(text)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(
+                        tmp_name,
+                        _STATE_FILENAME,
+                        src_dir_fd=run_fd,
+                        dst_dir_fd=run_fd,
+                    )
+                    os.fsync(run_fd)
+                except BaseException:
+                    try:
+                        os.unlink(tmp_name, dir_fd=run_fd)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                os.close(run_fd)
+        finally:
+            os.close(runs_fd)
+    finally:
+        os.close(root_fd)
 
 
 def read_state_yaml(home: str | os.PathLike, run_id: str) -> dict | None:

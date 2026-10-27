@@ -1,9 +1,12 @@
-// 前端交互可机械判定 harness（JEE-1930 返修 · 阻断项 1–3 覆盖）。
+// 前端交互可机械判定 harness（JEE-1930 返修 · 4 条阻断 + 3 项拦截覆盖）。
 //
-// 用 Node `vm` 加载真实 app/web/app.js，提供最小 DOM 桩，执行真实逻辑：
+// 用 Node `vm` 加载真实 app/web/app.js，提供最小 DOM 桩 + 可注入 fetch，执行真实逻辑：
 //   1. 路由落点：currentRoute() 对 #/jobs、#/runs、#/preview、#/publish 返回确定页（非 home）；
-//   2. 窄屏导航入口：index.html 存在 menuToggle/drawerMask，且 app.js bindDrawer 把二者与侧栏串联（点击开关→sidebar.open）；
-//   3. 失败态类名：renderJobBody 生成 .stepper 下 .step.fail + .bubble + .lbl（类名与 CSS .step.fail 一致）。
+//   2. 窄屏导航入口：index.html 存在 menuToggle/drawerMask，且 bindDrawer 把二者与侧栏串联
+//      （点击开关→sidebar.open；真实派发一次 nav 链接 click→sidebar.open 被移除）；
+//   3. 失败态类名：renderJobBody 生成 .stepper 下 .step.fail + .bubble + .lbl（与 CSS .step.fail 一致）；
+//   4. 四态硬边界：无 ID 入口对 500/网络错误渲染可重试错误态、403 渲染无权限态、成功空列表渲染空态；
+//   5. 发布确认页：授权成功后地址 ↔ 正文 ↔ h1 ↔ 高亮 四者一致。
 //
 // 输出 JSON 到 stdout；断言失败即 process.exit(1)。本文件由 pytest 调用，也可 `node` 直接跑。
 
@@ -21,25 +24,25 @@ class ClassList {
     this._set = new Set();
   }
   _sync() {
-    this._set = new Set(String(this._owner.className || "").split(/\s+/).filter(Boolean));
+    this._set = new Set(String(this._owner && this._owner.className || "").split(/\s+/).filter(Boolean));
   }
   toggle(name, force) {
     this._sync();
     const want = force === undefined ? !this._set.has(name) : !!force;
     if (want) this._set.add(name);
     else this._set.delete(name);
-    this._owner.className = [...this._set].join(" ");
+    if (this._owner) this._owner.className = [...this._set].join(" ");
     return want;
   }
   add(...names) {
     this._sync();
     names.forEach((n) => this._set.add(n));
-    this._owner.className = [...this._set].join(" ");
+    if (this._owner) this._owner.className = [...this._set].join(" ");
   }
   remove(...names) {
     this._sync();
     names.forEach((n) => this._set.delete(n));
-    this._owner.className = [...this._set].join(" ");
+    if (this._owner) this._owner.className = [...this._set].join(" ");
   }
   contains(name) {
     this._sync();
@@ -77,10 +80,9 @@ class FakeEl {
   appendChild(c) {
     if (c == null) return c;
     if (typeof c === "string") {
-      c = { nodeType: 3, textContent: c, children: [], classList: { toggle() {} } };
+      c = { nodeType: 3, textContent: c, children: [], classList: { toggle() {}, contains() { return false; } } };
     }
     if (c.nodeType === 3) {
-      // 文本节点：累积到父元素 textContent，便于断言气泡文案
       this.textContent += c.textContent;
       c.parentNode = this;
       this.children.push(c);
@@ -129,15 +131,32 @@ function findByClass(root, cls) {
   return out;
 }
 
-function makeContext({ hash }) {
-  const els = {};
-  const getEl = (id) => {
-    if (!els[id]) {
-      els[id] = new FakeEl("div");
-      els[id].id = id;
-    }
-    return els[id];
+function collectText(root) {
+  const parts = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (typeof n.textContent === "string" && n.textContent && n.nodeType !== 3) parts.push(n.textContent);
+    (n.children || []).forEach(walk);
   };
+  walk(root);
+  return parts.join("");
+}
+
+function findByText(root, text) {
+  const out = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (n.textContent === text) out.push(n);
+    (n.children || []).forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
+// 可注入 fetch 的最小上下文。
+// fetchImpl: (path, opts) => 返回对象 { ok, status, statusText, json } 或直接 throw。
+function makeContext({ hash, fetchImpl }) {
+  const els = {};
   const navAnchors = [
     ["home", "#/"],
     ["hotspots", "#/hotspots"],
@@ -154,6 +173,20 @@ function makeContext({ hash }) {
     return a;
   });
 
+  // 侧栏元素：让 bindDrawer 的 sidebar.querySelectorAll(".nav a") 真实拿到 nav 链接，
+  // 从而真实绑定 closeDrawer 到每个链接，抽屉测试才能真正派发点击。
+  const sidebarEl = new FakeEl("aside");
+  sidebarEl.querySelectorAll = (sel) => (sel === ".nav a" ? navAnchors : []);
+
+  const getEl = (id) => {
+    if (id === "sidebar") return sidebarEl;
+    if (!els[id]) {
+      els[id] = new FakeEl("div");
+      els[id].id = id;
+    }
+    return els[id];
+  };
+
   const location = { hash, replace() {} };
   const windowObj = {
     addEventListener() {},
@@ -166,21 +199,21 @@ function makeContext({ hash }) {
     createElement: (t) => new FakeEl(t),
     querySelectorAll: (sel) => {
       if (sel === ".nav a") return navAnchors;
-      if (sel === ".sidebar") return [getEl("sidebar")];
+      if (sel === ".sidebar") return [sidebarEl];
       return [];
     },
     querySelector: (sel) => {
-      if (sel === ".sidebar") return getEl("sidebar");
+      if (sel === ".sidebar") return sidebarEl;
       return null;
     },
-    createTextNode: (t) => ({ nodeType: 3, textContent: String(t), children: [], classList: { toggle() {} } }),
+    createTextNode: (t) => ({ nodeType: 3, textContent: String(t), children: [], classList: { toggle() {}, contains() { return false; } } }),
   };
 
   const sandbox = {
     document: documentObj,
     location,
     window: windowObj,
-    fetch: async () => { throw new Error("no-network"); },
+    fetch: fetchImpl || (async () => { throw new Error("no-network"); }),
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
@@ -190,12 +223,25 @@ function makeContext({ hash }) {
     console,
   };
   sandbox.globalThis = sandbox;
-  return { sandbox, els, navAnchors, location };
+  return { sandbox, els, navAnchors, sidebarEl, location };
 }
 
 const checks = [];
 function check(name, cond) {
   checks.push({ name, ok: !!cond });
+}
+
+// 跨 realm 安全地 await vm 内返回的 promise。
+async function runAwait(ctx, code) {
+  const p = vm.runInContext(code, ctx);
+  await Promise.resolve(p);
+}
+
+function okJson(body) {
+  return { ok: true, status: 200, statusText: "OK", json: async () => body };
+}
+function errJson(status, body = {}) {
+  return { ok: false, status, statusText: "ERR", json: async () => body };
 }
 
 // ---------- 1) 路由落点 ----------
@@ -217,36 +263,32 @@ function check(name, cond) {
   }
 }
 
-// ---------- 2) 窄屏导航入口 + 抽屉串联 ----------
+// ---------- 2) 窄屏导航入口 + 抽屉串联（真实派发 nav 链接点击） ----------
 {
-  const { sandbox, els, location } = makeContext({ hash: "#/runs" });
+  const { sandbox, els, navAnchors, sidebarEl, location } = makeContext({ hash: "#/runs" });
   const ctx = vm.createContext(sandbox);
   vm.runInContext(appJs, ctx, { filename: "app.js" });
 
   check("index.html 有 menuToggle 抽屉开关", /id="menuToggle"/.test(indexHtml));
   check("index.html 有 drawerMask 遮罩", /id="drawerMask"/.test(indexHtml));
 
-  // 执行 bindDrawer 已随模块加载跑过一次：点击 menuToggle 应给 sidebar 加 .open
-  const sidebar = els["sidebar"] || new FakeEl("div");
-  els["sidebar"] = sidebar;
-  const menuToggle = els["menuToggle"] || new FakeEl("button");
-  els["menuToggle"] = menuToggle;
-  const drawerMask = els["drawerMask"] || new FakeEl("div");
-  els["drawerMask"] = drawerMask;
+  const menuToggle = els["menuToggle"];
+  const drawerMask = els["drawerMask"];
 
-  // 重新跑 bindDrawer（幂等），再用真实点击触发
-  vm.runInContext("bindDrawer()", ctx);
+  // bindDrawer 已在模块加载时执行：点击 menuToggle 打开抽屉
   menuToggle.listeners["click"] && menuToggle.listeners["click"][0]();
-  check("点击 menuToggle 打开抽屉（sidebar.open）", sidebar.classList.contains("open"));
+  check("点击 menuToggle 打开抽屉（sidebar.open）", sidebarEl.classList.contains("open"));
   drawerMask.listeners["click"] && drawerMask.listeners["click"][0]();
-  check("点击遮罩关闭抽屉", !sidebar.classList.contains("open"));
+  check("点击遮罩关闭抽屉", !sidebarEl.classList.contains("open"));
+
+  // 再次打开，然后真实派发一次 .nav a 的 click，断言 closeDrawer 被触发、open 被移除
   menuToggle.listeners["click"] && menuToggle.listeners["click"][0]();
-  // 点 nav 链接应关闭抽屉
-  vm.runInContext("document.querySelectorAll('.nav a')[0].addEventListener('click', ()=>{}); ", ctx);
-  const navLinkHandler = () => sidebar.classList.remove("open");
-  // 直接用真实绑定：重新 bindDrawer 后取侧栏上 nav 链接的监听
-  const before = sidebar.classList.contains("open");
-  check("抽屉处于打开态后再点击", before);
+  const opened = sidebarEl.classList.contains("open");
+  const firstNavClick = navAnchors[0].listeners["click"];
+  const dispatched = Array.isArray(firstNavClick) && firstNavClick.length > 0;
+  if (dispatched) firstNavClick[0]();
+  check("抽屉打开后真实派发 nav 链接点击", opened && dispatched);
+  check("点击 nav 链接关闭抽屉（sidebar.open 移除）", !sidebarEl.classList.contains("open"));
 }
 
 // ---------- 3) 失败态类名 + stepper 气泡结构 ----------
@@ -264,10 +306,7 @@ function check(name, cond) {
     progress: { kind: "step", completed: 2, total: 4 },
     images: [],
   };
-  vm.runInContext(
-    `renderJobBody(${JSON.stringify(job)}, "20261026-080000-a1b2c3")`,
-    ctx,
-  );
+  vm.runInContext(`renderJobBody(${JSON.stringify(job)}, "20261026-080000-a1b2c3")`, ctx);
   const app = els["app"];
   const steps = findByClass(app, "step");
   check("renderJobBody 输出 4 个 .step", steps.length === 4);
@@ -280,12 +319,164 @@ function check(name, cond) {
   check("失败步骤气泡文案为 ✕", !!bubble && bubble.textContent === "✕");
 }
 
-const failed = checks.filter((c) => !c.ok);
-const summary = {
-  total: checks.length,
-  passed: checks.length - failed.length,
-  failed: failed.map((c) => c.name),
-  checks,
-};
-console.log(JSON.stringify(summary, null, 2));
-if (failed.length > 0) process.exit(1);
+// ---------- 4) 四态硬边界：无 ID 入口错误态/无权限态/空态可区分 ----------
+async function testFourStates() {
+  // 4.1 任务详情（#/runs）
+  {
+    const { sandbox, els } = makeContext({
+      hash: "#/runs",
+      fetchImpl: async () => errJson(500),
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderDetail(null)");
+    const app = els["app"];
+    check("renderDetail(null) 500 → 错误态(含重试)", findByClass(app, "error-block").length > 0 && findByText(app, "重试").length > 0);
+  }
+  {
+    const { sandbox, els } = makeContext({
+      hash: "#/runs",
+      fetchImpl: async () => { throw new Error("network down"); },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderDetail(null)");
+    const app = els["app"];
+    check("renderDetail(null) 网络错误 → 错误态(含重试)", findByClass(app, "error-block").length > 0 && findByText(app, "重试").length > 0);
+  }
+  {
+    const { sandbox, els } = makeContext({
+      hash: "#/runs",
+      fetchImpl: async () => errJson(403, { code: "CSRF_INVALID", message: "denied" }),
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderDetail(null)");
+    const app = els["app"];
+    const text = collectText(app);
+    check("renderDetail(null) 403 → 无权限态", text.includes("本机工作台目录不可读"));
+  }
+  {
+    const { sandbox, els } = makeContext({
+      hash: "#/runs",
+      fetchImpl: async () => okJson({ runs: [] }),
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderDetail(null)");
+    const app = els["app"];
+    const text = collectText(app);
+    check("renderDetail(null) 空列表 → 空态(非错误态)", findByClass(app, "error-block").length === 0 && text.includes("还没有"));
+  }
+
+  // 4.2 产物预览 / 发布确认 / 生成进行中（#/jobs）的 500 错误态
+  {
+    const { sandbox, els } = makeContext({ hash: "#/preview", fetchImpl: async () => errJson(500) });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPreview(null)");
+    check("renderPreview(null) 500 → 错误态(含重试)", findByClass(els["app"], "error-block").length > 0 && findByText(els["app"], "重试").length > 0);
+  }
+  {
+    const { sandbox, els } = makeContext({ hash: "#/publish", fetchImpl: async () => errJson(500) });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPublish(null)");
+    check("renderPublish(null) 500 → 错误态(含重试)", findByClass(els["app"], "error-block").length > 0 && findByText(els["app"], "重试").length > 0);
+  }
+  {
+    // 生成任务列表非 403（jobs 接口 500）：必须错误态，不能落到 renderJobEmpty
+    const { sandbox, els } = makeContext({
+      hash: "#/jobs",
+      fetchImpl: async (path) => {
+        if (path === "/api/v1/runs") return okJson({ runs: [{ run_id: "20261026-080000-a1b2c3" }] });
+        return errJson(500);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderJob(null)");
+    const app = els["app"];
+    const text = collectText(app);
+    check("renderJob(null) jobs 500 → 错误态(含重试,非空态)", findByClass(app, "error-block").length > 0 && findByText(app, "重试").length > 0 && !text.includes("还没有生成任务"));
+  }
+  {
+    // 生成任务列表 403：无权限态
+    const { sandbox, els } = makeContext({
+      hash: "#/jobs",
+      fetchImpl: async (path) => {
+        if (path === "/api/v1/runs") return okJson({ runs: [{ run_id: "20261026-080000-a1b2c3" }] });
+        return errJson(403);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderJob(null)");
+    const text = collectText(els["app"]);
+    check("renderJob(null) jobs 403 → 无权限态", text.includes("本机工作台目录不可读"));
+  }
+}
+
+// ---------- 5) 发布确认页：授权成功后地址 ↔ 正文 ↔ h1 ↔ 高亮一致 ----------
+async function testPublishConsistency() {
+  const runId = "20261026-080000-a1b2c3";
+  const detail = {
+    run_id: runId,
+    title: "测试发布标题",
+    status: "completed",
+    mode: "complete",
+    permissions: { publish: false },
+    publish: { status: "not_published", media_id: null },
+    editorial: { decision: "pass", publishable: true },
+  };
+  const { sandbox, els, navAnchors, location } = makeContext({
+    hash: `#/runs/${runId}/publish`,
+    fetchImpl: async (path, opts) => {
+      if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+      if (path === `/api/v1/runs/${runId}`) return okJson(detail);
+      if (path === `/api/v1/runs/${runId}/publish/preflight`) return okJson({ ok: false, checks: [], revision: "r1" });
+      if (path === `/api/v1/runs/${runId}/publish/permission`) return okJson({ ok: true });
+      throw new Error("unexpected path " + path);
+    },
+  });
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(appJs, ctx, { filename: "app.js" });
+
+  // 完整走 render()：更新 h1、顶栏动作、侧栏高亮，再渲染发布页
+  await runAwait(ctx, "render()");
+  const pageTitle = els["pageTitle"];
+  check("发布页初始 h1 为「发布确认」", pageTitle && pageTitle.textContent === "发布确认");
+
+  const publishNav = navAnchors[6];
+  check("发布页初始 publish 导航高亮", publishNav.classList.contains("active"));
+
+  // 点击「开启发布授权」，成功后应原地 renderPublish(runId)（不跳详情）。
+  // handler 内部 fire-and-forget 调 renderPublish（未 await），用宿主 macrotask 冲刷其异步链。
+  const appBefore = els["app"];
+  const authorizeBtn = findByText(appBefore, "开启发布授权")[0];
+  const handler = authorizeBtn && authorizeBtn.listeners["click"] && authorizeBtn.listeners["click"][0];
+  if (handler) await Promise.resolve(handler());
+  await new Promise((r) => setTimeout(r, 10));
+  const appAfter = els["app"];
+  const afterText = collectText(appAfter);
+  check("授权成功后正文仍是发布页(含发布闸门)", afterText.includes("发布闸门（P7）") && !afterText.includes("选题"));
+  check("授权成功后地址不变(#/runs/{id}/publish)", location.hash === `#/runs/${runId}/publish`);
+  check("授权成功后 h1 仍是「发布确认」", pageTitle.textContent === "发布确认");
+  check("授权成功后 publish 导航仍高亮", publishNav.classList.contains("active"));
+}
+
+// ============ 主入口 ============
+(async () => {
+  await testFourStates();
+  await testPublishConsistency();
+
+  const failed = checks.filter((c) => !c.ok);
+  const summary = {
+    total: checks.length,
+    passed: checks.length - failed.length,
+    failed: failed.map((c) => c.name),
+    checks,
+  };
+  console.log(JSON.stringify(summary, null, 2));
+  if (failed.length > 0) process.exit(1);
+})();

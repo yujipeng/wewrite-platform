@@ -251,15 +251,21 @@ async function render() {
 // ============ 无 ID 入口的最近运行解析 ============
 // `#/runs`、`#/preview`、`#/publish`、`#/jobs` 等无 ID 入口必须有确定落点：
 // 默认解析最近一次运行；无任何运行时渲染明确空态页，绝不静默回退工作台。
-// 返回 { runId, denied }：denied=true 表示无权限（非回环 Host 403），需渲染无权限态。
+// 返回三态 { runId, denied, error }：
+//   - denied=true：无权限（非回环 Host 403），需渲染无权限态；
+//   - error 非空：请求失败（500/网络异常），需渲染可重试错误态；
+//   - 否则成功：runId 非空为最近运行，runId 为空才是真空态。
 async function resolveLatestRunState() {
   try {
     const data = await api("/api/v1/runs");
     const runs = (data.runs || []).filter((r) => r && r.run_id);
     // list_runs 按创建时间倒序，runs[0] 即最近一次运行
-    return { runId: runs[0] ? runs[0].run_id : null, denied: false };
+    return { runId: runs[0] ? runs[0].run_id : null, denied: false, error: null };
   } catch (err) {
-    return { runId: null, denied: err.status === 403 };
+    if (err && err.status === 403) {
+      return { runId: null, denied: true, error: null };
+    }
+    return { runId: null, denied: false, error: err };
   }
 }
 
@@ -395,12 +401,17 @@ async function renderDetail(runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
 
-  // 无 ID 入口（#/runs）：解析最近一次运行；无权限渲染无权限态，无任何运行则空态页
+  // 无 ID 入口（#/runs）：解析最近一次运行；无权限/请求失败/无运行分别渲染对应状态页
   if (!runId) {
     const resolved = await resolveLatestRunState();
     if (resolved.denied) {
       app.innerHTML = "";
       app.appendChild(forbiddenState());
+      return;
+    }
+    if (resolved.error) {
+      app.innerHTML = "";
+      app.appendChild(errorState("加载任务列表失败：" + (resolved.error.code || resolved.error.message || "网络错误"), () => renderDetail(null)));
       return;
     }
     if (!resolved.runId) {
@@ -673,12 +684,17 @@ async function renderPreviewEmpty() {
 async function renderPreview(runId) {
   app.innerHTML = "";
 
-  // 无 ID 入口（#/preview）：解析最近一次运行；无权限/无运行渲染对应状态页
+  // 无 ID 入口（#/preview）：解析最近一次运行；无权限/请求失败/无运行分别渲染对应状态页
   if (!runId) {
     const resolved = await resolveLatestRunState();
     if (resolved.denied) {
       app.innerHTML = "";
       app.appendChild(forbiddenState());
+      return;
+    }
+    if (resolved.error) {
+      app.innerHTML = "";
+      app.appendChild(errorState("加载任务列表失败：" + (resolved.error.code || resolved.error.message || "网络错误"), () => renderPreview(null)));
       return;
     }
     if (!resolved.runId) {
@@ -1422,12 +1438,17 @@ function kvForm(rows) {
 async function renderPublish(runId) {
   app.innerHTML = "";
 
-  // 无 ID 入口：解析最近一次运行；无权限/无运行渲染对应状态页
+  // 无 ID 入口：解析最近一次运行；无权限/请求失败/无运行分别渲染对应状态页
   if (!runId) {
     const resolved = await resolveLatestRunState();
     if (resolved.denied) {
       app.innerHTML = "";
       app.appendChild(forbiddenState());
+      return;
+    }
+    if (resolved.error) {
+      app.innerHTML = "";
+      app.appendChild(errorState("加载任务列表失败：" + (resolved.error.code || resolved.error.message || "网络错误"), () => renderPublish(null)));
       return;
     }
     if (!resolved.runId) {
@@ -1531,7 +1552,9 @@ function renderPublishGate(runId, detail) {
         body: JSON.stringify({ allow: !perm }),
       });
       if (!res.ok) throw new Error((await res.json()).message || res.statusText);
-      renderDetail(runId);
+      // 授权/撤销成功后地址仍是 #/runs/{id}/publish：留在发布页原地重渲染，刷新授权态，
+      // 使地址、顶栏 h1、侧栏高亮、正文四者指向同一页面（不跳去详情）。
+      renderPublish(runId);
     } catch (err) {
       window.alert("授权失败：" + (err.code || err.message));
     }
@@ -1592,7 +1615,9 @@ function renderPublishGate(runId, detail) {
       const pbody = await pr.json();
       if (pbody.status === "succeeded") {
         window.alert("已写入草稿箱，media_id：" + pbody.media_id + "，请到公众号后台处理");
-        renderDetail(runId);
+        // 提交成功后地址仍是 #/runs/{id}/publish：原地重渲染发布页刷新发布状态，
+        // 使地址、顶栏 h1、侧栏高亮、正文四者一致（不跳去详情）。
+        renderPublish(runId);
       } else {
         window.alert("发布结果未知（unknown），禁止重复提交，请到公众号后台草稿箱核对");
       }
@@ -1648,12 +1673,17 @@ async function renderJob(jobId) {
   app.innerHTML = "";
   /* 页面标题由顶栏 h1 承载 */
 
-  // 无 ID 入口（#/jobs）：解析最近一次运行，再定位其最近一个 job；无则渲染空态
+  // 无 ID 入口（#/jobs）：解析最近一次运行，再定位其最近一个 job；无权限/请求失败/无 job 分别渲染对应状态
   if (!jobId) {
     const resolved = await resolveLatestRunState();
     if (resolved.denied) {
       app.innerHTML = "";
       app.appendChild(forbiddenState());
+      return;
+    }
+    if (resolved.error) {
+      app.innerHTML = "";
+      app.appendChild(errorState("加载任务列表失败：" + (resolved.error.code || resolved.error.message || "网络错误"), () => renderJob(null)));
       return;
     }
     if (resolved.runId) {
@@ -1671,6 +1701,10 @@ async function renderJob(jobId) {
           app.appendChild(forbiddenState());
           return;
         }
+        // 非 403：请求失败，渲染可重试错误态，绝不落到 renderJobEmpty()
+        app.innerHTML = "";
+        app.appendChild(errorState("加载生成任务列表失败：" + (err.code || err.message || "网络错误"), () => renderJob(null)));
+        return;
       }
     }
     renderJobEmpty();

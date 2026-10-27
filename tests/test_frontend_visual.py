@@ -163,7 +163,7 @@ def test_app_js_detail_stepper_and_chip(client):
     assert "chip" in js
 
 
-# ============ 返修阻断项 1–3：机械可判定交互断言（非源码字符串匹配） ============
+# ============ 返修阻断项 1–3 + 拦截项 1–3：机械可判定交互断言（非源码字符串匹配） ============
 
 def test_no_id_routes_resolve_to_definite_pages(client):
     """阻断项 1：无 ID 入口 #/jobs、#/runs、#/preview、#/publish 路由有确定落点。"""
@@ -178,7 +178,7 @@ def test_no_id_routes_resolve_to_definite_pages(client):
 
 
 def test_narrow_screen_drawer_navigation(client):
-    """阻断项 2：窄屏替代导航入口真实串联（menuToggle/drawerMask ↔ sidebar.open）。"""
+    """阻断项 2 + 拦截 3：窄屏替代导航真实串联（含真实派发 nav 链接 click 关闭抽屉）。"""
     _html(client)
     summary = _run_interaction_harness()
     by_name = {c["name"]: c["ok"] for c in summary["checks"]}
@@ -186,6 +186,8 @@ def test_narrow_screen_drawer_navigation(client):
     assert by_name["index.html 有 drawerMask 遮罩"] is True
     assert by_name["点击 menuToggle 打开抽屉（sidebar.open）"] is True
     assert by_name["点击遮罩关闭抽屉"] is True
+    assert by_name["抽屉打开后真实派发 nav 链接点击"] is True
+    assert by_name["点击 nav 链接关闭抽屉（sidebar.open 移除）"] is True
 
 
 def test_job_stepper_failed_class_and_bubbles(client):
@@ -198,3 +200,38 @@ def test_job_stepper_failed_class_and_bubbles(client):
     assert by_name["失败步骤含 .bubble 气泡"] is True
     assert by_name["失败步骤含 .lbl 标签"] is True
     assert by_name["失败步骤气泡文案为 ✕"] is True
+
+
+def test_no_id_entry_distinguishes_error_denied_empty(client):
+    """拦截 1：无 ID 入口区分 500/网络错误态、403 无权限态、成功空列表空态。"""
+    _app_js(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    for name in (
+        "renderDetail(null) 500 → 错误态(含重试)",
+        "renderDetail(null) 网络错误 → 错误态(含重试)",
+        "renderDetail(null) 403 → 无权限态",
+        "renderDetail(null) 空列表 → 空态(非错误态)",
+        "renderPreview(null) 500 → 错误态(含重试)",
+        "renderPublish(null) 500 → 错误态(含重试)",
+        "renderJob(null) jobs 500 → 错误态(含重试,非空态)",
+        "renderJob(null) jobs 403 → 无权限态",
+    ):
+        assert by_name[name] is True, f"harness 断言失败：{name}"
+
+
+def test_publish_page_action_keeps_url_body_title_highlight_consistent(client):
+    """拦截 2：发布确认页授权成功后地址 ↔ 正文 ↔ h1 ↔ 侧栏高亮四者一致。"""
+    _app_js(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    for name in (
+        "发布页初始 h1 为「发布确认」",
+        "发布页初始 publish 导航高亮",
+        "授权成功后正文仍是发布页(含发布闸门)",
+        "授权成功后地址不变(#/runs/{id}/publish)",
+        "授权成功后 h1 仍是「发布确认」",
+        "授权成功后 publish 导航仍高亮",
+    ):
+        assert by_name[name] is True, f"harness 断言失败：{name}"
+

@@ -16,6 +16,7 @@ const PAGE_CHROME = {
   job: { title: "生成进行中", crumb: "生成进行中" },
   runJob: { title: "生成进行中", crumb: "生成进行中" },
   config: { title: "配置", crumb: "配置" },
+  publish: { title: "发布确认", crumb: "发布确认" },
 };
 
 function updateChrome(route) {
@@ -35,6 +36,8 @@ function renderTopActions(page) {
     actions.appendChild(el("a", { class: "btn primary", href: "#/hotspots", text: "＋ 新建任务" }));
   } else if (page === "hotspots") {
     actions.appendChild(el("a", { class: "btn primary", href: "#/candidates", text: "生成候选 →" }));
+  } else if (page === "publish") {
+    actions.appendChild(el("a", { class: "btn", href: "#/runs", text: "返回任务详情" }));
   }
 }
 
@@ -177,6 +180,11 @@ async function api(path, opts = {}) {
 
 function currentRoute() {
   const hash = location.hash || "#/";
+  // 无 ID 入口：落到「最近一次运行」确定页，绝不静默回退工作台
+  if (hash === "#/jobs") return { page: "job" };
+  if (hash === "#/runs") return { page: "detail" };
+  if (hash === "#/preview") return { page: "preview" };
+  if (hash === "#/publish") return { page: "publish" };
   // #/jobs/{job_id}
   const jm = hash.match(/^#\/jobs\/([a-z0-9-]+)$/);
   if (jm) return { page: "job", jobId: jm[1] };
@@ -189,6 +197,9 @@ function currentRoute() {
   // #/runs/{run_id}/preview
   const pm = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})\/preview$/);
   if (pm) return { page: "preview", runId: pm[1] };
+  // #/runs/{run_id}/publish
+  const pbm = hash.match(/^#\/runs\/([0-9]{8}-[0-9]{6}-[a-f0-9]{6})\/publish$/);
+  if (pbm) return { page: "publish", runId: pbm[1] };
   if (hash === "#/hotspots") return { page: "hotspots" };
   if (hash === "#/candidates") return { page: "candidates" };
   if (hash === "#/config") return { page: "config" };
@@ -212,6 +223,7 @@ async function render() {
       (nav === "jobs" && (route.page === "job" || route.page === "runJob")) ||
       (nav === "detail" && route.page === "detail") ||
       (nav === "preview" && route.page === "preview") ||
+      (nav === "publish" && route.page === "publish") ||
       (nav === "config" && route.page === "config");
     n.classList.toggle("active", active);
   });
@@ -227,11 +239,41 @@ async function render() {
     await renderCandidates();
   } else if (route.page === "config") {
     await renderConfig();
+  } else if (route.page === "publish") {
+    await renderPublish(route.runId);
   } else if (route.page === "job") {
     await renderJob(route.jobId);
   } else if (route.page === "runJob") {
     await renderRunJob(route.runId);
   }
+}
+
+// ============ 无 ID 入口的最近运行解析 ============
+// `#/runs`、`#/preview`、`#/publish`、`#/jobs` 等无 ID 入口必须有确定落点：
+// 默认解析最近一次运行；无任何运行时渲染明确空态页，绝不静默回退工作台。
+// 返回 { runId, denied }：denied=true 表示无权限（非回环 Host 403），需渲染无权限态。
+async function resolveLatestRunState() {
+  try {
+    const data = await api("/api/v1/runs");
+    const runs = (data.runs || []).filter((r) => r && r.run_id);
+    // list_runs 按创建时间倒序，runs[0] 即最近一次运行
+    return { runId: runs[0] ? runs[0].run_id : null, denied: false };
+  } catch (err) {
+    return { runId: null, denied: err.status === 403 };
+  }
+}
+
+async function renderDetailOrEmpty(runId) {
+  if (runId) {
+    await renderDetail(runId);
+    return;
+  }
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
+  app.appendChild(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "任务详情" })]),
+    el("div", { class: "card-body" }, [emptyState("还没有任何任务，去「每日热榜」→「选题确认」发起第一篇")]),
+  ]));
 }
 
 async function renderHome() {
@@ -353,6 +395,22 @@ async function renderDetail(runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
 
+  // 无 ID 入口（#/runs）：解析最近一次运行；无权限渲染无权限态，无任何运行则空态页
+  if (!runId) {
+    const resolved = await resolveLatestRunState();
+    if (resolved.denied) {
+      app.innerHTML = "";
+      app.appendChild(forbiddenState());
+      return;
+    }
+    if (!resolved.runId) {
+      await renderDetailOrEmpty(null);
+      return;
+    }
+    runId = resolved.runId;
+    location.replace("#/runs/" + runId);
+  }
+
   const container = el("div");
   app.appendChild(container);
   container.appendChild(loadingState("正在加载任务详情…"));
@@ -455,9 +513,8 @@ function detailBody(d) {
     sections.push(el("div", { class: "preview-controls" }, [retryBtn]));
   }
 
-  // 选题
+  // 选题（卡片化：card-head + card-body，替代裸 section-title + dl.kv）
   const topic = d.topic || {};
-  sections.push(el("div", { class: "section-title", text: "选题" }));
   const topicKv = el("dl", { class: "kv" });
   const topicRows = [
     ["标题", topic.title],
@@ -469,11 +526,13 @@ function detailBody(d) {
     topicKv.appendChild(el("dt", { text: k }));
     topicKv.appendChild(el("dd", { text: v == null || v === "" ? "未提供" : String(v) }));
   }
-  sections.push(topicKv);
+  sections.push(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "选题" })]),
+    el("div", { class: "card-body" }, [topicKv]),
+  ]));
 
-  // 配图限额
+  // 配图设置（卡片化）
   const visual = d.visual || {};
-  sections.push(el("div", { class: "section-title", text: "配图设置" }));
   const visualKv = el("dl", { class: "kv" });
   for (const [k, v] of [
     ["视觉模式", visual.mode],
@@ -483,7 +542,10 @@ function detailBody(d) {
     visualKv.appendChild(el("dt", { text: k }));
     visualKv.appendChild(el("dd", { text: v == null || v === "" ? "未提供" : String(v) }));
   }
-  sections.push(visualKv);
+  sections.push(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "配图设置" })]),
+    el("div", { class: "card-body" }, [visualKv]),
+  ]));
 
   // 步骤时间线（对齐设计图 stepper 气泡）
   const steps = d.steps || {};
@@ -508,8 +570,7 @@ function detailBody(d) {
   stepCard.appendChild(stepBody);
   sections.push(stepCard);
 
-  // 审稿结论与 SEO
-  sections.push(el("div", { class: "section-title", text: "审稿结论与 SEO" }));
+  // 审稿结论与 SEO（卡片化）
   const editorial = d.editorial || {};
   const seo = d.seo || {};
   const edKv = el("dl", { class: "kv" });
@@ -525,26 +586,33 @@ function detailBody(d) {
     edKv.appendChild(el("dt", { text: k }));
     edKv.appendChild(el("dd", { text: v == null || v === "" ? "未提供" : String(v) }));
   }
-  sections.push(edKv);
+  sections.push(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "审稿结论与 SEO" })]),
+    el("div", { class: "card-body" }, [edKv]),
+  ]));
 
-  // 产物清单
-  sections.push(el("div", { class: "section-title", text: "产物清单" }));
+  // 产物清单（卡片化）
   const artBadges = el("div", { class: "artifact-badges" });
   for (const [name, label] of Object.entries(ARTIFACT_LABELS)) {
     const on = !!(d.artifacts && d.artifacts[name]);
     artBadges.appendChild(el("span", { class: "artifact-badge " + (on ? "on" : "off"), text: label + "：" + (on ? "已落盘" : "尚未生成") }));
   }
-  sections.push(artBadges);
+  sections.push(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "产物清单" })]),
+    el("div", { class: "card-body" }, [artBadges]),
+  ]));
 
-  // 发布概要
+  // 发布概要（卡片化）
   const publish = d.publish || {};
-  sections.push(el("div", { class: "section-title", text: "发布概要" }));
   const pubBox = el("div", { class: "publish-box" }, [
     el("div", { text: "发布状态：" + (publish.status || "not_published") }),
     el("div", { text: "media_id：" + (publish.media_id || "无") }),
     publish.unknown_at ? el("div", { text: "结果未知时间：" + publish.unknown_at }) : null,
   ]);
-  sections.push(pubBox);
+  sections.push(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "发布概要" })]),
+    el("div", { class: "card-body" }, [pubBox]),
+  ]));
 
   // 发布闸门（P7）
   sections.push(renderPublishGate(d.run_id, d));
@@ -561,14 +629,66 @@ function detailBody(d) {
 window.addEventListener("hashchange", render);
 render();
 
+// ============ 窄屏抽屉导航 ============
+// 窄屏隐藏侧栏后提供替代导航入口：顶栏 ☰ 打开抽屉，点遮罩或选中链接后收起。
+function bindDrawer() {
+  const sidebar = document.querySelector(".sidebar");
+  const menuToggle = document.getElementById("menuToggle");
+  const drawerMask = document.getElementById("drawerMask");
+  if (!sidebar || !menuToggle || !drawerMask) return;
+  const openDrawer = () => {
+    sidebar.classList.add("open");
+    drawerMask.hidden = false;
+    menuToggle.setAttribute("aria-expanded", "true");
+  };
+  const closeDrawer = () => {
+    sidebar.classList.remove("open");
+    drawerMask.hidden = true;
+    menuToggle.setAttribute("aria-expanded", "false");
+  };
+  menuToggle.addEventListener("click", () => {
+    if (sidebar.classList.contains("open")) closeDrawer();
+    else openDrawer();
+  });
+  drawerMask.addEventListener("click", closeDrawer);
+  sidebar.querySelectorAll(".nav a").forEach((a) => a.addEventListener("click", closeDrawer));
+}
+bindDrawer();
+
 // ============ M2：P3 产物预览 ============
 
 function sourceLabel(source) {
   return { draft: "初稿 draft.md", article: "终稿 article.md", illustrated_article: "带图版 article-illustrated.md" }[source] || source;
 }
 
+async function renderPreviewEmpty() {
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
+  app.appendChild(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "产物预览" })]),
+    el("div", { class: "card-body" }, [emptyState("还没有任何任务，暂无产物可预览")]),
+  ]));
+}
+
 async function renderPreview(runId) {
   app.innerHTML = "";
+
+  // 无 ID 入口（#/preview）：解析最近一次运行；无权限/无运行渲染对应状态页
+  if (!runId) {
+    const resolved = await resolveLatestRunState();
+    if (resolved.denied) {
+      app.innerHTML = "";
+      app.appendChild(forbiddenState());
+      return;
+    }
+    if (!resolved.runId) {
+      await renderPreviewEmpty();
+      return;
+    }
+    runId = resolved.runId;
+    location.replace("#/runs/" + runId + "/preview");
+  }
+
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
   /* 页面标题由顶栏 h1 承载 */
 
@@ -1298,13 +1418,70 @@ function kvForm(rows) {
   return dl;
 }
 
+// 发布确认页面（#/publish 无 ID 入口或 #/runs/{run_id}/publish 有 ID 入口）
+async function renderPublish(runId) {
+  app.innerHTML = "";
+
+  // 无 ID 入口：解析最近一次运行；无权限/无运行渲染对应状态页
+  if (!runId) {
+    const resolved = await resolveLatestRunState();
+    if (resolved.denied) {
+      app.innerHTML = "";
+      app.appendChild(forbiddenState());
+      return;
+    }
+    if (!resolved.runId) {
+      app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
+      app.appendChild(el("div", { class: "card" }, [
+        el("div", { class: "card-head" }, [el("h2", { text: "发布确认" })]),
+        el("div", { class: "card-body" }, [emptyState("还没有任何任务，暂无发布确认内容")]),
+      ]));
+      return;
+    }
+    runId = resolved.runId;
+    location.replace("#/runs/" + runId + "/publish");
+  }
+
+  app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
+
+  const container = el("div");
+  app.appendChild(container);
+  container.appendChild(loadingState("正在加载发布确认…"));
+
+  let detail;
+  try {
+    detail = await api("/api/v1/runs/" + runId);
+  } catch (err) {
+    container.innerHTML = "";
+    if (err.status === 403) container.appendChild(forbiddenState());
+    else if (err.status === 404) container.appendChild(errorState("任务不存在或已被移除", () => renderHome()));
+    else container.appendChild(errorState("加载失败：" + (err.code || err.message), () => renderPublish(runId)));
+    return;
+  }
+
+  container.innerHTML = "";
+
+  // 题名卡片
+  container.appendChild(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [
+      el("h2", { text: detail.title || "未命名文章" }),
+      el("span", { class: "hint" }, [detail.run_id]),
+    ]),
+  ]));
+
+  // 发布闸门（含发布预检 / 权限闸 / 提交动作）
+  container.appendChild(renderPublishGate(runId, detail));
+}
+
 function renderPublishGate(runId, detail) {
   const section = el("div", { class: "card" });
-  section.appendChild(el("div", { class: "section-title", text: "发布闸门（P7）" }));
+  section.appendChild(el("div", { class: "card-head" }, [el("h2", { text: "发布闸门（P7）" })]));
+  const body = el("div", { class: "card-body" });
+  section.appendChild(body);
 
   const perm = !!(detail.permissions && detail.permissions.publish);
   const statusLine = el("div", { class: "muted", text: "发布权限：" + (perm ? "已开启" : "未开启") });
-  section.appendChild(statusLine);
+  body.appendChild(statusLine);
 
   const authorizeBtn = el("button", { class: "btn", text: perm ? "撤销发布授权" : "开启发布授权" });
   const preflightBox = el("div", { class: "muted", text: "尚未预检" });
@@ -1312,10 +1489,10 @@ function renderPublishGate(runId, detail) {
   // P7-F4：手动「核对草稿箱」（仅只读 get_draft，不自动轮询、不重发）
   const reconcileBtn = el("button", { class: "btn", text: "核对草稿箱" });
   const reconcileBox = el("div", { class: "muted" });
-  section.appendChild(el("div", { class: "preview-controls" }, [authorizeBtn, reconcileBtn]));
-  section.appendChild(preflightBox);
-  section.appendChild(submitBox);
-  section.appendChild(reconcileBox);
+  body.appendChild(el("div", { class: "preview-controls" }, [authorizeBtn, reconcileBtn]));
+  body.appendChild(preflightBox);
+  body.appendChild(submitBox);
+  body.appendChild(reconcileBox);
 
   reconcileBtn.addEventListener("click", async () => {
     const mediaId = window.prompt("请输入要核对的 media_id（留空则用任务已记录的 media_id）", (detail.publish && detail.publish.media_id) || "");
@@ -1471,6 +1648,35 @@ async function renderJob(jobId) {
   app.innerHTML = "";
   /* 页面标题由顶栏 h1 承载 */
 
+  // 无 ID 入口（#/jobs）：解析最近一次运行，再定位其最近一个 job；无则渲染空态
+  if (!jobId) {
+    const resolved = await resolveLatestRunState();
+    if (resolved.denied) {
+      app.innerHTML = "";
+      app.appendChild(forbiddenState());
+      return;
+    }
+    if (resolved.runId) {
+      try {
+        const body = await api("/api/v1/jobs?run_id=" + encodeURIComponent(resolved.runId));
+        const jobs = body.jobs || [];
+        if (jobs.length > 0) {
+          const job = jobs[jobs.length - 1];
+          location.replace("#/jobs/" + job.job_id);
+          return;
+        }
+      } catch (err) {
+        if (err.status === 403) {
+          app.innerHTML = "";
+          app.appendChild(forbiddenState());
+          return;
+        }
+      }
+    }
+    renderJobEmpty();
+    return;
+  }
+
   const container = el("div");
   app.appendChild(container);
   container.appendChild(loadingState("正在加载生成任务…"));
@@ -1490,6 +1696,15 @@ async function renderJob(jobId) {
   renderJobBody(job, job.run_id);
 }
 
+function renderJobEmpty() {
+  app.innerHTML = "";
+  app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
+  app.appendChild(el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "生成进行中" })]),
+    el("div", { class: "card-body" }, [emptyState("还没有生成任务，去「选题确认」发起生成")]),
+  ]));
+}
+
 function renderJobBody(job, runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
@@ -1499,17 +1714,23 @@ function renderJobBody(job, runId) {
   const meta = el("div", { class: "muted", text: "job_id：" + job.job_id + " · 状态：" + (JOB_STATUS_TEXT[status] || status) + " · 尝试次数：" + (job.attempt || 1) + " · 更新时间：" + (job.updated_at || "—") });
   app.appendChild(meta);
 
-  // stepper（topic/write/review/visual）
+  // stepper（topic/write/review/visual）：bubble/lbl 气泡结构，失败态统一用 `fail` 类
   const stepper = el("div", { class: "stepper" });
   const currentStep = job.step || "topic";
   const stepDone = status === "succeeded";
+  const stepIcons = { topic: "◎", write: "✎", review: "✓", visual: "🖼" };
   for (const s of STEP_ORDER) {
     let cls = "step";
-    if (stepDone) cls += " done";
-    else if (STEP_ORDER.indexOf(s) < STEP_ORDER.indexOf(currentStep)) cls += " done";
-    else if (s === currentStep && status === "running") cls += " active";
-    else if (s === currentStep && status === "failed") cls += " failed";
-    stepper.appendChild(el("div", { class: cls, text: STEP_LABELS[s] }));
+    let glyph = stepIcons[s];
+    if (stepDone) { cls += " done"; glyph = "✓"; }
+    else if (STEP_ORDER.indexOf(s) < STEP_ORDER.indexOf(currentStep)) { cls += " done"; glyph = "✓"; }
+    else if (s === currentStep && status === "running") cls += " cur";
+    else if (s === currentStep && status === "failed") { cls += " fail"; glyph = "✕"; }
+    else if (s === currentStep && status === "cancelled") { cls += " fail"; glyph = "✕"; }
+    stepper.appendChild(el("div", { class: cls }, [
+      el("div", { class: "bubble" }, [glyph]),
+      el("div", { class: "lbl" }, [STEP_LABELS[s]]),
+    ]));
   }
   app.appendChild(stepper);
 

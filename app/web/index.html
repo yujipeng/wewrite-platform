@@ -24,8 +24,8 @@
         <a href="#/jobs" data-nav="jobs" data-title="生成进行中" data-crumb="生成进行中"><span class="ic">▶</span>生成进行中</a>
         <div class="group">运行视图</div>
         <a href="#/runs" data-nav="detail" data-title="任务详情" data-crumb="任务详情"><span class="ic">▤</span>任务详情</a>
-        <a href="#/runs" data-nav="preview" data-title="产物预览" data-crumb="产物预览"><span class="ic">👁</span>产物预览</a>
-        <a href="#/runs" data-nav="publish" data-title="发布确认" data-crumb="发布确认"><span class="ic">🚀</span>发布确认</a>
+        <a href="#/preview" data-nav="preview" data-title="产物预览" data-crumb="产物预览"><span class="ic">👁</span>产物预览</a>
+        <a href="#/publish" data-nav="publish" data-title="发布确认" data-crumb="发布确认"><span class="ic">🚀</span>发布确认</a>
         <div class="group">系统</div>
         <a href="#/config" data-nav="config" data-title="配置" data-crumb="配置"><span class="ic">⚙</span>配置</a>
       </nav>
@@ -34,6 +34,7 @@
 
     <div class="main">
       <header class="topbar">
+        <button class="menu-toggle" id="menuToggle" type="button" aria-label="打开导航" aria-expanded="false" aria-controls="nav">☰</button>
         <div>
           <div class="crumb">WeWrite 工作台 / <span id="crumbCur">工作台</span></div>
           <h1 id="pageTitle">工作台（运行列表）</h1>
@@ -43,6 +44,8 @@
       <main class="content" id="app" aria-live="polite"></main>
     </div>
   </div>
+
+  <div class="drawer-mask" id="drawerMask" hidden></div>
 
   <script type="module" src="/static/app.js"></script>
 </body>

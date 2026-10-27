@@ -128,6 +128,29 @@ input, select, textarea { font: inherit; color: inherit; }
 .topbar .crumb { color: var(--muted); font-size: 12.5px; }
 .topbar .actions { margin-left: auto; display: flex; gap: 8px; }
 
+/* 窄屏抽屉开关（默认隐藏，仅窄屏显示） */
+.menu-toggle {
+  display: none;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--wash);
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1;
+}
+.drawer-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 22, 28, 0.45);
+  z-index: 40;
+}
+.drawer-mask[hidden] { display: none; }
+
 .content {
   padding: 22px 26px 60px;
   max-width: 1180px;
@@ -328,6 +351,14 @@ dl.kv dd { margin: 0; }
 .step.fail .lbl { color: var(--coral); font-weight: 600; }
 .step.active .bubble { border-color: var(--teal); color: var(--teal); box-shadow: 0 0 0 4px rgba(11, 125, 116, 0.14); }
 .step.active .lbl { color: var(--teal); font-weight: 600; }
+/* 失败态类名兼容：旧代码用 .failed，设计图用 .fail，二者等价 */
+.step.failed .bubble { background: var(--coral); border-color: var(--coral); color: #fff; }
+.step.failed .lbl { color: var(--coral); font-weight: 600; }
+/* 裸文本 .step（无 bubble/lbl）兜底着色，避免 P6 步骤状态区分丢失 */
+.step.done { color: var(--teal); font-weight: 600; }
+.step.cur { color: var(--teal); font-weight: 600; }
+.step.active { color: var(--teal); font-weight: 600; }
+.step.fail, .step.failed { color: var(--coral); font-weight: 600; }
 .step .conn { position: absolute; top: 16px; left: 50%; width: 100%; height: 2px; background: var(--line); z-index: -1; }
 .step:first-child .conn { display: none; }
 
@@ -486,5 +517,18 @@ dl.kv dd { margin: 0; }
 
 @media (max-width: 720px) {
   .app { grid-template-columns: 1fr; }
-  .sidebar { display: none; }
+  .menu-toggle { display: inline-flex; }
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    max-width: 82vw;
+    z-index: 50;
+    overflow-y: auto;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+  }
+  .sidebar.open { transform: translateX(0); box-shadow: 0 0 24px rgba(0, 0, 0, 0.25); }
 }

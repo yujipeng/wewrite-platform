@@ -1,7 +1,10 @@
 """前端视觉对齐设计图回归用例（JEE-1930 S8-b 返修）。
 
-只做静态结构断言：验证 index.html / styles.css / app.js 已对齐设计图
-`wewrite-workbench-demo.html` 的视觉与信息架构，不改变任何后端 API 契约。
+静态结构断言 + Node `vm` 交互断言（真实执行 app.js 逻辑，非源码字符串匹配）：
+- index.html / styles.css / app.js 对齐设计图 `wewrite-workbench-demo.html` 的视觉与信息架构；
+- 无 ID 路由（#/jobs、#/runs、#/preview、#/publish）有确定落点，不静默回退工作台；
+- 窄屏抽屉导航入口（menuToggle / drawerMask）真实串联侧栏开关；
+- P6 失败步骤用 .step.fail + bubble/lbl 气泡结构，类名与 CSS 一致。
 
 验收口径（issue 第四节）：
 1. 深色侧边栏：品牌 logo「W」+「WeWrite 工作台 / 公众号写作流水线」+ 三组导航
@@ -16,7 +19,32 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
 from conftest import auth_headers  # noqa: F401  (保持与同目录用例一致)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_HARNESS = _REPO_ROOT / "tests" / "frontend_interaction_harness.mjs"
+
+
+def _run_interaction_harness() -> dict:
+    """用 Node vm 执行真实 app.js 逻辑，返回 harness 的 JSON 汇总。"""
+    node = shutil.which("node") or shutil.which("nodejs")
+    assert node, "测试需要 node 可用（node --check 已通过，但未找到 node 可执行文件）"
+    proc = subprocess.run(
+        [node, str(_HARNESS)],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"交互 harness 失败：\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(proc.stdout)
+
 
 
 def _html(client) -> str:
@@ -133,3 +161,40 @@ def test_app_js_detail_stepper_and_chip(client):
     js = _app_js(client)
     assert "stepper" in js
     assert "chip" in js
+
+
+# ============ 返修阻断项 1–3：机械可判定交互断言（非源码字符串匹配） ============
+
+def test_no_id_routes_resolve_to_definite_pages(client):
+    """阻断项 1：无 ID 入口 #/jobs、#/runs、#/preview、#/publish 路由有确定落点。"""
+    _html(client)  # 确认静态资源可访问（保持同目录风格）
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    # 具体断言：四个无 ID 入口都返回确定页面（job/detail/preview/publish），非 home
+    assert by_name["route #/jobs -> job"] is True
+    assert by_name["route #/runs -> detail"] is True
+    assert by_name["route #/preview -> preview"] is True
+    assert by_name["route #/publish -> publish"] is True
+
+
+def test_narrow_screen_drawer_navigation(client):
+    """阻断项 2：窄屏替代导航入口真实串联（menuToggle/drawerMask ↔ sidebar.open）。"""
+    _html(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    assert by_name["index.html 有 menuToggle 抽屉开关"] is True
+    assert by_name["index.html 有 drawerMask 遮罩"] is True
+    assert by_name["点击 menuToggle 打开抽屉（sidebar.open）"] is True
+    assert by_name["点击遮罩关闭抽屉"] is True
+
+
+def test_job_stepper_failed_class_and_bubbles(client):
+    """阻断项 3：P6 失败步骤用 .step.fail + bubble/lbl 气泡，失败态有可见区分。"""
+    _app_js(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    assert by_name["renderJobBody 输出 4 个 .step"] is True
+    assert by_name["失败步骤使用 .fail 类（非 .failed）"] is True
+    assert by_name["失败步骤含 .bubble 气泡"] is True
+    assert by_name["失败步骤含 .lbl 标签"] is True
+    assert by_name["失败步骤气泡文案为 ✕"] is True

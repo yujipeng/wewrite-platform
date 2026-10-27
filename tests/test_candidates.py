@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -231,7 +232,8 @@ def test_force_rebuild_open_set_writes_traceable_audit(tmp_path, monkeypatch):
     assert rebuilt["style_revision"] == "sha256:new-style"
 
     # 审计里有 candidate_set_rebuilt 事件，且记录被替换集的 cid/created_at/style_revision/snapshot_sha256
-    audit_path = os.path.join(home, "audit", "2026-10-26.jsonl")
+    # 审计文件名按「当天 UTC」命名（与 _audit() 同口径），不硬编码业务日期 2026-10-26。
+    audit_path = os.path.join(home, "audit", datetime.now(timezone.utc).strftime("%Y-%m-%d") + ".jsonl")
     assert os.path.exists(audit_path)
     lines = [json.loads(line) for line in open(audit_path, encoding="utf-8") if line.strip()]
     rebuilt_events = [e for e in lines if e.get("event") == "candidate_set_rebuilt"]

@@ -407,8 +407,8 @@ async function renderDetail(runId) {
       await renderDetailOrEmpty(null);
       return;
     }
-    runId = resolved.runId;
-    location.replace("#/runs/" + runId);
+    location.replace("#/runs/" + resolved.runId);
+    return;
   }
 
   const container = el("div");
@@ -685,8 +685,8 @@ async function renderPreview(runId) {
       await renderPreviewEmpty();
       return;
     }
-    runId = resolved.runId;
-    location.replace("#/runs/" + runId + "/preview");
+    location.replace("#/runs/" + resolved.runId + "/preview");
+    return;
   }
 
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
@@ -1438,8 +1438,8 @@ async function renderPublish(runId) {
       ]));
       return;
     }
-    runId = resolved.runId;
-    location.replace("#/runs/" + runId + "/publish");
+    location.replace("#/runs/" + resolved.runId + "/publish");
+    return;
   }
 
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));

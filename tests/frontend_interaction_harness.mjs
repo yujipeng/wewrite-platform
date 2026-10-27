@@ -465,10 +465,58 @@ async function testPublishConsistency() {
   check("授权成功后 publish 导航仍高亮", publishNav.classList.contains("active"));
 }
 
+
+// ---------- 6) 任务详情页：授权成功后应留在详情页（本轮复验点） ----------
+async function testDetailPublishConsistency() {
+  const runId = "20261026-080000-a1b2c3";
+  const detail = {
+    run_id: runId,
+    title: "测试发布标题",
+    status: "completed",
+    mode: "complete",
+    permissions: { publish: false },
+    publish: { status: "not_published", media_id: null },
+    editorial: { decision: "pass", publishable: true },
+  };
+  const { sandbox, els, navAnchors, location } = makeContext({
+    hash: `#/runs/${runId}`,
+    fetchImpl: async (path, opts) => {
+      if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+      if (path === `/api/v1/runs/${runId}`) return okJson(detail);
+      if (path === `/api/v1/runs/${runId}/publish/preflight`) return okJson({ ok: false, checks: [], revision: "r1" });
+      if (path === `/api/v1/runs/${runId}/publish/permission`) return okJson({ ok: true });
+      throw new Error("unexpected path " + path);
+    },
+  });
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(appJs, ctx, { filename: "app.js" });
+
+  await runAwait(ctx, "render()");
+  const pageTitle = els["pageTitle"];
+  check("详情页初始 h1 为「任务详情」", pageTitle && pageTitle.textContent === "任务详情");
+  const detailNav = navAnchors[4];
+  check("详情页初始 detail 导航高亮", detailNav.classList.contains("active"));
+
+  const appBefore = els["app"];
+  const authorizeBtn = findByText(appBefore, "开启发布授权")[0];
+  check("详情页存在发布闸门授权按钮", !!authorizeBtn);
+  const handler = authorizeBtn && authorizeBtn.listeners["click"] && authorizeBtn.listeners["click"][0];
+  if (handler) await Promise.resolve(handler());
+  await new Promise((r) => setTimeout(r, 10));
+
+  const afterText = collectText(els["app"]);
+  check("详情页授权成功后正文仍是详情页(含选题)", afterText.includes("选题"));
+  check("详情页授权成功后正文未变成发布确认页", !afterText.includes("发布闸门（P7）") || afterText.includes("选题"));
+  check("详情页授权成功后地址不变(#/runs/{id})", location.hash === `#/runs/${runId}`);
+  check("详情页授权成功后 h1 仍是「任务详情」", pageTitle.textContent === "任务详情");
+  check("详情页授权成功后 detail 导航仍高亮", detailNav.classList.contains("active"));
+}
+
 // ============ 主入口 ============
 (async () => {
   await testFourStates();
   await testPublishConsistency();
+  await testDetailPublishConsistency();
 
   const failed = checks.filter((c) => !c.ok);
   const summary = {

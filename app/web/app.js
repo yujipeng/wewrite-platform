@@ -625,8 +625,8 @@ function detailBody(d) {
     el("div", { class: "card-body" }, [pubBox]),
   ]));
 
-  // 发布闸门（P7）
-  sections.push(renderPublishGate(d.run_id, d));
+  // 发布闸门（P7）——详情页调用方：操作成功后留在详情页
+  sections.push(renderPublishGate(d.run_id, d, () => renderDetail(d.run_id)));
 
   // 失败步骤去向
   if (d.last_error) {
@@ -1490,11 +1490,14 @@ async function renderPublish(runId) {
     ]),
   ]));
 
-  // 发布闸门（含发布预检 / 权限闸 / 提交动作）
-  container.appendChild(renderPublishGate(runId, detail));
+  // 发布闸门（含发布预检 / 权限闸 / 提交动作）——发布页调用方：操作成功后留在发布页
+  container.appendChild(renderPublishGate(runId, detail, () => renderPublish(runId)));
 }
 
-function renderPublishGate(runId, detail) {
+function renderPublishGate(runId, detail, onDone) {
+  // onDone 由调用方决定成功后刷新哪个页面：详情页传 () => renderDetail(runId)、
+  // 发布页传 () => renderPublish(runId)；缺省回退 renderPublish(runId) 保证向后兼容。
+  const refresh = typeof onDone === "function" ? onDone : () => renderPublish(runId);
   const section = el("div", { class: "card" });
   section.appendChild(el("div", { class: "card-head" }, [el("h2", { text: "发布闸门（P7）" })]));
   const body = el("div", { class: "card-body" });
@@ -1552,9 +1555,9 @@ function renderPublishGate(runId, detail) {
         body: JSON.stringify({ allow: !perm }),
       });
       if (!res.ok) throw new Error((await res.json()).message || res.statusText);
-      // 授权/撤销成功后地址仍是 #/runs/{id}/publish：留在发布页原地重渲染，刷新授权态，
-      // 使地址、顶栏 h1、侧栏高亮、正文四者指向同一页面（不跳去详情）。
-      renderPublish(runId);
+      // 授权/撤销成功后由调用方 onDone 决定刷新哪个页面，使地址、顶栏 h1、
+      // 侧栏高亮、正文四者指向同一页面（详情页留详情页，发布页留发布页）。
+      refresh();
     } catch (err) {
       window.alert("授权失败：" + (err.code || err.message));
     }
@@ -1615,9 +1618,8 @@ function renderPublishGate(runId, detail) {
       const pbody = await pr.json();
       if (pbody.status === "succeeded") {
         window.alert("已写入草稿箱，media_id：" + pbody.media_id + "，请到公众号后台处理");
-        // 提交成功后地址仍是 #/runs/{id}/publish：原地重渲染发布页刷新发布状态，
-        // 使地址、顶栏 h1、侧栏高亮、正文四者一致（不跳去详情）。
-        renderPublish(runId);
+        // 提交成功后由调用方 onDone 决定刷新哪个页面，四者一致（不跳去别的页面）。
+        refresh();
       } else {
         window.alert("发布结果未知（unknown），禁止重复提交，请到公众号后台草稿箱核对");
       }

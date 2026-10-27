@@ -1,7 +1,72 @@
 // WeWrite 工作台前端（原生 ES modules，无构建）
-// P1 工作台首页（run 列表）+ P2 任务详情，四态（空/加载/错误/无权限）齐全。
+// JEE-1930 S8-b 返修：视觉对齐设计图（深色侧边栏三组导航 + 顶栏面包屑/h1/动作区 + 卡片化）。
+// 仅改视觉层，后端 API 契约与行为不变；四态（空/加载/错误/无权限）齐全。
 
 const app = document.getElementById("app");
+
+// ============ 视觉返修：顶栏与侧边栏 chrome ============
+
+// 页面标题/面包屑文案表（对齐设计图 PAGES）
+const PAGE_CHROME = {
+  home: { title: "工作台（运行列表）", crumb: "工作台" },
+  detail: { title: "任务详情", crumb: "任务详情" },
+  preview: { title: "产物预览", crumb: "产物预览" },
+  hotspots: { title: "每日热榜", crumb: "每日热榜" },
+  candidates: { title: "选题确认（候选对比）", crumb: "选题确认" },
+  job: { title: "生成进行中", crumb: "生成进行中" },
+  runJob: { title: "生成进行中", crumb: "生成进行中" },
+  config: { title: "配置", crumb: "配置" },
+};
+
+function updateChrome(route) {
+  const chrome = PAGE_CHROME[route.page] || PAGE_CHROME.home;
+  const pageTitle = document.getElementById("pageTitle");
+  const crumbCur = document.getElementById("crumbCur");
+  if (pageTitle) pageTitle.textContent = chrome.title;
+  if (crumbCur) crumbCur.textContent = chrome.crumb;
+}
+
+// 顶栏动作区：按页面注入右上角主操作（视觉返修，不动行为）
+function renderTopActions(page) {
+  const actions = document.getElementById("topActions");
+  if (!actions) return;
+  actions.innerHTML = "";
+  if (page === "home") {
+    actions.appendChild(el("a", { class: "btn primary", href: "#/hotspots", text: "＋ 新建任务" }));
+  } else if (page === "hotspots") {
+    actions.appendChild(el("a", { class: "btn primary", href: "#/candidates", text: "生成候选 →" }));
+  }
+}
+
+// 状态 chip（对齐设计图 statusChip：●已完成 / ●失败 / ●进行中）
+function statusChip(s) {
+  if (s === "completed") return el("span", { class: "chip ok" }, [el("span", { class: "dot completed" }), "已完成"]);
+  if (s === "failed") return el("span", { class: "chip err" }, [el("span", { class: "dot failed" }), "失败"]);
+  if (s === "active") return el("span", { class: "chip warn" }, [el("span", { class: "dot active" }), "进行中"]);
+  return el("span", { class: "chip" }, [STATUS_TEXT[s] || s || "未知"]);
+}
+
+// 步骤时间线 stepper 气泡（对齐设计图步骤气泡）
+function stepperSteps(steps) {
+  const stepper = el("div", { class: "stepper" });
+  const names = { topic: "选题", write: "写作", review: "审稿", visual: "配图" };
+  const icons = { topic: "◎", write: "✎", review: "✓", visual: "🖼" };
+  for (const key of STEP_ORDER) {
+    const info = steps[key] || {};
+    const st = info.status || "pending";
+    let cls = "step";
+    let glyph;
+    if (st === "completed") { cls += " done"; glyph = "✓"; }
+    else if (st === "failed") { cls += " fail"; glyph = "✕"; }
+    else if (st === "in_progress") { cls += " cur"; glyph = icons[key]; }
+    else { glyph = st === "skipped" ? "—" : icons[key]; }
+    stepper.appendChild(el("div", { class: cls }, [
+      el("div", { class: "bubble" }, [glyph]),
+      el("div", { class: "lbl" }, [names[key] || key]),
+    ]));
+  }
+  return stepper;
+}
 
 // 仅用 textContent 渲染用户数据，绝不 innerHTML 注入任意字符串（安全红线）。
 function el(tag, attrs = {}, children = []) {
@@ -136,12 +201,18 @@ async function render() {
   if (route.page !== "job" && route.page !== "runJob") {
     stopJobPolling();
   }
-  document.querySelectorAll(".nav-link").forEach((n) => {
+  updateChrome(route);
+  renderTopActions(route.page);
+  document.querySelectorAll(".nav a").forEach((n) => {
+    const nav = n.dataset.nav;
     const active =
-      (n.dataset.nav === "home" && (route.page === "home" || route.page === "detail" || route.page === "preview" || route.page === "job" || route.page === "runJob")) ||
-      (n.dataset.nav === "hotspots" && route.page === "hotspots") ||
-      (n.dataset.nav === "candidates" && route.page === "candidates") ||
-      (n.dataset.nav === "config" && route.page === "config");
+      (nav === "home" && route.page === "home") ||
+      (nav === "hotspots" && route.page === "hotspots") ||
+      (nav === "candidates" && route.page === "candidates") ||
+      (nav === "jobs" && (route.page === "job" || route.page === "runJob")) ||
+      (nav === "detail" && route.page === "detail") ||
+      (nav === "preview" && route.page === "preview") ||
+      (nav === "config" && route.page === "config");
     n.classList.toggle("active", active);
   });
   if (route.page === "home") {
@@ -165,7 +236,14 @@ async function render() {
 
 async function renderHome() {
   app.innerHTML = "";
-  app.appendChild(el("h1", { class: "page-title", text: "任务列表" }));
+  // 页面标题已由顶栏 h1 承载（「工作台（运行列表）」），内容区不再重复旧「任务列表」h1
+  const card = el("div", { class: "card" });
+  card.appendChild(el("div", { class: "card-head" }, [
+    el("h2", { text: "运行列表" }),
+    el("span", { class: "hint" }, ["点击任意行进入任务详情"]),
+  ]));
+  const body = el("div", { class: "card-body" });
+  card.appendChild(body);
 
   // 搜索框（本地过滤题名与 run_id）
   const search = el("input", {
@@ -173,13 +251,12 @@ async function renderHome() {
     type: "search",
     placeholder: "按题名或 run_id 搜索…",
   });
-
-  // 新建任务入口（跳 P4 每日热榜开始选题，不建空 run）
-  const newTaskBtn = el("a", { class: "btn", href: "#/hotspots", text: "新建任务" });
+  const controls = el("div", { class: "preview-controls" }, [search]);
+  body.appendChild(controls);
 
   const container = el("div");
-  app.appendChild(el("div", { class: "preview-controls" }, [search, newTaskBtn]));
-  app.appendChild(container);
+  body.appendChild(container);
+  app.appendChild(card);
 
   container.appendChild(loadingState("正在加载任务列表…"));
 
@@ -214,57 +291,62 @@ async function renderHome() {
       container.appendChild(emptyState("没有匹配的任务"));
       return;
     }
-    const list = el("ul", { class: "run-list" });
-    for (const r of filtered) {
-      list.appendChild(runRow(r));
-    }
-    container.appendChild(list);
+    container.appendChild(runsTable(filtered));
   };
 
   search.addEventListener("input", draw);
   draw();
 }
 
-function runRow(r) {
-  const status = r.status || "unknown";
-  const badge = el("span", {
-    class: "badge badge-" + (status === "active" ? "active" : status === "completed" ? "completed" : status === "failed" ? "failed" : ""),
-    text: STATUS_TEXT[status] || status,
-  });
+// 运行列表表格（对齐设计图 .table：run_id / 标题 / 状态 / 模式 / 产物 / 发布）
+function runsTable(runs) {
+  const table = el("table", { class: "table" });
+  const thead = el("thead", {}, [
+    el("tr", {}, [
+      el("th", { text: "run_id" }),
+      el("th", { text: "标题" }),
+      el("th", { text: "状态" }),
+      el("th", { text: "模式" }),
+      el("th", { text: "产物" }),
+      el("th", { text: "发布" }),
+    ]),
+  ]);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  for (const r of runs) {
+    tbody.appendChild(runTableRow(r));
+  }
+  table.appendChild(tbody);
+  return table;
+}
 
-  const meta = el("div", { class: "run-meta" }, [
-    r.run_id,
-    " · ",
-    MODE_TEXT[r.mode] || r.mode,
-    " · ",
-    r.created ? "创建于 " + r.created : "",
+function runTableRow(r) {
+  const status = r.status || "unknown";
+  const titleCell = el("td", { class: "title-cell" }, [
+    el("div", {}, [r.title || "未命名文章"]),
+    el("div", { class: "sub" }, [(r.mode ? MODE_TEXT[r.mode] || r.mode + " · " : "") + (r.created ? "创建于 " + r.created : "")]),
   ]);
 
-  const artBadges = el("div", { class: "artifact-badges" });
+  const artBadges = el("td");
+  const artWrap = el("div", { class: "artifact-badges" });
   for (const [name, label] of Object.entries(ARTIFACT_LABELS)) {
     const on = !!(r.artifacts && r.artifacts[name]);
-    artBadges.appendChild(
-      el("span", { class: "artifact-badge " + (on ? "on" : "off"), text: label + (on ? "" : "（未生成）") })
-    );
+    artWrap.appendChild(el("span", { class: "artifact-badge " + (on ? "on" : "off"), text: label }));
   }
+  artBadges.appendChild(artWrap);
 
-  const publishBadge = el("span", {
-    class: "badge",
-    text: r.publish && r.publish.media_id ? "已发布" : "未发布",
-  });
+  const published = r.publish && r.publish.media_id;
+  const publishCell = el("td", {}, [published ? el("span", { class: "chip ok" }, ["已发布"]) : el("span", { class: "chip" }, ["未发布"])]);
 
-  const main = el("div", { class: "run-main" }, [
-    el("div", { class: "run-title", text: r.title || "未命名文章" }),
-    meta,
-    el("div", { style: "margin-top:6px" }, [badge, publishBadge]),
+  const row = el("tr", { onclick: () => { location.hash = "#/runs/" + r.run_id; } }, [
+    el("td", {}, [el("span", { class: "mono" }, [r.run_id])]),
+    titleCell,
+    el("td", { class: "status-cell" }, [statusChip(status)]),
+    el("td", {}, [r.mode ? el("span", { class: "chip violet" }, [MODE_TEXT[r.mode] || r.mode]) : el("span", { class: "chip" }, ["—"])]),
+    artBadges,
+    publishCell,
   ]);
-
-  const item = el("li", {
-    class: "run-item",
-    onclick: () => { location.hash = "#/runs/" + r.run_id; },
-  }, [main, artBadges]);
-
-  return item;
+  return row;
 }
 
 async function renderDetail(runId) {
@@ -296,7 +378,11 @@ async function renderDetail(runId) {
 
 function detailBody(d) {
   const status = d.status || "unknown";
-  const title = el("h1", { class: "page-title", text: d.title || "未命名文章" });
+  // 页面标题由顶栏 h1 承载（「任务详情」），此处用卡片头 h2 展示文章题名
+  const title = el("div", { class: "card-head" }, [
+    el("h2", { text: d.title || "未命名文章" }),
+    el("span", { class: "hint" }, [d.run_id]),
+  ]);
 
   const kv = el("dl", { class: "kv" });
   const rows = [
@@ -312,10 +398,16 @@ function detailBody(d) {
     kv.appendChild(el("dd", { text: v == null || v === "" ? "未提供" : String(v) }));
   }
 
+  // 状态与操作卡片（对齐设计图：chip + 主操作按钮）
+  const statusCard = el("div", { class: "card" }, [
+    el("div", { class: "card-head" }, [el("h2", { text: "状态与操作" })]),
+    el("div", { class: "card-body" }, [statusChip(status)]),
+  ]);
+
   const previewBtn = el("a", {
     class: "btn",
     href: "#/runs/" + d.run_id + "/preview",
-    text: "预览产物",
+    text: "👁 预览产物",
   });
 
   // 生成进度入口（存在 job 时提供）
@@ -325,7 +417,9 @@ function detailBody(d) {
     text: "生成进度",
   });
 
-  const sections = [title, kv, el("div", { class: "preview-controls" }, [previewBtn, jobLink])];
+  const infoCard = el("div", { class: "card" }, [title, el("div", { class: "card-body" }, [kv])]);
+
+  const sections = [infoCard, statusCard, el("div", { class: "preview-controls" }, [previewBtn, jobLink])];
 
   // P2-F5：失败/取消/未知任务的重试入口
   if (status === "failed" || status === "cancelled" || status === "unknown") {
@@ -391,24 +485,28 @@ function detailBody(d) {
   }
   sections.push(visualKv);
 
-  // 步骤时间线
-  sections.push(el("div", { class: "section-title", text: "步骤时间线" }));
+  // 步骤时间线（对齐设计图 stepper 气泡）
   const steps = d.steps || {};
+  const stepCard = el("div", { class: "card" });
+  stepCard.appendChild(el("div", { class: "card-head" }, [
+    el("h2", { text: "步骤时间线" }),
+    el("span", { class: "hint" }, ["steps 状态机"]),
+  ]));
+  const stepBody = el("div", { class: "card-body" });
   if (Object.keys(steps).length === 0) {
-    sections.push(emptyState("任务尚无步骤记录"));
+    stepBody.appendChild(emptyState("任务尚无步骤记录"));
   } else {
-    const timeline = el("ul", { class: "timeline" });
+    stepBody.appendChild(stepperSteps(steps));
+    // 保留失败步骤错误信息（对齐设计图 sub 文案）
     for (const [step, info] of Object.entries(steps)) {
       const s = info || {};
-      const li = el("li", {}, [
-        el("span", { class: "step-name", text: STEP_LABELS[step] || step }),
-        el("span", { class: "step-status", text: STEP_STATUS_TEXT[s.status] || s.status }),
-        s.error ? el("span", { class: "step-error", text: "错误：" + s.error }) : el("span", { class: "muted", text: "更新时间：" + (s.updated || "未提供") }),
-      ]);
-      timeline.appendChild(li);
+      if (s.error) {
+        stepBody.appendChild(el("div", { class: "step-error" }, [(STEP_LABELS[step] || step) + " 错误：" + s.error]));
+      }
     }
-    sections.push(timeline);
   }
+  stepCard.appendChild(stepBody);
+  sections.push(stepCard);
 
   // 审稿结论与 SEO
   sections.push(el("div", { class: "section-title", text: "审稿结论与 SEO" }));
@@ -472,7 +570,7 @@ function sourceLabel(source) {
 async function renderPreview(runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
-  app.appendChild(el("h1", { class: "page-title", text: "产物预览" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   // 常驻口径提示：每个来源/主题切换后提示仍在
   app.appendChild(el("div", { class: "notice" }, [
@@ -585,7 +683,7 @@ async function csrfToken() {
 
 async function renderHotspots() {
   app.innerHTML = "";
-  app.appendChild(el("h1", { class: "page-title", text: "每日热榜" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   const actions = el("div", { class: "preview-controls" });
   const refreshBtn = el("button", { class: "btn", text: "立即刷新（抓取当下）" });
@@ -758,7 +856,7 @@ const SET_STATUS_TEXT = {
 
 async function renderCandidates() {
   app.innerHTML = "";
-  app.appendChild(el("h1", { class: "page-title", text: "选题确认" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   // 规则生成桩口径：分数来源标注（硬性要求）
   app.appendChild(el("div", { class: "notice" }, [
@@ -1046,7 +1144,7 @@ async function renderCandidates() {
 
 async function renderConfig() {
   app.innerHTML = "";
-  app.appendChild(el("h1", { class: "page-title", text: "配置" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   const container = el("div");
   app.appendChild(container);
@@ -1341,7 +1439,7 @@ function renderPublishGate(runId, detail) {
 async function renderRunJob(runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
-  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   const container = el("div");
   app.appendChild(container);
@@ -1371,7 +1469,7 @@ async function renderRunJob(runId) {
 async function renderJob(jobId) {
   stopJobPolling();
   app.innerHTML = "";
-  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   const container = el("div");
   app.appendChild(container);
@@ -1395,7 +1493,7 @@ async function renderJob(jobId) {
 function renderJobBody(job, runId) {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
-  app.appendChild(el("h1", { class: "page-title", text: "生成进行中" }));
+  /* 页面标题由顶栏 h1 承载 */
 
   const status = job.status || "unknown";
   const meta = el("div", { class: "muted", text: "job_id：" + job.job_id + " · 状态：" + (JOB_STATUS_TEXT[status] || status) + " · 尝试次数：" + (job.attempt || 1) + " · 更新时间：" + (job.updated_at || "—") });

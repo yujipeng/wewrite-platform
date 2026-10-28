@@ -53,10 +53,11 @@ async def healthz():
 # ---------- S8-c：登录鉴权 ----------
 
 def _login_redirect_back(request: Request) -> RedirectResponse:
-    """登录成功后回到来源页（默认首页），拦截越权跳转。"""
-    nxt = request.query_params.get("next", "")
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = "/"
+    """登录成功后回到来源页（默认首页），只接受站内相对路径，拦截越权跳转。
+
+    清洗规则与登录页前端、``app.middleware.safe_next`` 共用同一口径（见该函数）。
+    """
+    nxt = mw.safe_next(request.query_params.get("next", ""), default="/")
     return RedirectResponse(url=nxt, status_code=303)
 
 

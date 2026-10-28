@@ -77,8 +77,19 @@ def create_app() -> FastAPI:
     try:
         users = auth.UserStore(os.environ.get("WEWRITE_USERS"))
     except auth.UsernameInvalid:
-        # 配置非法时 fail closed：无任何可用账号，登录一律失败，不阻断启动。
+        # 结构非法（空账号/缺冒号/重复账号）时 fail closed：无任何可用账号，
+        # 登录一律失败，不阻断启动。
         users = auth.UserStore(None)
+        users.rejected = []
+    # 非 bcrypt 哈希的条目被静默拒绝（fail closed），这里仅记录不含密码内容的账号名，
+    # 便于定位配置问题；绝不打印 secret。
+    if users.rejected:
+        import logging
+
+        logging.getLogger("wewrite").warning(
+            "WEWRITE_USERS 中以下账号的口令不是受支持的 bcrypt 哈希，已拒绝该账号：%s",
+            ",".join(users.rejected),
+        )
 
     app = FastAPI(
         title="wewrite-platform",

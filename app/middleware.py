@@ -173,39 +173,63 @@ def effective_scheme(scope: dict, headers) -> str:
     return scope.get("scheme", "http")
 
 
-def origin_host_matches(
-    origin: str | None, host_bare: str, host_port: int | None, scheme: str = "http"
-) -> bool:
-    """校验 Origin 与 Host 头同源（scheme + host + 端口都一致），且 host 在白名单内。
+def _parse_origin_like(value: str) -> tuple[str, str, int] | None:
+    """解析 Origin/Referer 为 ``(scheme, host_lower, effective_port)`` 三元组。
 
-    Origin 形如 ``http://127.0.0.1:<port>`` 或 ``https://temp.os-uat.tcredit.com``；
-    端口须等于 Host 头端口（Host 省略端口时按请求 scheme 补默认端口）。公网域名
-    走 HTTPS 时 Origin 必须同为 https，否则不同源。
+    scheme 只接受 http/https；端口缺失时按 scheme 补默认端口（http=80、https=443），
+    显式端口与默认端口归一化到同一数值。解析失败返回 None。两个头部共用此函数，
+    避免同源判定逻辑重复。
     """
-    if not origin:
-        return False
+    if not value:
+        return None
     from urllib.parse import urlparse
 
     try:
-        parsed = urlparse(origin)
+        parsed = urlparse(value)
     except ValueError:
-        return False
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    origin_host = (parsed.hostname or "").lower()
-    if origin_host != host_bare.lower():
-        return False
+        return None
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        port = _default_port_for_scheme(scheme)
+    return scheme, host, port
 
-    # 端口比对：Origin 缺省端口时按 scheme 补默认端口
-    origin_port = parsed.port
-    if origin_port is None:
-        origin_port = _default_port_for_scheme(parsed.scheme)
-    if host_port is None:
-        host_port = _default_port_for_scheme(scheme)
-    if origin_port != host_port:
-        return False
 
-    return host_is_allowed(origin_host)
+def _host_tuple(scheme: str, host_bare: str, host_port: int | None) -> tuple[str, str, int] | None:
+    """Host 头的三元组 ``(scheme, host_lower, effective_port)``。
+
+    Host 省略端口时按请求 scheme 补默认端口；显式端口与默认端口等价处理。host 为空返回 None。
+    """
+    bare = (host_bare or "").lower()
+    if not bare:
+        return None
+    port = host_port
+    if port is None:
+        port = _default_port_for_scheme(scheme)
+    return scheme.lower(), bare, port
+
+
+def origin_host_matches(
+    origin: str | None, host_bare: str, host_port: int | None, scheme: str = "http"
+) -> bool:
+    """校验 Origin 与 Host 头同源（scheme + host + 端口三元组全等），且 host 在白名单内。
+
+    scheme 走 ``effective_scheme`` 传入；端口缺失时按各自 scheme 补默认端口再比较，
+    显式端口与默认端口等价。公网域名走 HTTPS 时 Origin 必须同为 https，否则不同源。
+    """
+    origin_tuple = _parse_origin_like(origin or "")
+    host_tuple = _host_tuple(scheme, host_bare, host_port)
+    if origin_tuple is None or host_tuple is None:
+        return False
+    # 三元组全等：scheme + host + port 都一致
+    if origin_tuple != host_tuple:
+        return False
+    return host_is_allowed(origin_tuple[1])
 
 
 def referer_host_matches(
@@ -213,30 +237,16 @@ def referer_host_matches(
 ) -> bool:
     """校验 Referer 的 scheme+host+端口 与 Host 一致（同源 GET 无 Origin，用 Referer 兜底）。
 
-    Referer 形如 ``http://127.0.0.1:<port>/path`` 或 ``https://temp...``；仅校验
-    scheme、host、端口三项，忽略路径。返回 False 表示缺失或不同源。
+    与 ``origin_host_matches`` 共用同一套三元组解析与比较；仅校验 scheme、host、端口
+    三项，忽略路径。返回 False 表示缺失或不同源。
     """
-    if not referer:
+    referer_tuple = _parse_origin_like(referer or "")
+    host_tuple = _host_tuple(scheme, host_bare, host_port)
+    if referer_tuple is None or host_tuple is None:
         return False
-    from urllib.parse import urlparse
-
-    try:
-        parsed = urlparse(referer)
-    except ValueError:
+    if referer_tuple != host_tuple:
         return False
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    referer_host = (parsed.hostname or "").lower()
-    if referer_host != host_bare.lower():
-        return False
-    referer_port = parsed.port
-    if referer_port is None:
-        referer_port = _default_port_for_scheme(parsed.scheme)
-    if host_port is None:
-        host_port = _default_port_for_scheme(scheme)
-    if referer_port != host_port:
-        return False
-    return host_is_allowed(referer_host)
+    return host_is_allowed(referer_tuple[1])
 
 
 def _path_exempt_from_auth(path: str) -> bool:
@@ -248,6 +258,26 @@ def _path_exempt_from_auth(path: str) -> bool:
 
 def _is_api_path(path: str) -> bool:
     return path.startswith("/api/")
+
+
+def safe_next(raw: str | None, default: str = "/") -> str:
+    """清洗登录跳转目标，只接受站内相对路径，其余回落到 ``default``。
+
+    规则（防御开放重定向与 ``javascript:`` 等注入）：
+    - 必须以单个 ``/`` 开头；
+    - 不能以 ``//`` 开头（协议相对地址）；
+    - 不得含反斜杠、控制字符（含 ``\r\n`` 换行注入）、空白；
+    - 空值/缺失回落到默认落地页。
+    """
+    if not raw:
+        return default
+    if not raw.startswith("/") or raw.startswith("//"):
+        return default
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return default
+    if "\\" in raw or any(ch.isspace() for ch in raw):
+        return default
+    return raw
 
 
 class HostCsrfMiddleware:

@@ -72,18 +72,31 @@ docker compose up -d --build
 
 打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝（除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权）。
 
-公网部署需额外注入 `ALLOWED_HOSTS` 与 `WEWRITE_USERS`（见「公网域名白名单与登录鉴权」一节），例如：
+#### 公网部署（作用于长期 `workbench` 服务）
+
+`docker-compose.yml` 的 `workbench.environment` 段已声明 `ALLOWED_HOSTS=${ALLOWED_HOSTS:-}` 与 `WEWRITE_USERS=${WEWRITE_USERS:-}`，docker-compose 会自动读取项目目录下的 `.env` 做插值。给长期服务注入这两个变量的最小可执行步骤：
 
 ```bash
-docker-compose run --rm \
-  -e ALLOWED_HOSTS=temp.os-uat.tcredit.com \
-  -e "WEWRITE_USERS=alice:\$2b\$12\$..." \
-  workbench wewrite-platform serve
+# 1) 在项目目录（与 docker-compose.yml 同级）新建 .env，写入公网白名单与账号
+cat > .env <<'EOF'
+ALLOWED_HOSTS=temp.os-uat.tcredit.com
+WEWRITE_USERS=alice:$2b$12$替换成上面生成的bcrypt哈希
+EOF
+
+# 2) 重建并后台常驻（.env 已生效，变量随服务注入）
+docker-compose up -d --build
+
+# 3) 校验长期服务容器内变量已注入（应能看到两个变量，值为 .env 内容）
+docker-compose exec workbench env | grep -E 'ALLOWED_HOSTS|WEWRITE_USERS'
 ```
+
+`.env` 已列入 `.gitignore`（不入 git、不落镜像层）。**变量缺省为空时行为 fail closed**：公网 Host 一律 403、无任何可用账号，回环访问不受影响；这与 `app/auth.py` 的 fail-closed 口径一致。公网反代与 443 端口映射由 JEE-1914 在 product133 承接，本仓库 compose 只映射宿主回环 `127.0.0.1:8765`。
 
 ### 首次配置与密钥注入（env 优先）
 
 密钥**只写不读**：页面写入的 `wechat.secret`、`image.api_key` 只保存在挂载卷 `config.yaml`（0600），不回显明文、不打印日志、不写镜像层。环境变量优先于页面配置，且被环境变量接管的字段写入会返回 `409 ENV_MANAGED`（整包失败不局部提交）。
+
+> 一次性命令（非常驻部署，仅临时跑命令用；默认不映射端口）：
 
 ```bash
 docker-compose run --rm -e WECHAT_APPID=wx... -e WECHAT_SECRET=... workbench wewrite-platform serve

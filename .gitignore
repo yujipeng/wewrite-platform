@@ -5,3 +5,6 @@ __pycache__/
 *.egg-info/
 serve.log
 WEWRITE_HOME/
+.env
+.env.*
+!.env.example

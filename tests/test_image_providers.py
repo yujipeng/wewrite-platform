@@ -101,6 +101,39 @@ def test_config_save_custom_provider_roundtrip(monkeypatch, tmp_path):
     assert body["image"]["base_url"] == "https://x.example/v1"
 
 
+def test_config_switch_to_empty_base_url_not_residue(monkeypatch, tmp_path):
+    """切换到 azure_openai（默认 base_url 为空串）保存后，base_url 不残留旧 provider 地址。
+
+    对应前端空地址缺陷：先存 doubao 带 base_url，再以 azure_openai + base_url:"" 保存，
+    回读 image.base_url 必须为 ""（后端显式空串语义），不得残留 doubao 的地址。
+    """
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put(
+        "/api/v1/config",
+        json={
+            "image": {
+                "provider": "doubao",
+                "model": "doubao-seedream-5-0-260128",
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            }
+        },
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    assert c.get("/api/v1/config").json()["image"]["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+
+    r = c.put(
+        "/api/v1/config",
+        json={"image": {"provider": "azure_openai", "model": "dall-e-3", "base_url": ""}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["image"]["provider"] == "azure_openai"
+    assert body["image"]["base_url"] == ""
+
+
 def test_config_theme_not_in_list_is_preserved(monkeypatch, tmp_path):
     """存一个不在内置清单里的旧主题名，回读仍为该值（后端不校验主题枚举）。"""
     home = str(tmp_path)

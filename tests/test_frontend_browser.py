@@ -268,3 +268,47 @@ def test_p8_config_theme_select_from_themes(browser_session):
     assert len(option_values) >= 18, f"主题应来自 /api/v1/themes（18 项），实际 {len(option_values)}"
     assert "professional-clean" in option_values
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_switch_to_azure_openai_empty_base_url_not_residue(browser_session):
+    """返修回归：选 doubao → 改选 azure_openai → 保存，回读 base_url 为空、provider 为 azure_openai。
+
+    覆盖空 base_url 被 `|| undefined` 吞掉导致残留旧地址的缺陷。
+    """
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_config():
+        data = urllib.request.urlopen(f"{base}/api/v1/config", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    provider_select = _kv_control(page, "provider")
+    base_url_input = _kv_control(page, "base_url")
+    save_btn = page.locator("button", has_text="保存配置")
+
+    # 先选 doubao 并保存（写入带地址的配置）
+    provider_select.select_option("doubao")
+    assert base_url_input.input_value() == "https://ark.cn-beijing.volces.com/api/v3"
+    save_btn.click()
+    page.wait_for_timeout(900)  # 等待保存 + setTimeout(renderConfig, 400) 重渲染完成
+
+    # 改选 azure_openai（base_url 联动为空串）并保存
+    provider_select.select_option("azure_openai")
+    assert base_url_input.input_value() == "", "azure_openai 默认 base_url 应为空串"
+    save_btn.click()
+    page.wait_for_timeout(900)
+
+    # 回读：provider 为 azure_openai，base_url 为空，不残留 doubao 地址
+    cfg = read_config()
+    assert cfg["image"]["provider"] == "azure_openai"
+    assert cfg["image"]["base_url"] == ""
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

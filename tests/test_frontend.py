@@ -72,8 +72,8 @@ def test_p8_image_provider_select_and_link(client):
     assert "自定义…" in js
     # provider 用 <select>（el("select") 构造），不再是只读文本框
     assert 'el("select")' in js
-    # 保存请求体包含 image.provider
-    assert "provider:" in js
+    # 保存请求体包含 image.provider（含 env 接管时不发的分支）
+    assert "image.provider" in js
     # api_key 为 password 只写不读
     assert 'type: "password"' in js
     assert "已配置（留空保持）" in js

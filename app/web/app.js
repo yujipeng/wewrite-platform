@@ -1431,17 +1431,33 @@ async function renderConfig() {
 
   saveBtn.addEventListener("click", async () => {
     const isCustom = providerSelect.value === "__custom__";
+    // 图片供应商：env 接管的字段不发（避免破坏 409 ENV_MANAGED 语义）。
+    // 内置 provider 的 model/base_url 以输入框当前值为准提交（含空串，如
+    // azure_openai 默认 base_url 为空串时不得被 `|| undefined` 吞掉）；自定义
+    // provider 的 model/base_url 空值保持原值（与改造前一致）。
+    const image = {};
+    if (!envManaged.has("image.provider")) {
+      if (isCustom) {
+        const customVal = customProviderInput.value.trim();
+        if (customVal) image.provider = customVal;
+      } else {
+        image.provider = providerSelect.value;
+      }
+    }
+    if (!envManaged.has("image.model")) {
+      image.model = isCustom ? (providerModelInput.value || undefined) : providerModelInput.value;
+    }
+    if (!envManaged.has("image.base_url")) {
+      image.base_url = isCustom ? (providerBaseUrlInput.value || undefined) : providerBaseUrlInput.value;
+    }
+    const wechat = { appid: appidInput.value || undefined, author: authorInput.value || undefined };
     const body = {
       theme: themeSelect.value || undefined,
-      image: {
-        provider: isCustom ? (customProviderInput.value.trim() || undefined) : (providerSelect.value || undefined),
-        model: providerModelInput.value || undefined,
-        base_url: providerBaseUrlInput.value || undefined,
-      },
-      wechat: { appid: appidInput.value || undefined, author: authorInput.value || undefined },
+      image,
+      wechat,
     };
-    if (apiKeyInput.value) body.image.api_key = apiKeyInput.value;
-    if (secretInput.value) body.wechat.secret = secretInput.value;
+    if (apiKeyInput.value) image.api_key = apiKeyInput.value;
+    if (secretInput.value) wechat.secret = secretInput.value;
     try {
       const token = await csrfToken();
       const res = await fetch("/api/v1/config", {

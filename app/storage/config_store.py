@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 
 import yaml
@@ -183,6 +184,14 @@ class ConfigStore:
         def _field_value(dotted: str):
             return _get_in(cfg, dotted)
 
+        def _writer_key_configured() -> bool:
+            # 最终生效值：env WEWRITE_WRITER_API_KEY 存在且非空 → true；
+            # 否则回落到 config.yaml 的 writer.api_key；两者都无 → false。
+            env_value = os.environ.get("WEWRITE_WRITER_API_KEY")
+            if env_value is not None and env_value != "":
+                return True
+            return secret_configured(writer.get("api_key") or None)
+
         return {
             "version": 1,
             "theme": _field_value("theme"),
@@ -206,7 +215,7 @@ class ConfigStore:
                 "base_url": writer.get("base_url", "https://api.deepseek.com"),
                 "temperature": writer.get("temperature", 1.0),
                 "max_tokens": writer.get("max_tokens", 4000),
-                "api_key_configured": secret_configured(writer.get("api_key") or None),
+                "api_key_configured": _writer_key_configured(),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},
             "env_managed": [
@@ -317,13 +326,25 @@ class ConfigStore:
                     raise errors.validation_error("字段必须为字符串", {"field": field})
                 if value is not None:
                     dirty[field] = value
-            elif field in {"image.max_cost", "image.estimated_cost_per_image", "writer.temperature"}:
+            elif field in {"image.max_cost", "image.estimated_cost_per_image"}:
                 if value is None:
                     continue
                 try:
                     dirty[field] = float(value)
                 except (TypeError, ValueError):
                     raise errors.validation_error("字段必须为数字", {"field": field})
+            elif field == "writer.temperature":
+                if value is None:
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    raise errors.validation_error("字段必须为数字", {"field": field})
+                if not math.isfinite(number) or not (0.0 <= number <= 2.0):
+                    raise errors.validation_error(
+                        "temperature 必须为 0–2 之间的有限数字", {"field": field}
+                    )
+                dirty[field] = number
             elif field == "writer.max_tokens":
                 if value is None:
                     continue
@@ -331,7 +352,7 @@ class ConfigStore:
                     number = float(value)
                 except (TypeError, ValueError):
                     raise errors.validation_error("字段必须为数字", {"field": field})
-                if number <= 0 or number != int(number):
+                if not math.isfinite(number) or number <= 0 or number != int(number):
                     raise errors.validation_error("max_tokens 必须为正整数", {"field": field})
                 dirty[field] = int(number)
             elif field in {"wechat.appid", "wechat.author"}:

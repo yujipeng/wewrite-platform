@@ -518,6 +518,56 @@ def test_config_writer_temperature_max_tokens_validation(monkeypatch, tmp_path):
     assert body["writer"]["max_tokens"] == 2048
 
 
+def test_config_writer_temperature_boundaries(monkeypatch, tmp_path):
+    """temperature 边界：0/2 通过，-1/2.1/"Infinity"/"NaN" 均 422 且不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+
+    # 边界通过
+    for ok_val in (0, 2):
+        r = c.put("/api/v1/config", json={"writer": {"temperature": ok_val}}, headers=post_headers(c))
+        assert r.status_code == 200, f"temperature={ok_val} 应通过"
+
+    # 越界 / 非有限值拒绝
+    for bad in (-1, 2.1, "Infinity", "NaN", "-Infinity"):
+        r = c.put("/api/v1/config", json={"writer": {"temperature": bad}}, headers=post_headers(c))
+        assert r.status_code == 422, f"temperature={bad} 应 422"
+        assert r.json()["code"] == "VALIDATION_ERROR"
+    # 失败后 config.yaml 未被改写（仍保持上一次合法保存的 temperature=2）
+    assert c.get("/api/v1/config").json()["writer"]["temperature"] == 2
+
+
+def test_config_writer_max_tokens_boundaries(monkeypatch, tmp_path):
+    """max_tokens 边界：1/4000 通过，0/-5/1.5/"Infinity"/"NaN"/"1e999" 均 422 不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+
+    for ok_val in (1, 4000):
+        r = c.put("/api/v1/config", json={"writer": {"max_tokens": ok_val}}, headers=post_headers(c))
+        assert r.status_code == 200, f"max_tokens={ok_val} 应通过"
+
+    for bad in (0, -5, 1.5, "Infinity", "NaN", "1e999"):
+        r = c.put("/api/v1/config", json={"writer": {"max_tokens": bad}}, headers=post_headers(c))
+        assert r.status_code == 422, f"max_tokens={bad!r} 应 422"
+        assert r.json()["code"] == "VALIDATION_ERROR"
+    assert c.get("/api/v1/config").json()["writer"]["max_tokens"] == 4000
+
+
+def test_config_writer_api_key_env_only_configured(monkeypatch, tmp_path):
+    """env-only：只设 WEWRITE_WRITER_API_KEY、config.yaml 无 key → api_key_configured True。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    monkeypatch.setenv("WEWRITE_WRITER_API_KEY", "sk-env-only")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is True
+    # 投影/响应无明文、无末四位
+    assert "sk-env-only" not in json.dumps(body)
+    assert "api_key" not in body["writer"]
+    # env_managed 标记保持（字段仍标为 env 接管）
+    managed = {m["field"]: m["env"] for m in body["env_managed"]}
+    assert managed.get("writer.api_key") == "WEWRITE_WRITER_API_KEY"
+
+
 def test_publish_reconcile_text_only_consistent(monkeypatch, tmp_path):
     """有 media_id 时只读 get_draft，双方归一化后比较文本 hash（仅文本核对）。"""
     home = str(tmp_path)

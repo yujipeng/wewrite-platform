@@ -1560,11 +1560,27 @@ async function renderConfig() {
     if (!envManaged.has("writer.base_url")) {
       writer.base_url = writerIsCustom ? (writerBaseUrlInput.value || undefined) : writerBaseUrlInput.value;
     }
-    if (!envManaged.has("writer.temperature")) {
-      if (writerTemperatureInput.value !== "") writer.temperature = parseFloat(writerTemperatureInput.value);
+    // 提交前校验：temperature 为 0–2 的有限数字，max_tokens 为正整数。
+    // 不合法就地提示并中止，不发起请求；禁止 parseInt 静默截断小数。
+    let tempValue;
+    if (!envManaged.has("writer.temperature") && writerTemperatureInput.value !== "") {
+      tempValue = Number(writerTemperatureInput.value);
+      if (!Number.isFinite(tempValue) || tempValue < 0 || tempValue > 2) {
+        result.textContent = "保存失败：温度（0–2）必须是 0 到 2 之间的数字";
+        result.classList.add("error-block");
+        return;
+      }
+      writer.temperature = tempValue;
     }
-    if (!envManaged.has("writer.max_tokens")) {
-      if (writerMaxTokensInput.value !== "") writer.max_tokens = parseInt(writerMaxTokensInput.value, 10);
+    if (!envManaged.has("writer.max_tokens") && writerMaxTokensInput.value !== "") {
+      const rawTokens = writerMaxTokensInput.value.trim();
+      const tokenNum = Number(rawTokens);
+      if (!Number.isFinite(tokenNum) || tokenNum <= 0 || !Number.isInteger(tokenNum)) {
+        result.textContent = "保存失败：最大 token 数必须为正整数";
+        result.classList.add("error-block");
+        return;
+      }
+      writer.max_tokens = tokenNum;
     }
     const body = {
       theme: themeSelect.value || undefined,

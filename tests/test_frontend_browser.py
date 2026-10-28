@@ -367,3 +367,42 @@ def test_p8_writer_model_provider_linkage_and_key_not_echoed(browser_session):
     assert secret not in json.dumps(cfg)
     assert "1234567890" not in json.dumps(cfg)
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_writer_numeric_validation_blocks_submit(browser_session):
+    """JEE-1946 返修回归：max_tokens=1.5 / temperature=3 保存时不发请求且提示错误。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_config():
+        data = urllib.request.urlopen(f"{base}/api/v1/config", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    max_tokens_input = _kv_control(page, "最大 token 数")
+    temp_input = _kv_control(page, "温度（0–2）")
+    save_btn = page.locator("button", has_text="保存配置")
+
+    before = read_config()["writer"]["max_tokens"]
+
+    # max_tokens=1.5：不发起请求，就地报错
+    max_tokens_input.fill("1.5")
+    save_btn.click()
+    page.wait_for_timeout(400)
+    assert "最大 token 数必须为正整数" in page.inner_text("#app")
+    assert read_config()["writer"]["max_tokens"] == before, "非法 max_tokens 不应落盘"
+
+    # temperature=3：不发起请求，就地报错
+    temp_input.fill("3")
+    save_btn.click()
+    page.wait_for_timeout(400)
+    assert "温度（0–2）必须是 0 到 2 之间的数字" in page.inner_text("#app")
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

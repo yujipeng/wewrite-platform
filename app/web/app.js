@@ -672,6 +672,13 @@ function sourceLabel(source) {
   return { draft: "初稿 draft.md", article: "终稿 article.md", illustrated_article: "带图版 article-illustrated.md" }[source] || source;
 }
 
+function sourceShortLabel(source) {
+  return { draft: "初稿", article: "终稿", illustrated_article: "带图版" }[source] || source;
+}
+
+// P3 预览可切换的正文来源顺序（与后端 PREVIEW_SOURCES 白名单一致）
+const PREVIEW_SOURCE_KEYS = ["draft", "article", "illustrated_article"];
+
 async function renderPreviewEmpty() {
   app.innerHTML = "";
   app.appendChild(el("a", { class: "back-link", href: "#/", text: "← 返回任务列表" }));
@@ -717,9 +724,37 @@ async function renderPreview(runId) {
 
   const controls = el("div", { class: "preview-controls" });
   const sourceSelect = el("select");
-  for (const s of ["draft", "article", "illustrated_article"]) {
-    sourceSelect.appendChild(el("option", { value: s, text: sourceLabel(s) }));
+
+  // 先取 run 详情里的 artifacts，据此标注来源可用性并默认选中第一个实际存在的来源。
+  let artifacts = {};
+  try {
+    const detail = await api("/api/v1/runs/" + runId);
+    artifacts = detail.artifacts || {};
+  } catch (_) {
+    artifacts = {};
   }
+
+  // 3.4：来源下拉旁只读产物状态提示（与实际 artifacts 一致）
+  const artStatus = el("div", { class: "muted" });
+  artStatus.textContent = "当前任务已有产物：" + PREVIEW_SOURCE_KEYS.map(
+    (s) => sourceShortLabel(s) + " " + (artifacts[s] ? "✓" : "✗")
+  ).join(" / ");
+
+  for (const s of PREVIEW_SOURCE_KEYS) {
+    const opt = el("option", { value: s, text: sourceLabel(s) });
+    if (!artifacts[s]) {
+      opt.textContent = sourceLabel(s) + "（未生成）";
+      opt.disabled = true;
+    }
+    sourceSelect.appendChild(opt);
+  }
+
+  // 默认选中第一个实际存在的来源，而不是固定选 draft
+  const firstAvailable = PREVIEW_SOURCE_KEYS.find((s) => artifacts[s]);
+  if (firstAvailable) {
+    sourceSelect.value = firstAvailable;
+  }
+
   const themeSelect = el("select");
   themeSelect.appendChild(el("option", { value: "", text: "主题加载中…" }));
   const renderBtn = el("button", { class: "btn", text: "渲染预览" });
@@ -731,10 +766,17 @@ async function renderPreview(runId) {
   controls.appendChild(renderBtn);
   controls.appendChild(copyBtn);
   app.appendChild(controls);
+  app.appendChild(artStatus);
   app.appendChild(meta);
 
   const iframeHost = el("div");
   app.appendChild(iframeHost);
+
+  // 一个可用来源都没有：禁用渲染按钮并显示引导文案（验收标准 6）
+  if (!firstAvailable) {
+    renderBtn.disabled = true;
+    iframeHost.appendChild(emptyState("该任务还没有可预览的正文，请先在任务详情页生成文章"));
+  }
 
   // 主题列表走 GET /api/v1/themes（名称来自 wewrite 的 list_themes()）
   let themes = [];
@@ -771,8 +813,9 @@ async function renderPreview(runId) {
       if (!res.ok) {
         let code = "HTTP_" + res.status;
         let message = res.statusText;
-        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
-        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+        let details = null;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
       }
       const body = await res.json();
       // sandbox 且不含 allow-scripts：iframe 只渲染、不执行脚本
@@ -788,10 +831,52 @@ async function renderPreview(runId) {
     } catch (err) {
       iframeHost.innerHTML = "";
       if (err.status === 403) iframeHost.appendChild(forbiddenState());
-      else if (err.status === 404) iframeHost.appendChild(errorState("产物不存在或尚未生成", () => renderPreviewIframe()));
+      else if (err.status === 404) iframeHost.appendChild(renderPreview404(err));
       else iframeHost.appendChild(errorState("预览失败：" + (err.code || err.message), renderPreviewIframe));
     }
   };
+
+  // 按后端 details.reason 分流 404 提示（不再一律「产物不存在或尚未生成」）。
+  // 列出当前实际存在的来源，缺失来源可直接点击切换。
+  function renderPreview404(err) {
+    const details = err.details || {};
+    const reason = details.reason;
+    if (reason === "theme_not_found") {
+      return el("div", { class: "state-block error-block" }, [
+        "所选主题「" + (details.theme || "未知") + "」不存在或已不可用，请重新选择主题。",
+        el("br"),
+        el("button", { class: "btn", text: "切换主题", onclick: () => themeSelect.focus() }),
+      ]);
+    }
+    if (reason === "artifact_not_whitelisted") {
+      return errorState("预览请求被拒绝（" + (err.code || "NOT_FOUND") + "）。请刷新页面重试；若持续出现请联系维护者。", renderPreviewIframe);
+    }
+    if (reason === "artifact_missing") {
+      const missing = details.artifact ? sourceShortLabel(details.artifact) : "该来源";
+      const available = PREVIEW_SOURCE_KEYS.filter((s) => artifacts[s]);
+      const block = el("div", { class: "state-block error-block" }, [
+        "该任务还没有生成「" + sourceLabel(details.artifact || "") + "」。请改选其他来源，或先在任务详情页生成文章。",
+      ]);
+      if (available.length > 0) {
+        block.appendChild(el("br"));
+        block.appendChild(el("span", { text: "当前实际存在的来源：" }));
+        for (const s of available) {
+          block.appendChild(el("button", {
+            class: "btn",
+            text: sourceShortLabel(s),
+            onclick: () => { sourceSelect.value = s; renderPreviewIframe(); },
+          }));
+        }
+      }
+      return block;
+    }
+    // 其它原因（含无 reason 的旧 404）：给可切换入口，不再把 404 一律说成「产物不存在」
+    return el("div", { class: "state-block error-block" }, [
+      "预览请求被拒绝（" + (err.code || "NOT_FOUND") + "）" + (reason ? "，reason=" + reason : "") + "。请刷新页面重试；若持续出现请联系维护者。",
+      el("br"),
+      el("button", { class: "btn", text: "重试", onclick: renderPreviewIframe }),
+    ]);
+  }
 
   renderBtn.addEventListener("click", renderPreviewIframe);
   copyBtn.addEventListener("click", async () => {
@@ -805,8 +890,8 @@ async function renderPreview(runId) {
     }
   });
 
-  // 初始自动渲染一次
-  if (themeSelect.value) await renderPreviewIframe();
+  // 初始自动渲染一次（有可用来源且有主题时才自动渲染，避免点开就 404）
+  if (firstAvailable && themeSelect.value) await renderPreviewIframe();
 }
 
 // ============ M2：P4 每日热榜 ============

@@ -301,7 +301,14 @@ def safe_open_run_file(home: str | os.PathLike, run_id: str, name: str):
                     dir_fd=run_fd,
                 )
             except OSError as exc:
-                raise errors.not_found({"reason": _os_error_reason(exc), "artifact": name}) from exc
+                reason = _os_error_reason(exc)
+                # 产物文件确实不存在（ENOENT）时，给出可区分的 artifact_missing 语义，
+                # 供前端按 reason 分流；symlink/非目录等安全拒绝仍保留原 reason（eloop/enotdir）。
+                if reason == "enoent":
+                    raise errors.not_found(
+                        {"reason": "artifact_missing", "artifact": name, "run_id": run_id}
+                    ) from exc
+                raise errors.not_found({"reason": reason, "artifact": name}) from exc
             try:
                 st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):

@@ -48,6 +48,16 @@ def test_safe_open_run_file_reads_whitelisted(three_state_home):
     assert "article" in content
 
 
+def test_safe_open_run_file_missing_artifact_reason(three_state_home):
+    """验收标准 2/3：产物文件不存在时抛 NOT_FOUND，details.reason=artifact_missing 且带 artifact 名。"""
+    with pytest.raises(errors.ApiError) as ei:
+        paths.safe_open_run_file(three_state_home, "20261026-080000-a1b2c3", "article")
+    assert ei.value.code == "NOT_FOUND"
+    assert ei.value.details.get("reason") == "artifact_missing"
+    assert ei.value.details.get("artifact") == "article"
+    assert ei.value.details.get("run_id") == "20261026-080000-a1b2c3"
+
+
 def test_leaf_symlink_rejected(three_state_home):
     """叶文件换成 symlink：必须 403 且不读外部同名文件。"""
     run_dir = os.path.join(three_state_home, "runs", "20261026-100000-abcdef")

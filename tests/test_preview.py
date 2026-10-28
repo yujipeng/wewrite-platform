@@ -154,3 +154,58 @@ def test_preview_missing_artifact_not_found(client):
     )
     assert r.status_code == 404
     assert r.json()["code"] == "NOT_FOUND"
+
+
+def test_preview_missing_artifact_reason_artifact_missing(client, three_state_home):
+    """验收标准 2：只有 article、无 draft 的 run 请求 source=draft，
+    返回 404 且 details.reason == artifact_missing、artifact == draft、run_id 回填。"""
+    run_id = "20261026-080000-a1b2c3"
+    write_artifact(three_state_home, run_id, "article", "# 只有终稿\n")
+    client.get("/api/v1/runs")  # 钉住身份
+    r = client.post(
+        "/api/v1/preview",
+        json={"run_id": run_id, "source": "draft", "theme": "professional-clean"},
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:8765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": client.get("/api/v1/bootstrap").json()["csrf_token"],
+        },
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert body["code"] == "NOT_FOUND"
+    assert body["details"]["reason"] == "artifact_missing"
+    assert body["details"]["artifact"] == "draft"
+    assert body["details"]["run_id"] == run_id
+
+
+def test_preview_theme_not_found_reason(client):
+    """验收标准 4：合法格式但不在 list_themes() 的 theme → 404 theme_not_found。"""
+    r = client.post(
+        "/api/v1/preview",
+        json={"run_id": "20261026-100000-abcdef", "source": "article", "theme": "no-such-theme-xyz"},
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:8765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": client.get("/api/v1/bootstrap").json()["csrf_token"],
+        },
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert body["code"] == "NOT_FOUND"
+    assert body["details"]["reason"] == "theme_not_found"
+    assert body["details"]["theme"] == "no-such-theme-xyz"
+
+
+def test_preview_non_whitelisted_artifact_unchanged(client):
+    """验收标准 5（部分）：白名单外产物名仍 404 artifact_not_whitelisted，不被误改。"""
+    import pytest
+
+    from app.domain import errors
+
+    with pytest.raises(errors.ApiError) as ei:
+        paths.safe_open_run_file(os.environ["WEWRITE_HOME"], "20261026-100000-abcdef", "config.yaml")
+    assert ei.value.code == "NOT_FOUND"
+    assert ei.value.details["reason"] == "artifact_not_whitelisted"

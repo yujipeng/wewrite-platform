@@ -668,24 +668,59 @@ class ConfigStore:
         return None
 
     @staticmethod
-    def _find_key_line(text: str, field: str) -> int | None:
-        """在 YAML 原文中定位 ``field:`` 键所在行（1-based）；找不到返回 None。
+    def _build_key_line_map(text: str) -> dict[str, int]:
+        """用 ``yaml.compose`` 遍历节点，建立「点分路径 → 键所在行」映射（1-based）。
 
-        用于给字段类型错误定位行号：按行扫描 ``key:``（顶层键）或 ``  key:``
-        （嵌套键，如 blacklist 下的 words/topics）前缀匹配。
+        能区分同名嵌套键（``blacklist.topics`` 与顶层 ``topics``），也能拿到
+        行内对象（``blacklist: {words: ...}``）里嵌套键的行号，解决文本前缀扫描
+        忽略层级、取首个命中导致的行号失真。compose 失败（语法错误）返回空表。
         """
-        for lineno, line in enumerate(text.split("\n"), start=1):
-            stripped = line.lstrip()
-            if stripped.startswith(field + ":") or stripped.startswith(field + " "):
-                return lineno
+        from yaml.nodes import MappingNode, SequenceNode
+
+        mapping: dict[str, int] = {}
+        try:
+            root = yaml.compose(text)
+        except yaml.YAMLError:
+            return mapping
+
+        def walk(node, prefix: str) -> None:
+            if isinstance(node, MappingNode):
+                for key_node, value_node in node.value:
+                    key = getattr(key_node, "value", None)
+                    if key is None:
+                        continue
+                    path = f"{prefix}.{key}" if prefix else str(key)
+                    mapping[path] = key_node.start_mark.line + 1
+                    walk(value_node, path)
+            elif isinstance(node, SequenceNode):
+                # 序列元素不产生键路径，但元素内部可能是 mapping，继续递归
+                for item in node.value:
+                    walk(item, prefix)
+
+        walk(root, "")
+        return mapping
+
+    def _style_error_line(self, text: str, field: str, line_map: dict[str, int] | None = None) -> int | None:
+        """按点分路径查表取错误行号；查不到回退父路径，再回退 None。"""
+        if not field:
+            return None
+        if line_map is None:
+            line_map = self._build_key_line_map(text)
+        line = line_map.get(field)
+        if line is not None:
+            return line
+        # 回退父路径（如 blacklist.words 查不到时试 blacklist）
+        if "." in field:
+            parent = field.rsplit(".", 1)[0]
+            return line_map.get(parent)
         return None
 
     def validate_style_yaml(self, text: str) -> dict:
         """校验 style.yaml 文本（POST /style/validate）。
 
         返回 ``{valid, warnings, errors: [{line, field, message}]}``；解析失败
-        抛 422（带行号），字段问题以 errors 列表返回并带 ``line``（从原文扫描
-        键位置），message 保持中文原因。
+        抛 422（带行号），字段问题以 errors 列表返回并带 ``line``（按点分路径
+        查 ``yaml.compose`` 映射定位），message 保持中文原因。
         """
         if not isinstance(text, str):
             raise errors.validation_error("yaml 必须为字符串", {"field": "yaml"})
@@ -693,13 +728,12 @@ class ConfigStore:
             raise errors.validation_error("style.yaml 超过 64KB 大小上限", {"field": "yaml"})
 
         data = self.parse_style_yaml(text)
+        line_map = self._build_key_line_map(text)
         try:
             style, warnings = self.validate_style_data(data)
         except errors.ApiError as exc:
             field = exc.details.get("field") or ""
-            # 点分字段（如 blacklist.words）取末段键名定位行号
-            key = field.rsplit(".", 1)[-1] if field else None
-            line = self._find_key_line(text, key) if key else None
+            line = self._style_error_line(text, field, line_map)
             return {
                 "valid": False,
                 "warnings": [],
@@ -707,13 +741,31 @@ class ConfigStore:
             }
         return {"valid": True, "warnings": warnings, "errors": [], "fields": list(style.keys())}
 
+    @staticmethod
+    def _blacklist_as_object(value) -> dict:
+        """把 blacklist 归一为对象形态 ``{words, topics}``（生成路径专用）。
+
+        列表入参按语义归入 ``words``、``topics`` 置空（生成结果必须是对象形态，
+        验收第 7/9 条）；对象入参补齐 words/topics 两个键。
+        """
+        if isinstance(value, dict):
+            words = value.get("words")
+            topics = value.get("topics")
+            return {
+                "words": [str(v).strip() for v in words if str(v).strip()] if isinstance(words, list) else [],
+                "topics": [str(v).strip() for v in topics if str(v).strip()] if isinstance(topics, list) else [],
+            }
+        if isinstance(value, list):
+            return {"words": [str(v).strip() for v in value if str(v).strip()], "topics": []}
+        return {"words": [], "topics": []}
+
     def generate_style_yaml(self, body: dict, backend) -> dict:
         """生成整份 style.yaml（POST /style/generate 逻辑层）。
 
         校验入参（industry/audience/tone_hint 至少一项非空，否则 422）→ 调写作
-        模型。模型返回非法 YAML / 不可解析内容 → ``502 UPSTREAM_ERROR``（不是
-        422）；解析通过后服务端白名单裁剪补默认→重新序列化，绝不透出模型原文。
-        不落盘。
+        模型。模型输出导致的**任何**解析或字段错误 → ``502 UPSTREAM_ERROR``
+        （422 只留给入参不合法）；解析通过后服务端白名单裁剪补默认→重新序列化，
+        ``blacklist`` 缺省或已有值都归一成对象形态。不落盘。
         """
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
@@ -734,24 +786,25 @@ class ConfigStore:
             )
 
         raw_text = backend.generate(industry or "", audience or "", tone_hint or "")
-        # 模型返回不可解析内容 → 502 UPSTREAM_ERROR（生成失败归因到上游，不是入参 422）。
+        # 模型输出导致的解析或字段错误统一归因 502（422 只用于入参）。
         try:
             data = self.parse_style_yaml(raw_text)
+            style, warnings = self.validate_style_data(data)
         except errors.ApiError as exc:
             raise errors.upstream_error(
                 "写作模型返回无法解析的风格 YAML", {"reason": "invalid_generated_yaml"}
             ) from exc
-        style, warnings = self.validate_style_data(data)
+
         style.setdefault("version", 1)
-        # 补齐白名单字段（缺省补默认，保证结构完整；blacklist 缺省补对象形态）
+        # 补齐白名单字段（缺省补默认，保证结构完整）
         for field in self.STYLE_FIELDS:
             if field not in style:
-                if field == "blacklist":
-                    style[field] = {"words": [], "topics": []}
-                elif field in {"topics", "reference_accounts"}:
+                if field in {"topics", "reference_accounts"}:
                     style[field] = []
                 else:
                     style[field] = ""
+        # 生成路径 blacklist 强制对象形态：缺省或已有值（数组/对象）都归一。
+        style["blacklist"] = self._blacklist_as_object(style.get("blacklist"))
         serialized = yaml.safe_dump(style, allow_unicode=True, sort_keys=False)
         return {"yaml": serialized, "source": "llm", "warnings": warnings}
 

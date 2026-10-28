@@ -202,6 +202,18 @@ def test_generate_blacklist_defaults_to_object(tmp_path):
     assert "words" in parsed["blacklist"] and "topics" in parsed["blacklist"]
 
 
+def test_generate_blacklist_list_becomes_object(tmp_path):
+    """第 3 轮返修第 1 条：模型返回 blacklist: [震惊] → 输出对象形态含 words/topics。"""
+    store = _store(str(tmp_path))
+    result = store.generate_style_yaml(
+        {"industry": "科技"}, FakeBackend("blacklist: [震惊, 必看]\n")
+    )
+    parsed = yaml.safe_load(result["yaml"])
+    assert isinstance(parsed["blacklist"], dict), "blacklist 列表应归一为对象形态"
+    assert parsed["blacklist"]["words"] == ["震惊", "必看"]
+    assert parsed["blacklist"]["topics"] == []
+
+
 def test_generate_invalid_yaml_returns_502(tmp_path):
     """返修第 5 条：模型返回非法 YAML → 502 UPSTREAM_ERROR（非 422）。"""
     store = _store(str(tmp_path))
@@ -214,6 +226,41 @@ def test_generate_invalid_yaml_returns_502(tmp_path):
         assert exc.status_code == 502
     else:
         raise AssertionError("应当抛 502 UPSTREAM_ERROR")
+
+
+def test_generate_field_error_returns_502(tmp_path):
+    """第 3 轮返修第 2 条：模型返回 blacklist: 123 → 502（字段校验错误也归 502）。"""
+    store = _store(str(tmp_path))
+    try:
+        store.generate_style_yaml(
+            {"industry": "科技"}, FakeBackend("blacklist: 123\n")
+        )
+    except errors.ApiError as exc:
+        assert exc.code == "UPSTREAM_ERROR"
+        assert exc.status_code == 502
+    else:
+        raise AssertionError("应当抛 502 UPSTREAM_ERROR")
+
+
+def test_validate_inline_blacklist_words_error_has_line(tmp_path):
+    """第 3 轮返修第 3 条：行内对象 blacklist: {words: 123} 报错行号非空。"""
+    store = _store(str(tmp_path))
+    result = store.validate_style_yaml("blacklist: {words: 123}\n")
+    assert result["valid"] is False
+    err = result["errors"][0]
+    assert err.get("line") is not None, "行内对象嵌套键错误应能定位到行号"
+
+
+def test_validate_nested_vs_top_level_topics_line(tmp_path):
+    """第 3 轮返修第 3 条：blacklist.topics 与顶层 topics 同时存在时定位到顶层 topics 行。"""
+    store = _store(str(tmp_path))
+    text = "blacklist:\n  topics: [宗教]\ntopics: 123\n"
+    result = store.validate_style_yaml(text)
+    assert result["valid"] is False
+    err = result["errors"][0]
+    # 顶层 topics 在第 3 行（blacklist.topics 在第 2 行），不得误定位到第 2 行
+    assert err.get("field") == "topics"
+    assert err.get("line") == 3, f"应定位到顶层 topics 第 3 行，实际 {err.get('line')}"
 
 
 # ---------- brief 注入（验收第 10 条） ----------

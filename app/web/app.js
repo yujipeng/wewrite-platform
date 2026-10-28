@@ -1402,6 +1402,86 @@ async function renderConfig() {
   imageSection.appendChild(providerRow);
   container.appendChild(imageSection);
 
+  // 写作模型（文章生成）—— 与图片供应商同一套交互（provider 联动/自定义/api_key 只写不读/env 优先）
+  container.appendChild(el("div", { class: "section-title", text: "写作模型（文章生成）" }));
+  // 未配置 api_key 时一眼看到后果（WRITER_NOT_CONFIGURED）
+  if (!cfg.writer.api_key_configured) {
+    container.appendChild(el("div", { class: "notice", text: "未配置写作模型，文章生成会失败（WRITER_NOT_CONFIGURED）" }));
+  }
+
+  let writerProviderList = [];
+  try {
+    writerProviderList = (await api("/api/v1/writer-providers")).providers || [];
+  } catch (_) {
+    writerProviderList = [];
+  }
+
+  const writerSection = el("div");
+  const writerProviderSelect = el("select");
+  writerProviderSelect.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
+  const writerDefaults = {}; // name -> {model, base_url}
+  for (const p of writerProviderList) {
+    writerProviderSelect.appendChild(el("option", { value: p.name, text: p.name }));
+    writerDefaults[p.name] = { model: p.default_model || "", base_url: p.default_base_url || "" };
+  }
+  const writerCurrentProvider = cfg.writer.provider || "";
+  if (writerCurrentProvider && !(writerCurrentProvider in writerDefaults)) {
+    writerProviderSelect.appendChild(el("option", { value: writerCurrentProvider, text: writerCurrentProvider + "（当前值）" }));
+  }
+  writerProviderSelect.value = writerCurrentProvider || "__custom__";
+
+  const writerModelInput = el("input", { type: "text", value: cfg.writer.model || "", placeholder: "模型名称" });
+  const writerBaseUrlInput = el("input", { type: "text", value: cfg.writer.base_url || "", placeholder: "接口地址" });
+  const writerApiKeyInput = el("input", {
+    type: "password",
+    value: "",
+    placeholder: cfg.writer.api_key_configured ? "已配置（留空保持）" : "API 密钥",
+  });
+  const writerTemperatureInput = el("input", {
+    type: "number", step: "0.1", min: "0", max: "2",
+    value: cfg.writer.temperature == null ? "1.0" : String(cfg.writer.temperature),
+    placeholder: "温度（0–2）",
+  });
+  const writerMaxTokensInput = el("input", {
+    type: "number", step: "1", min: "1",
+    value: cfg.writer.max_tokens == null ? "4000" : String(cfg.writer.max_tokens),
+    placeholder: "最大 token 数",
+  });
+  const writerCustomInput = el("input", {
+    type: "text",
+    value: "",
+    placeholder: "自定义写作模型 provider 名称",
+    style: "display:none;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%",
+  });
+
+  // 选中内置 provider 联动填充默认 model/base_url；自定义清空供自由填写
+  const applyWriterDefaults = () => {
+    const val = writerProviderSelect.value;
+    const def = writerDefaults[val];
+    if (def) {
+      writerModelInput.value = def.model;
+      writerBaseUrlInput.value = def.base_url;
+    } else if (val === "__custom__") {
+      writerModelInput.value = "";
+      writerBaseUrlInput.value = "";
+    }
+    writerCustomInput.style.display = val === "__custom__" ? "" : "none";
+  };
+  writerProviderSelect.addEventListener("change", applyWriterDefaults);
+
+  const writerRow = el("div");
+  writerRow.appendChild(kvForm([
+    ["模型提供商", writerProviderSelect],
+    ["模型名称", writerModelInput],
+    ["接口地址", writerBaseUrlInput],
+    ["API 密钥", writerApiKeyInput],
+    ["温度（0–2）", writerTemperatureInput],
+    ["最大 token 数", writerMaxTokensInput],
+  ]));
+  writerRow.appendChild(writerCustomInput);
+  writerSection.appendChild(writerRow);
+  container.appendChild(writerSection);
+
   // 主题
   container.appendChild(el("div", { class: "section-title", text: "排版主题" }));
   const themeSelect = el("select");
@@ -1432,6 +1512,17 @@ async function renderConfig() {
   if (envManaged.has("theme")) themeSelect.disabled = true;
   if (envManaged.has("image.api_key")) apiKeyInput.disabled = true;
 
+  // 写作模型 env 接管禁用（与图片供应商一致）
+  if (envManaged.has("writer.provider")) {
+    writerProviderSelect.disabled = true;
+    writerProviderSelect.title = "该字段由环境变量接管，禁止修改";
+  }
+  if (envManaged.has("writer.model")) writerModelInput.disabled = true;
+  if (envManaged.has("writer.base_url")) writerBaseUrlInput.disabled = true;
+  if (envManaged.has("writer.api_key")) writerApiKeyInput.disabled = true;
+  if (envManaged.has("writer.temperature")) writerTemperatureInput.disabled = true;
+  if (envManaged.has("writer.max_tokens")) writerMaxTokensInput.disabled = true;
+
   const saveBtn = el("button", { class: "btn", text: "保存配置" });
   const result = el("div", { class: "muted", text: "" });
   container.appendChild(el("div", { class: "preview-controls" }, [saveBtn, result]));
@@ -1458,13 +1549,55 @@ async function renderConfig() {
       image.base_url = isCustom ? (providerBaseUrlInput.value || undefined) : providerBaseUrlInput.value;
     }
     const wechat = { appid: appidInput.value || undefined, author: authorInput.value || undefined };
+    // 写作模型：env 接管的字段不发；内置 provider 的 model/base_url 以输入框当前值
+    // 为准提交，自定义 provider 的空值保持原值（与图片供应商一致）。
+    const writerIsCustom = writerProviderSelect.value === "__custom__";
+    const writer = {};
+    if (!envManaged.has("writer.provider")) {
+      if (writerIsCustom) {
+        const customVal = writerCustomInput.value.trim();
+        if (customVal) writer.provider = customVal;
+      } else if (writerProviderSelect.value) {
+        writer.provider = writerProviderSelect.value;
+      }
+    }
+    if (!envManaged.has("writer.model")) {
+      writer.model = writerIsCustom ? (writerModelInput.value || undefined) : writerModelInput.value;
+    }
+    if (!envManaged.has("writer.base_url")) {
+      writer.base_url = writerIsCustom ? (writerBaseUrlInput.value || undefined) : writerBaseUrlInput.value;
+    }
+    // 提交前校验：temperature 为 0–2 的有限数字，max_tokens 为正整数。
+    // 不合法就地提示并中止，不发起请求；禁止 parseInt 静默截断小数。
+    let tempValue;
+    if (!envManaged.has("writer.temperature") && writerTemperatureInput.value !== "") {
+      tempValue = Number(writerTemperatureInput.value);
+      if (!Number.isFinite(tempValue) || tempValue < 0 || tempValue > 2) {
+        result.textContent = "保存失败：温度（0–2）必须是 0 到 2 之间的数字";
+        result.classList.add("error-block");
+        return;
+      }
+      writer.temperature = tempValue;
+    }
+    if (!envManaged.has("writer.max_tokens") && writerMaxTokensInput.value !== "") {
+      const rawTokens = writerMaxTokensInput.value.trim();
+      const tokenNum = Number(rawTokens);
+      if (!Number.isFinite(tokenNum) || tokenNum <= 0 || !Number.isInteger(tokenNum)) {
+        result.textContent = "保存失败：最大 token 数必须为正整数";
+        result.classList.add("error-block");
+        return;
+      }
+      writer.max_tokens = tokenNum;
+    }
     const body = {
       theme: themeSelect.value || undefined,
       image,
       wechat,
+      writer,
     };
     if (apiKeyInput.value) image.api_key = apiKeyInput.value;
     if (secretInput.value) wechat.secret = secretInput.value;
+    if (!envManaged.has("writer.api_key") && writerApiKeyInput.value) writer.api_key = writerApiKeyInput.value;
     try {
       const token = await csrfToken();
       const res = await fetch("/api/v1/config", {
@@ -1516,16 +1649,26 @@ async function renderConfig() {
     if (data.valid) {
       validateBox.classList.remove("error-block");
       validateBox.classList.add("muted");
-      const msg = data.warnings && data.warnings.length
-        ? "校验通过；忽略的未知字段：" + data.warnings.join("、")
-        : "校验通过";
-      validateBox.appendChild(el("div", { text: msg }));
+      if (data.warnings && data.warnings.length) {
+        validateBox.appendChild(el("div", { text: "校验通过；忽略的未知字段：" + data.warnings.join("、") }));
+      } else {
+        validateBox.appendChild(el("div", { text: "校验通过" }));
+      }
     } else {
       validateBox.classList.add("error-block");
       validateBox.classList.remove("muted");
       for (const e of data.errors || []) {
-        validateBox.appendChild(el("div", { text: (e.field ? e.field + "：" : "") + (e.message || "") }));
+        const lineText = e.line ? "第 " + e.line + " 行：" : "";
+        validateBox.appendChild(el("div", { text: lineText + (e.field ? e.field + "：" : "") + (e.message || "") }));
       }
+    }
+  }
+
+  function renderWarnings(data) {
+    // 保存路径的 warnings 可见化（不静默丢弃）
+    if (data && data.warnings && data.warnings.length) {
+      styleResult.textContent = "已保存；忽略的未知字段：" + data.warnings.join("、");
+      styleResult.classList.add("muted");
     }
   }
 
@@ -1661,10 +1804,13 @@ async function renderConfig() {
         try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
         const err = new Error(message); err.code = code; err.status = res.status; throw err;
       }
+      const saved = await res.json();
       savedRaw = yamlEditor.value;
       markDirty(false);
       styleResult.textContent = "已保存";
       styleResult.classList.remove("error-block");
+      styleResult.classList.remove("muted");
+      renderWarnings(saved);
       setTimeout(renderConfig, 400);
     } catch (err) {
       styleResult.textContent = "保存失败：" + (err.code || err.message);

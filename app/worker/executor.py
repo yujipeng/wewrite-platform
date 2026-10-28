@@ -27,13 +27,48 @@ from app.domain import errors
 from app.storage import jobs as jobs_store
 from app.storage import paths
 
+# writer 配置叶字段 → 上游 llm-write 读取的环境变量名（env 优先，其次 config.yaml）。
+_WRITER_ENV_FIELDS = (
+    ("api_key", "WEWRITE_WRITER_API_KEY"),
+    ("provider", "WEWRITE_WRITER_PROVIDER"),
+    ("base_url", "WEWRITE_WRITER_BASE_URL"),
+    ("model", "WEWRITE_WRITER_MODEL"),
+    ("temperature", "WEWRITE_WRITER_TEMPERATURE"),
+    ("max_tokens", "WEWRITE_WRITER_MAX_TOKENS"),
+)
+
+
+def _writer_env(config: dict | None) -> dict[str, str]:
+    """把最终生效的 writer 配置注入子进程环境。
+
+    llm-write 只读环境变量，因此 worker 启动子进程时必须把 env 优先、其次
+    ``config.yaml`` 的最终值显式注入 ``env``，否则网页改了 model 也不生效。
+    不覆盖已由环境变量注入的值（env 优先是安全底线，config 不越权）。
+    """
+    env: dict[str, str] = {}
+    if config is None:
+        return env
+    writer = config.get("writer") or {}
+    for key, env_var in _WRITER_ENV_FIELDS:
+        if env_var in os.environ:
+            continue  # 环境变量接管，config 不覆盖
+        value = writer.get(key)
+        if value is None or value == "":
+            continue  # 未配置则交由上游默认值
+        env[env_var] = str(value)
+    return env
+
 
 class WriterBackend:
     """llm-write 子进程后端（可注入 fake）。返回 ``(exit_code, output_path_or_none)``。"""
 
-    def run(self, brief_path: str, output_path: str) -> int:
+    def run(self, brief_path: str, output_path: str, env: dict | None = None) -> int:
         cmd = [sys.executable, "-m", "wewrite.commands.llm_write", "--brief", brief_path, "--output", output_path]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # 继承父进程环境再叠加 writer 配置，避免空 env 覆盖 PATH 等必要变量。
+        child_env = dict(os.environ)
+        if env:
+            child_env.update(env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=child_env)
         return proc.returncode
 
 
@@ -79,18 +114,6 @@ def _write_run_state(home: str, run_id: str, state: dict) -> None:
 def _check_cancel(store: jobs_store.JobStore, job_id: str) -> bool:
     job = store.load(job_id)
     return bool(job and job.get("cancel_requested"))
-
-
-def _build_brief_text(state: dict) -> str:
-    topic = state.get("topic") or {}
-    visual = state.get("visual") or {}
-    title = topic.get("title") or "未命名文章"
-    framework = topic.get("framework_hint") or "问题-证据-行动"
-    return (
-        f"# 选题\n\n标题：{title}\n\n切入点：{topic.get('source') or ''}\n\n"
-        f"框架：{framework}\n\n关键词：{', '.join(topic.get('keywords') or [])}\n\n"
-        f"视觉模式：{visual.get('mode') or 'none'}，最大图片数：{visual.get('max_images') or 0}\n"
-    )
 
 
 def _build_brief_text(state: dict, style: dict | None = None) -> str:
@@ -275,6 +298,10 @@ class Worker:
             return 3
         import tempfile as _tmp
 
+        # 把最终生效的 writer 配置注入子进程 env（env 优先，其次 config.yaml）。
+        # llm-write 只读环境变量，不注入则网页改 model/base_url 等不会生效。
+        env = self._build_writer_env()
+
         brief_fd, brief_path = _tmp.mkstemp(suffix=".md")
         out_fd, out_path = _tmp.mkstemp(suffix=".md")
         os.close(brief_fd)
@@ -282,7 +309,7 @@ class Worker:
         try:
             with open(brief_path, "wb") as f:
                 f.write(brief_bytes)
-            exit_code = self.writer.run(brief_path, out_path)
+            exit_code = self.writer.run(brief_path, out_path, env=env)
             if exit_code == 0 and os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     content = f.read()
@@ -294,6 +321,13 @@ class Worker:
                     os.unlink(p)
                 except OSError:
                     pass
+
+    def _build_writer_env(self) -> dict[str, str]:
+        """读取 config.yaml，返回注入子进程的 writer 环境变量（env 优先，其次配置）。"""
+        from app.storage.config_store import ConfigStore
+
+        config = ConfigStore(self.home).load_config()
+        return _writer_env(config)
 
     def _step_review(self, job: dict) -> None:
         self.store.heartbeat(job["job_id"], step="review")

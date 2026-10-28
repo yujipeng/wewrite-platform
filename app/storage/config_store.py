@@ -4,11 +4,11 @@
 
 - 密钥（wechat.secret / image.api_key / writer api_key）只写不读，投影只给
   ``*_configured`` 布尔，绝不回显明文或末四位；
-- 环境变量接管字段（WECHAT_* / WEWRITE_IMAGE_* / WEWRITE_THEME）写入返回
-  ``409 ENV_MANAGED``，整包失败不局部提交；
-- ``writer`` 环境配置整体只读，拒绝 PUT；
-- 空值表示保持原值，显式 ``clear``（仅 wechat.secret / image.api_key）需
-  ``clear_confirmed=true`` 二次确认；
+- 环境变量接管字段（WECHAT_* / WEWRITE_IMAGE_* / WEWRITE_THEME /
+  WEWRITE_WRITER_*）写入返回 ``409 ENV_MANAGED``，整包失败不局部提交；
+- ``writer`` 与 ``image`` 同为可写白名单（api_key 只写不读，见下）；
+- 空值表示保持原值，显式 ``clear``（wechat.secret / image.api_key /
+  writer.api_key）需 ``clear_confirmed=true`` 二次确认；
 - 落盘走 ``safe_write_root_file``（mkstemp 0600 → fsync → os.replace → 复验权限），
   日志统一 ``redact_secret``。
 """
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 
 import yaml
@@ -34,17 +35,13 @@ ENV_FIELD_MAP: dict[str, tuple[str, ...]] = {
     "WEWRITE_IMAGE_API_KEY": ("image", "api_key"),
     "WEWRITE_IMAGE_MODEL": ("image", "model"),
     "WEWRITE_THEME": ("theme",),
+    "WEWRITE_WRITER_API_KEY": ("writer", "api_key"),
+    "WEWRITE_WRITER_PROVIDER": ("writer", "provider"),
+    "WEWRITE_WRITER_BASE_URL": ("writer", "base_url"),
+    "WEWRITE_WRITER_MODEL": ("writer", "model"),
+    "WEWRITE_WRITER_TEMPERATURE": ("writer", "temperature"),
+    "WEWRITE_WRITER_MAX_TOKENS": ("writer", "max_tokens"),
 }
-
-# writer 相关环境变量（整体只读，不接受 PUT）
-WRITER_ENV_VARS = (
-    "WEWRITE_WRITER_API_KEY",
-    "WEWRITE_WRITER_PROVIDER",
-    "WEWRITE_WRITER_BASE_URL",
-    "WEWRITE_WRITER_MODEL",
-    "WEWRITE_WRITER_TEMPERATURE",
-    "WEWRITE_WRITER_MAX_TOKENS",
-)
 
 # PUT /config 可写的白名单字段（叶字段键），secret/api_key 只写不读。
 WRITABLE_CONFIG_FIELDS = frozenset(
@@ -59,17 +56,26 @@ WRITABLE_CONFIG_FIELDS = frozenset(
         "wechat.appid",
         "wechat.secret",
         "wechat.author",
+        "writer.provider",
+        "writer.model",
+        "writer.api_key",
+        "writer.base_url",
+        "writer.temperature",
+        "writer.max_tokens",
     }
 )
 
 # PUT /config 请求体允许的顶层键；其余（含 permissions）一律 422 未知字段。
-CONFIG_TOP_KEYS = frozenset({"theme", "image", "wechat", "clear", "clear_confirmed"})
+CONFIG_TOP_KEYS = frozenset({"theme", "image", "wechat", "writer", "clear", "clear_confirmed"})
 CONFIG_IMAGE_KEYS = frozenset(
     {"provider", "model", "api_key", "base_url", "max_cost", "estimated_cost_per_image"}
 )
 CONFIG_WECHAT_KEYS = frozenset({"appid", "secret", "author"})
+CONFIG_WRITER_KEYS = frozenset(
+    {"provider", "model", "api_key", "base_url", "temperature", "max_tokens"}
+)
 
-CLEARABLE_FIELDS = frozenset({"wechat.secret", "image.api_key"})
+CLEARABLE_FIELDS = frozenset({"wechat.secret", "image.api_key", "writer.api_key"})
 
 DEFAULT_CONFIG: dict = {
     "version": 1,
@@ -90,6 +96,9 @@ DEFAULT_CONFIG: dict = {
     "writer": {
         "provider": "deepseek",
         "model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com",
+        "temperature": 1.0,
+        "max_tokens": 4000,
         "api_key": "",
     },
     "permissions": {"publish": False},
@@ -209,6 +218,33 @@ class ConfigStore:
         def _field_value(dotted: str):
             return _get_in(cfg, dotted)
 
+        def _writer_key_configured() -> bool:
+            # 与 worker `_writer_env()` 对齐：env 存在即接管，不看是否非空。
+            # 空串 env 时子进程实际收到空密钥 → 未配置，不得回落到文件值。
+            env_value = os.environ.get("WEWRITE_WRITER_API_KEY")
+            if env_value is not None:
+                return env_value != ""
+            return secret_configured(writer.get("api_key") or None)
+
+        # writer 各字段的投影口径与 worker `_writer_env()` 一致：env 存在即以其为准
+        # （空串表示未设置），否则回落到 config.yaml（再回落默认值）。
+        _writer_env_of = {
+            "provider": "WEWRITE_WRITER_PROVIDER",
+            "model": "WEWRITE_WRITER_MODEL",
+            "base_url": "WEWRITE_WRITER_BASE_URL",
+            "temperature": "WEWRITE_WRITER_TEMPERATURE",
+            "max_tokens": "WEWRITE_WRITER_MAX_TOKENS",
+        }
+
+        def _writer_effective(key, default):
+            env_var = _writer_env_of[key]
+            if env_var in os.environ:
+                return os.environ[env_var]
+            val = writer.get(key)
+            if val is None or val == "":
+                return default
+            return val
+
         return {
             "version": 1,
             "theme": _field_value("theme"),
@@ -227,10 +263,14 @@ class ConfigStore:
                 "author": wechat.get("author", "编辑"),
             },
             "writer": {
-                "provider": writer.get("provider", "deepseek"),
-                "model": writer.get("model", "deepseek-chat"),
-                "api_key_configured": secret_configured(writer.get("api_key") or None),
-                "writer_configured": bool(os.environ.get("WEWRITE_WRITER_API_KEY", "").strip()),
+                "provider": _writer_effective("provider", "deepseek"),
+                "model": _writer_effective("model", "deepseek-chat"),
+                "base_url": _writer_effective("base_url", "https://api.deepseek.com"),
+                "temperature": _writer_effective("temperature", 1.0),
+                "max_tokens": _writer_effective("max_tokens", 4000),
+                "api_key_configured": _writer_key_configured(),
+                # JEE-1947 前端用：写作模型是否可用（AI 生成入口禁用判断）
+                "writer_configured": _writer_key_configured(),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},
             "env_managed": [
@@ -291,7 +331,7 @@ class ConfigStore:
             for field in clear_list:
                 if field not in CLEARABLE_FIELDS:
                     raise errors.validation_error(
-                        "只允许清除 wechat.secret | image.api_key", {"field": "clear"}
+                        "只允许清除 wechat.secret | image.api_key | writer.api_key", {"field": "clear"}
                     )
                 if field in managed:
                     raise errors.env_managed({"field": field, "env": managed[field]})
@@ -306,7 +346,7 @@ class ConfigStore:
         return {"applied": applied, "config": self.project_config()}
 
     def _collect_config_dirty(self, body: dict) -> dict[str, object]:
-        """把 PUT body 归一化为 {点分字段: 值}；未知字段拒绝；writer 只读拒绝。"""
+        """把 PUT body 归一化为 {点分字段: 值}；未知字段拒绝。"""
         dirty: dict[str, object] = {}
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
@@ -316,20 +356,17 @@ class ConfigStore:
             if key not in CONFIG_TOP_KEYS:
                 raise errors.validation_error("未知字段", {"field": key})
 
-        # writer 相关环境配置整体只读，拒绝写入（设计 2.5）
-        if isinstance(body.get("writer"), dict) and body.get("writer"):
-            raise errors.validation_error("writer 相关环境配置整体只读，不接受写入", {"field": "writer"})
-
-        # 嵌套键未知拒绝（image/wechat 下白名单外的键一律 422）
+        # 嵌套键未知拒绝（image/wechat/writer 下白名单外的键一律 422）
         _reject_unknown_nested(body, "image", CONFIG_IMAGE_KEYS)
         _reject_unknown_nested(body, "wechat", CONFIG_WECHAT_KEYS)
+        _reject_unknown_nested(body, "writer", CONFIG_WRITER_KEYS)
 
         for field in WRITABLE_CONFIG_FIELDS:
             # 只处理出现在 body 里的字段；缺失不改
             present, value = _pick_dotted(body, field)
             if not present:
                 continue
-            if field in {"image.api_key", "wechat.secret"}:
+            if field in {"image.api_key", "wechat.secret", "writer.api_key"}:
                 # 只写不读：接受非空字符串；空串表示保持原值
                 if value is not None and not isinstance(value, str):
                     raise errors.validation_error("密钥字段必须为字符串", {"field": field})
@@ -342,7 +379,10 @@ class ConfigStore:
                 if any(sep in value for sep in ("/", "\\", "..")):
                     raise errors.validation_error("theme 不合法", {"field": field})
                 dirty[field] = value
-            elif field in {"image.provider", "image.model", "image.base_url"}:
+            elif field in {
+                "image.provider", "image.model", "image.base_url",
+                "writer.provider", "writer.model", "writer.base_url",
+            }:
                 if value is not None and not isinstance(value, str):
                     raise errors.validation_error("字段必须为字符串", {"field": field})
                 if value is not None:
@@ -354,6 +394,28 @@ class ConfigStore:
                     dirty[field] = float(value)
                 except (TypeError, ValueError):
                     raise errors.validation_error("字段必须为数字", {"field": field})
+            elif field == "writer.temperature":
+                if value is None:
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    raise errors.validation_error("字段必须为数字", {"field": field})
+                if not math.isfinite(number) or not (0.0 <= number <= 2.0):
+                    raise errors.validation_error(
+                        "temperature 必须为 0–2 之间的有限数字", {"field": field}
+                    )
+                dirty[field] = number
+            elif field == "writer.max_tokens":
+                if value is None:
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    raise errors.validation_error("字段必须为数字", {"field": field})
+                if not math.isfinite(number) or number <= 0 or number != int(number):
+                    raise errors.validation_error("max_tokens 必须为正整数", {"field": field})
+                dirty[field] = int(number)
             elif field in {"wechat.appid", "wechat.author"}:
                 if value is not None and not isinstance(value, str):
                     raise errors.validation_error("字段必须为字符串", {"field": field})
@@ -399,10 +461,12 @@ class ConfigStore:
     def validate_style_data(self, data: dict) -> dict:
         """校验一份 style dict（结构化 JSON 或 YAML 解析后）并返回白名单收敛结果。
 
-        - 未知字段返回 ``warnings`` 列表（被忽略字段），不静默丢弃也不拒绝；
+        - 未知字段（含嵌套 ``blacklist.*``）返回 ``warnings`` 列表（点分名称），
+          不静默丢弃也不拒绝；
         - ``blacklist`` 同时接受数组与对象 ``{words, topics}``；
         - ``word_count`` 接受整数或字符串（如 ``"1800-2600"``）；
         - ``topics`` / ``reference_accounts`` 强制为字符串数组；
+        - 字段类型错误抛 ``VALIDATION_ERROR``（调用方决定如何映射行号）；
         - 返回 ``(style, warnings)``，style 只含白名单字段。
         """
         warnings: list[str] = []
@@ -428,7 +492,7 @@ class ConfigStore:
                 else:
                     raise self._style_field_error(field, f"{field} 必须为数组")
             elif field == "blacklist":
-                style[field] = self._normalize_blacklist(value)
+                style[field] = self._normalize_blacklist(value, warnings)
             elif field == "word_count":
                 style[field] = self._normalize_word_count(value)
             else:
@@ -442,10 +506,11 @@ class ConfigStore:
                     raise self._style_field_error(field, f"{field} 必须为字符串")
         return style, warnings
 
-    def _normalize_blacklist(self, value):
+    def _normalize_blacklist(self, value, warnings: list[str] | None = None):
         """blacklist 归一化：数组 → 字符串数组；对象 → ``{words, topics}``。
 
-        对象形态只保留 words/topics 两个键，其它键忽略（不拒绝、不落盘）。
+        对象形态只保留 words/topics 两个键，其它键以 ``blacklist.<key>`` 点分
+        名称记入 ``warnings``（可见，不静默丢弃、不落盘）。
         """
         if value is None:
             return []
@@ -455,14 +520,17 @@ class ConfigStore:
             words = value.get("words")
             topics = value.get("topics")
             out: dict = {}
+            for key in value:
+                if key not in {"words", "topics"} and warnings is not None:
+                    warnings.append(f"blacklist.{key}")
             if isinstance(words, list):
                 out["words"] = [str(v).strip() for v in words if str(v).strip()]
             elif words is not None:
-                raise self._style_field_error("blacklist", "blacklist.words 必须为数组")
+                raise self._style_field_error("blacklist.words", "blacklist.words 必须为数组")
             if isinstance(topics, list):
                 out["topics"] = [str(v).strip() for v in topics if str(v).strip()]
             elif topics is not None:
-                raise self._style_field_error("blacklist", "blacklist.topics 必须为数组")
+                raise self._style_field_error("blacklist.topics", "blacklist.topics 必须为数组")
             return out
         raise self._style_field_error("blacklist", "blacklist 必须为对象或数组")
 
@@ -513,10 +581,11 @@ class ConfigStore:
                 raise errors.validation_error(
                     "style.yaml 超过 64KB 大小上限", {"field": "yaml"}
                 )
+            # 先解析+校验，通过后**原样落盘提交的文本**（保真注释/空行/引号形式），
+            # 不重新序列化，保证 GET raw 与提交逐字节相等。
             data = self.parse_style_yaml(text)
-            style, warnings = self.validate_style_data(data)
-            style.setdefault("version", 1)
-            self._write_style_data(style)
+            _style, warnings = self.validate_style_data(data)
+            self._write_style_raw(text)
             result = self.project_style()
             if warnings:
                 result["warnings"] = warnings
@@ -563,6 +632,10 @@ class ConfigStore:
             yaml.safe_dump(style, allow_unicode=True, sort_keys=False),
         )
 
+    def _write_style_raw(self, text: str) -> None:
+        """原样落盘 style.yaml 文本（整文件编辑路径，保真注释/空行/引号形式）。"""
+        paths.safe_write_root_file(self.home, "style.yaml", text)
+
     def parse_style_yaml(self, text: str) -> dict:
         """解析 style.yaml 文本；失败抛 422 并带行号 + 中文原因。"""
         try:
@@ -594,11 +667,25 @@ class ConfigStore:
             return context.line + 1
         return None
 
+    @staticmethod
+    def _find_key_line(text: str, field: str) -> int | None:
+        """在 YAML 原文中定位 ``field:`` 键所在行（1-based）；找不到返回 None。
+
+        用于给字段类型错误定位行号：按行扫描 ``key:``（顶层键）或 ``  key:``
+        （嵌套键，如 blacklist 下的 words/topics）前缀匹配。
+        """
+        for lineno, line in enumerate(text.split("\n"), start=1):
+            stripped = line.lstrip()
+            if stripped.startswith(field + ":") or stripped.startswith(field + " "):
+                return lineno
+        return None
+
     def validate_style_yaml(self, text: str) -> dict:
         """校验 style.yaml 文本（POST /style/validate）。
 
         返回 ``{valid, warnings, errors: [{line, field, message}]}``；解析失败
-        抛 422（带行号），字段问题以 errors 列表返回，不抛异常。
+        抛 422（带行号），字段问题以 errors 列表返回并带 ``line``（从原文扫描
+        键位置），message 保持中文原因。
         """
         if not isinstance(text, str):
             raise errors.validation_error("yaml 必须为字符串", {"field": "yaml"})
@@ -609,18 +696,24 @@ class ConfigStore:
         try:
             style, warnings = self.validate_style_data(data)
         except errors.ApiError as exc:
+            field = exc.details.get("field") or ""
+            # 点分字段（如 blacklist.words）取末段键名定位行号
+            key = field.rsplit(".", 1)[-1] if field else None
+            line = self._find_key_line(text, key) if key else None
             return {
                 "valid": False,
                 "warnings": [],
-                "errors": [{"field": exc.details.get("field"), "message": exc.message}],
+                "errors": [{"field": field, "line": line, "message": exc.message}],
             }
         return {"valid": True, "warnings": warnings, "errors": [], "fields": list(style.keys())}
 
     def generate_style_yaml(self, body: dict, backend) -> dict:
         """生成整份 style.yaml（POST /style/generate 逻辑层）。
 
-        校验入参（industry/audience/tone_hint 至少一项非空）→ 调写作模型 →
-        服务端解析→白名单裁剪补默认→重新序列化，绝不透出模型原文。不落盘。
+        校验入参（industry/audience/tone_hint 至少一项非空，否则 422）→ 调写作
+        模型。模型返回非法 YAML / 不可解析内容 → ``502 UPSTREAM_ERROR``（不是
+        422）；解析通过后服务端白名单裁剪补默认→重新序列化，绝不透出模型原文。
+        不落盘。
         """
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
@@ -641,13 +734,21 @@ class ConfigStore:
             )
 
         raw_text = backend.generate(industry or "", audience or "", tone_hint or "")
-        data = self.parse_style_yaml(raw_text)
+        # 模型返回不可解析内容 → 502 UPSTREAM_ERROR（生成失败归因到上游，不是入参 422）。
+        try:
+            data = self.parse_style_yaml(raw_text)
+        except errors.ApiError as exc:
+            raise errors.upstream_error(
+                "写作模型返回无法解析的风格 YAML", {"reason": "invalid_generated_yaml"}
+            ) from exc
         style, warnings = self.validate_style_data(data)
         style.setdefault("version", 1)
-        # 补齐白名单字段（缺省补默认，保证结构完整）
+        # 补齐白名单字段（缺省补默认，保证结构完整；blacklist 缺省补对象形态）
         for field in self.STYLE_FIELDS:
             if field not in style:
-                if field in {"topics", "reference_accounts", "blacklist"}:
+                if field == "blacklist":
+                    style[field] = {"words": [], "topics": []}
+                elif field in {"topics", "reference_accounts"}:
                     style[field] = []
                 else:
                     style[field] = ""

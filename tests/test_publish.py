@@ -555,12 +555,192 @@ def test_publish_reconcile_without_media_id_manual_review(monkeypatch, tmp_path)
     assert "人工" in body["note"]
 
 
-def test_config_writer_readonly_rejected(monkeypatch, tmp_path):
+def test_config_writer_now_writable(monkeypatch, tmp_path):
+    """JEE-1946：writer 从只读放开为可写白名单；改 model 保存后回读一致。"""
     home = str(tmp_path)
     c = make_client(monkeypatch, home)
-    r = c.put("/api/v1/config", json={"writer": {"api_key": "x"}}, headers=post_headers(c))
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"provider": "openai", "model": "gpt-4o", "base_url": "https://api.openai.com/v1"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["provider"] == "openai"
+    assert body["writer"]["model"] == "gpt-4o"
+    assert body["writer"]["base_url"] == "https://api.openai.com/v1"
+
+
+def test_config_writer_custom_provider_roundtrip(monkeypatch, tmp_path):
+    """验收第 3 条：选 custom 填自建网关地址与模型名，保存后回读一致。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"provider": "custom", "model": "my-model", "base_url": "https://gw.example.com/v1"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["provider"] == "custom"
+    assert body["writer"]["model"] == "my-model"
+    assert body["writer"]["base_url"] == "https://gw.example.com/v1"
+
+
+def test_config_writer_api_key_never_echoed(monkeypatch, tmp_path):
+    """writer.api_key 只写不读：响应与回读均无明文、无末四位，仅 api_key_configured。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    secret = "SK-WRITER-PLAIN-9876543210"
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"api_key": secret, "model": "my-model"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    assert secret not in json.dumps(r.json())
+    assert "9876543210" not in json.dumps(r.json())
+
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is True
+    assert "api_key" not in body["writer"]
+    assert secret not in json.dumps(body)
+    assert "9876543210" not in json.dumps(body)
+
+
+def test_config_writer_env_managed_409(monkeypatch, tmp_path):
+    """writer 字段被环境变量接管时写入返回 409 ENV_MANAGED，整包不局部提交。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "env-model")
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"model": "web-model", "provider": "openai"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "ENV_MANAGED"
+    # env_managed 错误体沿用 image 既有结构（接管字段与变量名随 message 返回）
+    assert r.json()["message"]["field"] == "writer.model"
+    assert r.json()["message"]["env"] == "WEWRITE_WRITER_MODEL"
+    # 整包失败：provider 也不得提交
+    assert c.get("/api/v1/config").json()["writer"]["provider"] == "deepseek"
+
+
+def test_config_writer_temperature_max_tokens_validation(monkeypatch, tmp_path):
+    """temperature / max_tokens 数值校验：非法值整包 422，合法值回读一致。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    # max_tokens 非正整数拒绝
+    r = c.put("/api/v1/config", json={"writer": {"max_tokens": -1}}, headers=post_headers(c))
     assert r.status_code == 422
     assert r.json()["code"] == "VALIDATION_ERROR"
+    # 合法值保存回读
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"temperature": 0.7, "max_tokens": 2048}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["temperature"] == 0.7
+    assert body["writer"]["max_tokens"] == 2048
+
+
+def test_config_writer_temperature_boundaries(monkeypatch, tmp_path):
+    """temperature 边界：0/2 通过，-1/2.1/"Infinity"/"NaN" 均 422 且不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+
+    # 边界通过
+    for ok_val in (0, 2):
+        r = c.put("/api/v1/config", json={"writer": {"temperature": ok_val}}, headers=post_headers(c))
+        assert r.status_code == 200, f"temperature={ok_val} 应通过"
+
+    # 越界 / 非有限值拒绝
+    for bad in (-1, 2.1, "Infinity", "NaN", "-Infinity"):
+        r = c.put("/api/v1/config", json={"writer": {"temperature": bad}}, headers=post_headers(c))
+        assert r.status_code == 422, f"temperature={bad} 应 422"
+        assert r.json()["code"] == "VALIDATION_ERROR"
+    # 失败后 config.yaml 未被改写（仍保持上一次合法保存的 temperature=2）
+    assert c.get("/api/v1/config").json()["writer"]["temperature"] == 2
+
+
+def test_config_writer_max_tokens_boundaries(monkeypatch, tmp_path):
+    """max_tokens 边界：1/4000 通过，0/-5/1.5/"Infinity"/"NaN"/"1e999" 均 422 不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+
+    for ok_val in (1, 4000):
+        r = c.put("/api/v1/config", json={"writer": {"max_tokens": ok_val}}, headers=post_headers(c))
+        assert r.status_code == 200, f"max_tokens={ok_val} 应通过"
+
+    for bad in (0, -5, 1.5, "Infinity", "NaN", "1e999"):
+        r = c.put("/api/v1/config", json={"writer": {"max_tokens": bad}}, headers=post_headers(c))
+        assert r.status_code == 422, f"max_tokens={bad!r} 应 422"
+        assert r.json()["code"] == "VALIDATION_ERROR"
+    assert c.get("/api/v1/config").json()["writer"]["max_tokens"] == 4000
+
+
+def test_config_writer_api_key_env_only_configured(monkeypatch, tmp_path):
+    """env-only：只设 WEWRITE_WRITER_API_KEY、config.yaml 无 key → api_key_configured True。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    monkeypatch.setenv("WEWRITE_WRITER_API_KEY", "sk-env-only")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is True
+    # 投影/响应无明文、无末四位
+    assert "sk-env-only" not in json.dumps(body)
+    assert "api_key" not in body["writer"]
+    # env_managed 标记保持（字段仍标为 env 接管）
+    managed = {m["field"]: m["env"] for m in body["env_managed"]}
+    assert managed.get("writer.api_key") == "WEWRITE_WRITER_API_KEY"
+
+
+def test_config_writer_api_key_env_empty_string_wins_over_file(monkeypatch, tmp_path):
+    """空串 env 接管：文件里有密钥 + WEWRITE_WRITER_API_KEY="" → api_key_configured False。
+
+    投影必须与 worker `_writer_env()` 一致：env 存在即接管（空串表示未设置），
+    不得回落到文件密钥，否则页面提示与真实运行结果相反。
+    """
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    # 先写文件密钥（投影曾为 true）
+    c.put("/api/v1/config", json={"writer": {"api_key": "SK-FILE-SECRET"}}, headers=post_headers(c))
+    assert c.get("/api/v1/config").json()["writer"]["api_key_configured"] is True
+
+    monkeypatch.setenv("WEWRITE_WRITER_API_KEY", "")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is False
+    # 投影与 worker _writer_env() 注入结果一致：空串 env → worker 不注入该字段
+    from app.worker.executor import _writer_env
+
+    injected = _writer_env({"writer": {"api_key": "SK-FILE-SECRET"}})
+    assert "WEWRITE_WRITER_API_KEY" not in injected
+    # env_managed 仍列出（存在即接管）
+    managed = {m["field"]: m["env"] for m in body["env_managed"]}
+    assert managed.get("writer.api_key") == "WEWRITE_WRITER_API_KEY"
+
+
+def test_config_writer_scalar_env_empty_string_wins_over_file(monkeypatch, tmp_path):
+    """model 等标量字段同口径：WEWRITE_WRITER_MODEL="" + 文件 model=file-model → 投影为空串。
+
+    与 worker `_writer_env()` 一致：env 存在即以其为准（空串表示未设置），
+    不回落到文件值；worker 也不注入该字段（子进程读到空串，走上游默认）。
+    """
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    c.put("/api/v1/config", json={"writer": {"model": "file-model"}}, headers=post_headers(c))
+    assert c.get("/api/v1/config").json()["writer"]["model"] == "file-model"
+
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["model"] == ""
+    # worker 也不注入该字段（env 存在即接管）
+    from app.worker.executor import _writer_env
+
+    injected = _writer_env({"writer": {"model": "file-model"}})
+    assert "WEWRITE_WRITER_MODEL" not in injected
 
 
 def test_publish_reconcile_text_only_consistent(monkeypatch, tmp_path):

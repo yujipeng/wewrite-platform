@@ -78,6 +78,14 @@ def test_reference_yaml_saves_and_roundtrips(tmp_path):
     assert data["reference_accounts"] == []
 
 
+def test_yaml_put_preserves_raw_bytes(tmp_path):
+    """返修第 1 条：含注释的 YAML 提交后 raw 逐字节相等（不重新序列化）。"""
+    store = _store(str(tmp_path))
+    text = "# 顶部注释\nname: \"带引号\"\n\n# 空行与注释\ntone: 专业\nblacklist:\n  words: [\"震惊\"]\n  topics: [\"宗教\"]\n"
+    result = store.put_style({"yaml": text})
+    assert result.get("raw") == text, "raw 应逐字节等于提交文本"
+
+
 def test_blacklist_array_still_supported(tmp_path):
     """旧形态 blacklist 数组仍可保存。"""
     store = _store(str(tmp_path))
@@ -121,11 +129,21 @@ def test_validate_unknown_field_warning(tmp_path):
 
 
 def test_validate_field_error_reported(tmp_path):
-    """字段类型错误：validate 返回 errors 列表（不抛 500）。"""
+    """字段类型错误：validate 返回 errors 列表（不抛 500），且带 line。"""
     store = _store(str(tmp_path))
-    result = store.validate_style_yaml("blacklist: 123\n")
+    result = store.validate_style_yaml("name: ok\nblacklist: 123\n")
     assert result["valid"] is False
-    assert any("blacklist" in (e.get("field") or "") for e in result["errors"])
+    err = result["errors"][0]
+    assert "blacklist" in (err.get("field") or "")
+    assert err.get("line") == 2, f"应定位到第 2 行，实际 {err.get('line')}"
+
+
+def test_validate_nested_unknown_field_warning(tmp_path):
+    """返修第 3 条：blacklist.foo 嵌套未知键进 warnings（点分名称）。"""
+    store = _store(str(tmp_path))
+    result = store.validate_style_yaml("blacklist:\n  words: []\n  foo: 1\n")
+    assert result["valid"] is True
+    assert "blacklist.foo" in result["warnings"]
 
 
 def test_yaml_size_limit_422(tmp_path):
@@ -171,6 +189,31 @@ def test_generate_sanitizes_to_whitelist(tmp_path):
     assert "foo" not in parsed
     assert parsed["tone"] == "专业"
     assert "name" in parsed  # 白名单字段全量补默认
+
+
+def test_generate_blacklist_defaults_to_object(tmp_path):
+    """返修第 2 条：模型只返回 name 时，输出 blacklist 为对象形态含 words/topics。"""
+    store = _store(str(tmp_path))
+    result = store.generate_style_yaml(
+        {"industry": "科技"}, FakeBackend("name: 只有名称\n")
+    )
+    parsed = yaml.safe_load(result["yaml"])
+    assert isinstance(parsed["blacklist"], dict), "blacklist 应补为对象形态"
+    assert "words" in parsed["blacklist"] and "topics" in parsed["blacklist"]
+
+
+def test_generate_invalid_yaml_returns_502(tmp_path):
+    """返修第 5 条：模型返回非法 YAML → 502 UPSTREAM_ERROR（非 422）。"""
+    store = _store(str(tmp_path))
+    try:
+        store.generate_style_yaml(
+            {"industry": "科技"}, FakeBackend("tone: [oops")
+        )
+    except errors.ApiError as exc:
+        assert exc.code == "UPSTREAM_ERROR"
+        assert exc.status_code == 502
+    else:
+        raise AssertionError("应当抛 502 UPSTREAM_ERROR")
 
 
 # ---------- brief 注入（验收第 10 条） ----------

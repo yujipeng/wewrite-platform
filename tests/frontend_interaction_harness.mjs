@@ -153,6 +153,26 @@ function findByText(root, text) {
   return out;
 }
 
+function findByTag(root, tag) {
+  const out = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (n.tagName === tag.toUpperCase()) out.push(n);
+    (n.children || []).forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
+// 派发某按钮的 click（返回是否派发成功）；渲染动作是 fire-and-forget，配合宿主 macrotask 冲刷。
+async function clickButton(root, text) {
+  const btn = findByText(root, text).find((n) => n.tagName === "BUTTON");
+  const handler = btn && btn.listeners && btn.listeners["click"] && btn.listeners["click"][0];
+  if (handler) await Promise.resolve(handler());
+  await new Promise((r) => setTimeout(r, 10));
+  return !!handler;
+}
+
 // 可注入 fetch 的最小上下文。
 // fetchImpl: (path, opts) => 返回对象 { ok, status, statusText, json } 或直接 throw。
 function makeContext({ hash, fetchImpl }) {
@@ -512,11 +532,121 @@ async function testDetailPublishConsistency() {
   check("详情页授权成功后 detail 导航仍高亮", detailNav.classList.contains("active"));
 }
 
+// ============ 7) P3 预览：来源下拉标注可用性 + 默认选可用来源 + 404 按 reason 分流 ============
+async function testPreviewSourceAvailability() {
+  const runId = "20261026-080000-a1b2c3";
+  const artifacts = { article: true, draft: false, illustrated_article: false };
+
+  // 场景 A：只有 article，无 draft → 默认选中 article，draft/带图版标「（未生成）」且 disabled
+  {
+    const { sandbox, els } = makeContext({
+      hash: `#/runs/${runId}/preview`,
+      fetchImpl: async (path, opts) => {
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === `/api/v1/runs/${runId}`) return okJson({ run_id: runId, artifacts });
+        if (path === "/api/v1/themes") return okJson({ themes: [{ name: "professional-clean", description: "" }] });
+        if (path === "/api/v1/preview") {
+          // 渲染成功（正常路径不 404）
+          return okJson({ html: "<h1>预览</h1>", paste_safe_html: "", title: "T", digest: "D", source_sha256: "x".repeat(64), filtered_count: 0 });
+        }
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPreview(" + JSON.stringify(runId) + ")");
+    const appEl = els["app"];
+    const selects = findByTag(appEl, "select");
+    const sourceSel = selects[0];
+    const options = sourceSel.children.filter((c) => c.tagName === "OPTION");
+    check("预览：source 下拉选项含（未生成）标注", options.some((o) => String(o.textContent).includes("（未生成）")));
+    const draftOpt = options.find((o) => o.getAttribute("value") === "draft");
+    const articleOpt = options.find((o) => o.getAttribute("value") === "article");
+    check("预览：draft 不可选(disabled)", draftOpt && draftOpt.disabled === true);
+    check("预览：默认选中 article（第一个可用来源）", sourceSel.value === "article" && articleOpt && articleOpt.disabled === false);
+    // 正常路径渲染成功：iframe 出现且无 404 提示（点渲染按钮触发，初始自动渲染受 theme 加载时序影响）
+    await clickButton(appEl, "渲染预览");
+    const text = collectText(appEl);
+    check("预览：正常路径无「产物不存在或尚未生成」", !text.includes("产物不存在或尚未生成"));
+    const iframes = findByTag(appEl, "iframe");
+    check("预览：正常路径渲染出 iframe", iframes.length > 0);
+  }
+
+  // 场景 B：无任何产物 → 渲染按钮禁用 + 引导文案
+  {
+    const { sandbox, els } = makeContext({
+      hash: `#/runs/${runId}/preview`,
+      fetchImpl: async (path) => {
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === `/api/v1/runs/${runId}`) return okJson({ run_id: runId, artifacts: { article: false, draft: false, illustrated_article: false } });
+        if (path === "/api/v1/themes") return okJson({ themes: [{ name: "professional-clean", description: "" }] });
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPreview(" + JSON.stringify(runId) + ")");
+    const appEl = els["app"];
+    const text = collectText(appEl);
+    check("预览：无产物时按钮禁用", findByText(appEl, "渲染预览").some((b) => b.disabled === true));
+    check("预览：无产物时显示引导文案", text.includes("该任务还没有可预览的正文"));
+  }
+
+  // 场景 C：404 artifact_missing → 提示可切换来源（不再是「产物不存在或尚未生成」）
+  {
+    const { sandbox, els } = makeContext({
+      hash: `#/runs/${runId}/preview`,
+      fetchImpl: async (path, opts) => {
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === `/api/v1/runs/${runId}`) return okJson({ run_id: runId, artifacts });
+        if (path === "/api/v1/themes") return okJson({ themes: [{ name: "professional-clean", description: "" }] });
+        if (path === "/api/v1/preview") {
+          return errJson(404, { code: "NOT_FOUND", message: "资源不存在", details: { reason: "artifact_missing", artifact: "draft", run_id: runId } });
+        }
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPreview(" + JSON.stringify(runId) + ")");
+    const appEl = els["app"];
+    // 点渲染按钮触发 404（初始自动渲染受 theme 加载时序影响，故显式派发）
+    await clickButton(appEl, "渲染预览");
+    const text = collectText(appEl);
+    check("预览：404 artifact_missing 不再显示旧文案", !text.includes("产物不存在或尚未生成"));
+    check("预览：404 artifact_missing 显示可切换来源提示", text.includes("还没有生成") && text.includes("当前实际存在的来源"));
+  }
+
+  // 场景 D：404 theme_not_found → 主题提示
+  {
+    const { sandbox, els } = makeContext({
+      hash: `#/runs/${runId}/preview`,
+      fetchImpl: async (path, opts) => {
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === `/api/v1/runs/${runId}`) return okJson({ run_id: runId, artifacts });
+        if (path === "/api/v1/themes") return okJson({ themes: [{ name: "professional-clean", description: "" }] });
+        if (path === "/api/v1/preview") {
+          return errJson(404, { code: "NOT_FOUND", message: "资源不存在", details: { reason: "theme_not_found", theme: "no-such" } });
+        }
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderPreview(" + JSON.stringify(runId) + ")");
+    const appEl = els["app"];
+    await clickButton(appEl, "渲染预览");
+    const text = collectText(appEl);
+    check("预览：404 theme_not_found 显示主题提示", text.includes("不存在或已不可用"));
+  }
+}
+
 // ============ 主入口 ============
 (async () => {
   await testFourStates();
   await testPublishConsistency();
   await testDetailPublishConsistency();
+  await testPreviewSourceAvailability();
 
   const failed = checks.filter((c) => !c.ok);
   const summary = {

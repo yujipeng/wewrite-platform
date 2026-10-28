@@ -55,47 +55,38 @@ def test_p7_reconcile_entry_present(client):
 
 
 def test_p8_style_rendered(client):
-    """P8 写作风格字段渲染（不再只 GET 不展示）。"""
+    """P8 写作风格区块渲染（整文件 YAML 编辑器 + 保存动作）。"""
     js = _app_js(client)
     assert "/api/v1/style" in js
-    # 渲染了风格字段与保存动作
-    for field in ("风格名称", "行业", "目标受众", "语气", "写作人格", "保存写作风格"):
+    # 渲染了风格编辑器与保存动作
+    for field in ("写作风格", "保存"):
         assert field in js
     # PUT /style 有写入动作
     assert '"/api/v1/style"' in js or "/api/v1/style" in js
 
 
 def test_p8_style_grouped_and_options(client):
-    """JEE-1947：13 字段分 4 组、语气/声音/内容风格/封面风格为下拉 + 自定义、标签输入、字数档位。"""
+    """JEE-1947：写作风格改为整文件 YAML 编辑器（加载/智能生成/校验/保存）。"""
     js = _app_js(client)
-    # 4 组标题
-    for group in ("定位", "方向", "语气与风格", "产出规格"):
-        assert group in js
-    # 下拉 + 自定义（常用值选项）
-    assert "自定义…" in js
-    assert '"tone", "语气", "select"' in js
-    for v in ("专业", "亲和", "犀利", "幽默", "讲故事"):
-        assert v in js
-    for v in ("第一人称", "第三人称", "编辑口吻"):
-        assert v in js
-    for v in ("干货清单", "深度分析", "案例复盘", "观点评论"):
-        assert v in js
-    for v in ("极简", "大字报", "插画", "实拍"):
-        assert v in js
-    # 标签式输入
-    assert "tag-chip-input" in js
-    assert "输入后回车/逗号添加" in js
-    # 字数档位
-    assert "[800, 1200, 2000, 3000]" in js and '" 字"' in js
-    # 写作主题与排版主题区分文案
+    # 整文件编辑器 textarea
+    assert "style-yaml-editor" in js
+    assert 'el("textarea"' in js
+    # 四个操作
+    for btn in ("加载当前配置", "智能生成", "校验", "保存"):
+        assert btn in js
+    # 主题区分文案
     assert "写作主题" in js and "排版主题" in js
+    # 未保存变更提示
+    assert "beforeunload" in js
+    assert "__styleDirty" in js
 
 
 def test_p8_style_ai_generate_entry(client):
     """JEE-1947：智能生成风格入口，未配置模型时按钮禁用 + 中文提示。"""
     js = _app_js(client)
     assert "/api/v1/style/generate" in js
-    assert "智能生成风格" in js
+    assert "/api/v1/style/validate" in js
+    assert "智能生成" in js
     assert "需先配置写作模型" in js
     assert "未自动保存" in js
     assert "writer_configured" in js

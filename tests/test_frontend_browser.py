@@ -319,8 +319,8 @@ def _style_control(page, label):
     return page.locator("dt", has_text=label).locator("xpath=./following-sibling::dd[1]")
 
 
-def test_p8_style_grouped_and_tone_select_custom_save(browser_session):
-    """JEE-1947 真浏览器验证：写作风格分 4 组、tone 为下拉且自定义值可保存回读一致。"""
+def test_p8_style_yaml_editor_render_and_save(browser_session):
+    """JEE-1947 真浏览器验证：整文件 YAML 编辑器渲染，参考格式粘贴保存成功。"""
     import json
     import urllib.request
 
@@ -337,73 +337,54 @@ def test_p8_style_grouped_and_tone_select_custom_save(browser_session):
     page.goto(f"{base}/#/config", wait_until="networkidle")
     page.wait_for_timeout(400)
 
-    # 1) 分组渲染：4 个 .style-group，组标题齐全
-    groups = page.locator(".style-group")
-    assert groups.count() == 4, f"应分 4 组，实际 {groups.count()}"
-    for title in ("定位", "方向", "语气与风格", "产出规格"):
-        assert page.locator(".style-group-head", has_text=title).count() == 1, f"缺少组标题 {title}"
+    # 1) 整文件 YAML 编辑器 textarea 渲染，四个操作按钮齐全
+    editor = page.locator("textarea.style-yaml-editor")
+    assert editor.count() == 1, "应渲染 YAML 全文编辑器"
+    for btn in ("加载当前配置", "智能生成", "校验"):
+        assert page.locator("button", has_text=btn).count() >= 1, f"缺少按钮 {btn}"
+    # 「保存」按钮精确匹配（避免命中「保存配置」）
+    save_btns = page.locator("button").evaluate_all(
+        "(els) => els.map((e) => e.textContent.trim()).filter((t) => t === '保存')"
+    )
+    assert "保存" in save_btns, "缺少「保存」按钮"
 
-    # 2) tone 为下拉（select），含常用值与自定义…
-    tone_cell = _style_control(page, "语气")
-    tone_select = tone_cell.locator("select")
-    assert tone_select.count() == 1, "语气应为下拉选择框"
-    tone_options = tone_select.locator("option").all_inner_texts()
-    assert "专业" in tone_options and "自定义…" in tone_options
-
-    # 3) 自定义值保存后回读一致（不被下拉拒掉）
-    tone_select.select_option("__custom__")
-    custom_input = tone_cell.locator('input[placeholder="输入自定义语气"]')
-    assert custom_input.count() == 1, "选自定义…后应出现自定义输入框"
-    custom_input.fill("我的自定义语气")
-
-    save_btn = page.locator("button", has_text="保存写作风格")
-    save_btn.click()
+    # 2) 参考格式（blacklist 对象 + word_count 字符串 + reference_accounts）原样粘贴保存成功
+    reference = (
+        "name: 社会现象心理分析\n"
+        "blacklist:\n  words: [震惊]\n  topics: [宗教]\n"
+        "word_count: \"1800-2600\"\n"
+        "reference_accounts: []\n"
+        "tone: 像朋友聊天\n"
+    )
+    editor.fill(reference)
+    # 精确匹配「保存」按钮（排除「保存配置」）
+    page.get_by_role("button", name="保存", exact=True).first.click()
     page.wait_for_timeout(900)
 
     saved = read_style()
-    assert saved.get("tone") == "我的自定义语气", f"tone 回读应为自定义值，实际 {saved.get('tone')}"
+    assert saved.get("word_count") == "1800-2600", f"word_count 应为字符串，实际 {saved.get('word_count')}"
+    assert saved.get("reference_accounts") == [], "reference_accounts 应保留"
+    assert isinstance(saved.get("blacklist"), dict), "blacklist 应为对象形态"
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
 
 
-def test_p8_style_tags_and_word_count_buttons(browser_session):
-    """JEE-1947 真浏览器验证：topics 标签输入（回车成标签）与字数档位按钮。"""
-    import json
-    import urllib.request
-
+def test_p8_style_validate_error_shows_line(browser_session):
+    """JEE-1947 真浏览器验证：校验坏 YAML 显示中文原因（不 500）。"""
     ctx = browser_session["ctx"]
     base = browser_session["base"]
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page_errors: list[str] = []
     page.on("pageerror", lambda e: page_errors.append(str(e)))
 
-    def read_style():
-        data = urllib.request.urlopen(f"{base}/api/v1/style", timeout=5)
-        return json.loads(data.read().decode("utf-8"))
-
     page.goto(f"{base}/#/config", wait_until="networkidle")
     page.wait_for_timeout(400)
 
-    # 标签输入：topics 输入 "AI，创业" 回车 → 2 个标签
-    topics_cell = _style_control(page, "话题")
-    tag_input = topics_cell.locator('input[placeholder="输入后回车/逗号添加"]')
-    assert tag_input.count() == 1, "话题应为标签输入"
-    tag_input.fill("AI，创业")
-    tag_input.press("Enter")
-    assert topics_cell.locator(".tag-chip").count() == 2, "应生成 2 个标签"
-
-    # 字数档位：点「2000 字」→ word_count 变 2000
-    word_cell = _style_control(page, "字数")
-    btn2000 = word_cell.locator("button", has_text="2000 字")
-    assert btn2000.count() == 1, "应有 2000 字档位按钮"
-    btn2000.click()
-    word_input = word_cell.locator('input[type="number"]')
-    assert word_input.input_value() == "2000", "word_count 应变为 2000"
-
-    save_btn = page.locator("button", has_text="保存写作风格")
-    save_btn.click()
+    editor = page.locator("textarea.style-yaml-editor")
+    editor.fill("name: ok\n  bad-indent: [unclosed\n")
+    page.locator("button", has_text="校验").click()
     page.wait_for_timeout(900)
 
-    saved = read_style()
-    assert saved.get("topics") == ["AI", "创业"], f"topics 回读应为 ['AI','创业']，实际 {saved.get('topics')}"
-    assert saved.get("word_count") == 2000, f"word_count 回读应为 2000，实际 {saved.get('word_count')}"
+    # 校验失败：出现中文原因提示
+    body_text = page.inner_text("#app")
+    assert "校验失败" in body_text or "YAML" in body_text or "语法" in body_text
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

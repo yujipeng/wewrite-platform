@@ -93,6 +93,52 @@ def _build_brief_text(state: dict) -> str:
     )
 
 
+def _build_brief_text(state: dict, style: dict | None = None) -> str:
+    """拼写作 brief（选题 + 写作风格）。
+
+    ``style`` 来自 ``style.yaml``，注入写作模型 brief，否则风格配置不会生效。
+    ``blacklist`` 兼容数组（旧）与对象 ``{words, topics}``（新）两种形态。
+    """
+    topic = state.get("topic") or {}
+    visual = state.get("visual") or {}
+    title = topic.get("title") or "未命名文章"
+    framework = topic.get("framework_hint") or "问题-证据-行动"
+    parts = [
+        "# 选题\n",
+        f"标题：{title}\n",
+        f"切入点：{topic.get('source') or ''}\n",
+        f"框架：{framework}\n",
+        f"关键词：{', '.join(topic.get('keywords') or [])}\n",
+        f"视觉模式：{visual.get('mode') or 'none'}，最大图片数：{visual.get('max_images') or 0}\n",
+    ]
+
+    if style and isinstance(style, dict):
+        parts.append("\n# 写作风格\n")
+        for field in ("name", "industry", "target_audience", "tone", "voice",
+                      "content_style", "writing_persona", "cover_style", "author"):
+            value = style.get(field)
+            if isinstance(value, str) and value.strip():
+                parts.append(f"{field}：{value}\n")
+        topics = style.get("topics")
+        if isinstance(topics, list) and topics:
+            parts.append(f"话题方向：{', '.join(str(t) for t in topics)}\n")
+        word_count = style.get("word_count")
+        if word_count not in (None, "", 0):
+            parts.append(f"目标字数：{word_count}\n")
+        blacklist = style.get("blacklist")
+        if isinstance(blacklist, list) and blacklist:
+            parts.append(f"禁忌词：{', '.join(str(b) for b in blacklist)}\n")
+        elif isinstance(blacklist, dict):
+            words = blacklist.get("words") or []
+            topics_bl = blacklist.get("topics") or []
+            if words:
+                parts.append(f"禁忌词：{', '.join(str(w) for w in words)}\n")
+            if topics_bl:
+                parts.append(f"禁忌话题：{', '.join(str(t) for t in topics_bl)}\n")
+
+    return "".join(parts)
+
+
 class Worker:
     """job 执行器。可注入 writer/reviewer/image 后端与 wechat adapter（测试）。"""
 
@@ -173,7 +219,9 @@ class Worker:
         self.store.heartbeat(job["job_id"], step="write")
         run_id = job["run_id"]
         state = _read_run_state(self.home, run_id)
-        brief_text = _build_brief_text(state)
+        # 读取 style.yaml 注入 brief，否则风格配置不会进入写作链路（JEE-1947）。
+        style = self._load_style()
+        brief_text = _build_brief_text(state, style)
 
         # staging 临时文件（与 article.md 同目录语义：先写 run 目录内临时名）
         staging_rel = f".article-{job['job_id']}.staging.md"
@@ -212,6 +260,12 @@ class Worker:
         state = _read_run_state(self.home, run_id)
         state.setdefault("artifacts", {})["article"] = f"runs/{run_id}/article.md"
         _write_run_state(self.home, run_id, state)
+
+    def _load_style(self) -> dict:
+        """读取 style.yaml（供 brief 注入）；缺失返回空 dict，不阻断写作。"""
+        from app.storage.config_store import ConfigStore
+
+        return ConfigStore(self.home).load_style()
 
     def _invoke_writer(self, job: dict, run_id: str, brief_rel: str, staging_rel: str) -> int:
         """把 brief 写到 staging 输出路径由后端处理；默认走子进程 llm-write。"""

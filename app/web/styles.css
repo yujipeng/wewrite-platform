@@ -472,28 +472,35 @@ dl.kv dd { margin: 0; }
 .candidate-card { display: flex; flex-direction: column; gap: 6px; }
 .scores { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; margin: 6px 0; }
 
-/* M4：P8 写作风格选项化 + 分组 + AI 引导（JEE-1947） */
-.style-group {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  margin: 12px 0;
-  overflow: hidden;
+/* M4：P8 写作风格整文件 YAML 编辑 + AI 引导（JEE-1947） */
+.style-yaml-editor {
+  width: 100%;
+  min-height: 320px;
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  resize: vertical;
+  tab-size: 2;
 }
-.style-group-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 14px;
-  background: var(--wash);
-  border-bottom: 1px solid var(--line);
-  font-weight: 600;
+.style-yaml-editor:focus {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(11, 125, 116, 0.12);
+}
+
+.style-validate-box {
+  margin: 10px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   font-size: 13px;
 }
-.style-group-head .hint { font-weight: 400; font-size: 12px; color: var(--muted); }
-.style-group-body { padding: 6px 14px; }
-.style-group-body dl.kv { grid-template-columns: 150px 1fr; }
 
-.style-select,
 .style-custom-input {
   padding: 6px 10px;
   border: 1px solid var(--border);
@@ -502,50 +509,6 @@ dl.kv dd { margin: 0; }
   width: 100%;
   background: var(--card);
 }
-.style-custom-input { margin-top: 6px; }
-
-.tag-input-wrap {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: #fff;
-  min-height: 36px;
-}
-.tag-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: var(--teal-bg);
-  border: 1px solid #bfe0dc;
-  color: var(--teal-dk);
-  border-radius: 999px;
-  padding: 2px 9px;
-  font-size: 12.5px;
-}
-.tag-chip .tag-remove {
-  border: none;
-  background: none;
-  color: var(--teal-dk);
-  font-size: 14px;
-  line-height: 1;
-  padding: 0 2px;
-  cursor: pointer;
-}
-.tag-chip-input {
-  flex: 1;
-  min-width: 90px;
-  border: none;
-  outline: none;
-  font-size: 13.5px;
-  background: transparent;
-}
-
-.word-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.word-btns .btn.sm { padding: 3px 10px; }
 
 .ai-generate-box {
   border: 1px dashed var(--teal);

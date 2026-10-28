@@ -609,17 +609,27 @@ def _style_generate_backend(request: Request):
     return getattr(request.app.state, "style_generate_backend", None) or writer_adapter.StyleGenerateBackend()
 
 
+@router.post("/api/v1/style/validate")
+async def validate_style(request: Request):
+    """校验 style.yaml 文本：返回语法/字段问题列表（行号 + 中文原因），不写盘。"""
+    body = await _read_body(request)
+    try:
+        return _config_store().validate_style_yaml(body.get("yaml", ""))
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
 @router.post("/api/v1/style/generate")
 async def generate_style(request: Request):
-    """智能生成写作风格草稿（可选 AI 引导入口）。
+    """智能生成整份 style.yaml（可选 AI 引导入口）。
 
-    出网调用写作模型，绝不落盘，只回显草稿供前端预览/修改；未配置写作模型返回
-    503 WRITER_NOT_CONFIGURED，调用失败返回 502 UPSTREAM_ERROR。
+    出网调用写作模型，绝不落盘，只回显经过白名单裁剪、重新序列化的 YAML 全文；
+    未配置写作模型返回 503 WRITER_NOT_CONFIGURED，调用失败返回 502 UPSTREAM_ERROR。
     """
     body = await _read_body(request)
     try:
         return await run_in_threadpool(
-            _config_store().generate_style_draft, body, _style_generate_backend(request)
+            _config_store().generate_style_yaml, body, _style_generate_backend(request)
         )
     except errors.ApiError as exc:
         return _error_response(exc)

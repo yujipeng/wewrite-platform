@@ -17,9 +17,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
+from app import auth
 from app.api.routes import router
 from app.domain import errors
-from app.middleware import CsrfStore, HostCsrfMiddleware
+from app.middleware import CsrfStore, HostCsrfMiddleware, SessionStore
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -72,6 +73,13 @@ async def _lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     csrf = CsrfStore()
+    sessions = SessionStore()
+    try:
+        users = auth.UserStore(os.environ.get("WEWRITE_USERS"))
+    except auth.UsernameInvalid:
+        # 配置非法时 fail closed：无任何可用账号，登录一律失败，不阻断启动。
+        users = auth.UserStore(None)
+
     app = FastAPI(
         title="wewrite-platform",
         version=__version__,
@@ -82,6 +90,8 @@ def create_app() -> FastAPI:
     )
 
     app.state.csrf = csrf
+    app.state.sessions = sessions
+    app.state.users = users
     app.state.server_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     app.state.start_worker = True
 
@@ -96,6 +106,16 @@ def create_app() -> FastAPI:
     # 静态资源：css/js 等
     app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
+    # 登录页（公网域名未登录时的落地页）
+    @app.get("/login")
+    async def login_page(request: Request):
+        return FileResponse(str(web_dir / "login.html"))
+
+    # 登出页：先由 POST /auth/logout 撤销会话，再回到登录页
+    @app.get("/logout")
+    async def logout_page(request: Request):
+        return FileResponse(str(web_dir / "logout.html"))
+
     @app.get("/")
     async def index():
         return FileResponse(str(web_dir / "index.html"))
@@ -105,8 +125,8 @@ def create_app() -> FastAPI:
     async def run_page(run_id: str):
         return FileResponse(str(web_dir / "index.html"))
 
-    # 挂载中间件：Host 校验 + 变更方法 CSRF/Content-Type 校验
-    app.add_middleware(HostCsrfMiddleware, csrf=csrf)
+    # 挂载中间件：Host 校验 + 登录鉴权 + 变更方法 CSRF/Content-Type 校验
+    app.add_middleware(HostCsrfMiddleware, csrf=csrf, sessions=sessions, users=users)
 
     return app
 

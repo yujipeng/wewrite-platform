@@ -30,6 +30,24 @@ wewrite-platform serve --port 8765
 
 状态根默认 `~/.wewrite`，可用 `WEWRITE_HOME` 覆盖。热榜补抓：`wewrite-platform hotspots refresh [--limit N]`。
 
+### 公网域名白名单与登录鉴权（S8-c）
+
+回环地址（`127.0.0.1` / `localhost` / `[::1]`）保持免登录，本机单机工作流不受影响。经反代暴露公网域名时：
+
+- **域名白名单**：环境变量 `ALLOWED_HOSTS`（逗号分隔，精确匹配），例如 `ALLOWED_HOSTS=temp.os-uat.tcredit.com`。未列入白名单的 Host 一律 403。
+- **登录鉴权**：白名单内、非回环的域名访问任意页面/接口时，未登录会 302 跳 `/login`（API 返回 401 `AUTH_REQUIRED`）。`/healthz` 与 `/static/*` 保持免鉴权。
+- **账号**：环境变量 `WEWRITE_USERS`，逗号分隔 `username:secret`，例如 `alice:$2b$12$...`。secret 支持 **bcrypt 哈希**（推荐，`$2b$` 前缀），也支持明文（仅限内网/本地临时使用，不推荐）。未配置任何账号时登录一律失败（fail closed）。
+- **会话**：登录成功签发 HttpOnly + SameSite 会话 cookie（HTTPS 域名自动追加 `Secure`），进程内存保存、重启失效。登出走 `POST /auth/logout` 或访问 `/logout`。
+- **CSRF 保留**：白名单域名放行后，变更方法仍强制同源 `Origin`（scheme + host + 端口一致）+ `Sec-Fetch-Site: same-origin` + `X-CSRF-Token`，不回退、不全局关闭。
+
+生成 bcrypt 哈希（供运维配置真实账号）：
+
+```bash
+python3 -c "import bcrypt; print(bcrypt.hashpw('你的密码'.encode('utf-8'), bcrypt.gensalt()).decode())"
+```
+
+
+
 ## 测试
 
 测试运行口径（venv 建在 checkout 外 + 清华镜像 + `-e ".[test]"`）唯一化在 `docs/dev-test-env.md`，跑测试一律照那里装，不要用系统 `python3` 直跑。快速版：

@@ -4,9 +4,10 @@
 
 ## 结论摘要
 
-- 共 **29** 个运行依赖，许可证**均无 GPL / AGPL 强 copyleft 项**，未发现禁用许可。
+- 共 **31** 个运行依赖，许可证**均无 GPL / AGPL 强 copyleft 项**，未发现禁用许可。
 - 2 个依赖为 **LGPL-3.0-or-later**（弱 copyleft）：`cssutils`、`encutils`，均由 `wewrite==4.2.1` 传递引入，仅以库形式 import、未修改其源码。若目标机许可证政策将 LGPL 也纳入禁用清单，需单独裁决（见「需要裁决项」）。
-- 其余 27 个为宽松许可（MIT / BSD / Apache-2.0 / MPL-2.0 / PSF-2.0 / 0BSD / MIT-CMU）。
+- 其余 29 个为宽松许可（MIT / BSD / Apache-2.0 / MPL-2.0 / PSF-2.0 / 0BSD / MIT-CMU）。
+- 本次 S8-c（JEE-1934）新增 `bcrypt==5.0.0`（Apache-2.0）与 `python-multipart==0.0.32`（Apache-2.0），均为宽松许可，无 copyleft 项。
 
 ## 完整清单（按许可证分组）
 
@@ -15,6 +16,7 @@
 | 0BSD | chardet |
 | Apache-2.0 | opentelemetry-api |
 | Apache Software License | requests |
+| Apache-2.0 | bcrypt, python-multipart |
 | BSD-2-Clause | Pygments |
 | BSD-3-Clause | Markdown, click, idna, starlette, uvicorn |
 | LGPL-3.0-or-later | cssutils, encutils |
@@ -31,6 +33,7 @@
 | annotated-doc | 0.0.5 | MIT |
 | annotated-types | 0.8.0 | MIT |
 | anyio | 4.15.1 | MIT |
+| bcrypt | 5.0.0 | Apache-2.0 |
 | beautifulsoup4 | 4.15.0 | MIT License |
 | certifi | 2026.10.23 | Mozilla Public License 2.0 (MPL 2.0) |
 | chardet | 7.7.0 | 0BSD |
@@ -48,6 +51,7 @@
 | pydantic | 2.14.1 | MIT |
 | pydantic_core | 2.50.1 | MIT |
 | Pygments | 2.21.0 | BSD-2-Clause |
+| python-multipart | 0.0.32 | Apache-2.0 |
 | PyYAML | 6.0.3 | MIT License |
 | requests | 2.34.2 | Apache Software License |
 | soupsieve | 2.10 | MIT |

@@ -1,25 +1,40 @@
-"""Host / CSRF / Content-Type 中间件基线。
+"""Host / CSRF / Content-Type / 登录鉴权中间件。
 
-设计第 3 节：
-- Host 只允许 ``127.0.0.1:<port>``、``[::1]:<port>``、``localhost:<port>``（防 DNS rebinding）。
+设计第 3 节 + S8-c（JEE-1934）扩展：
+
+- Host 白名单 = 回环精确白名单（``127.0.0.1`` / ``[::1]`` / ``localhost``）∪
+  环境变量 ``ALLOWED_HOSTS``（逗号分隔，精确匹配、大小写不敏感）。回环地址保持
+  免登录；公网域名（白名单内非回环）必须先过登录鉴权。
 - 变更方法（POST/PUT/DELETE）强制 ``Content-Type: application/json``、同源 ``Origin``、
-  ``Sec-Fetch-Site: same-origin``、``X-CSRF-Token``。
-- 普通 GET 与 ``/healthz`` 只做 Host 校验。
-- 无 CORS。M1 落地这层，后续里程碑复用。
+  ``Sec-Fetch-Site: same-origin``、``X-CSRF-Token``；``/auth/login`` 与
+  ``/auth/logout`` 例外（登录无会话、登出幂等，不做 CSRF 与 JSON Content-Type 要求）。
+- 普通 GET 与 ``/healthz`` 只做 Host 校验；公网域名下 ``/static/*``、``/healthz``、
+  ``/login``、``/auth/login``、``/auth/logout`` 免登录，其余页面 302 跳登录、API 401。
+- Origin/Referer 同源校验：公网域名按 scheme + host + 端口比对（http 默认 80、
+  https 默认 443），回环保持原有行为。无 CORS。
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import secrets
+import time
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from app import auth
 from app.domain import errors
 
-# 同源 Origin 的白名单主机（不含端口，端口随请求动态校验）
-_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+# 同源 Origin 的**回环**白名单主机（不含端口，端口随请求动态校验）
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+# 登录鉴权免检路径（精确匹配）
+_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/login", "/auth/login", "/auth/logout"})
+
+# 会话 cookie 名（与 app.auth.SESSION_COOKIE 一致）
+SESSION_COOKIE = auth.SESSION_COOKIE
 
 
 class CsrfStore:
@@ -37,6 +52,33 @@ class CsrfStore:
         if not token:
             return False
         return token in self._tokens
+
+
+class SessionStore:
+    """进程内存会话表（重启即失效）：``{token: 过期单调时钟}``。"""
+
+    def __init__(self):
+        self._sessions: dict[str, float] = {}
+
+    def create(self) -> str:
+        token = auth.new_session_token()
+        self._sessions[token] = time.monotonic() + auth.SESSION_TTL_SECONDS
+        return token
+
+    def valid(self, token: str | None) -> bool:
+        if not token:
+            return False
+        expires = self._sessions.get(token)
+        if expires is None:
+            return False
+        if time.monotonic() > expires:
+            self._sessions.pop(token, None)
+            return False
+        return True
+
+    def revoke(self, token: str | None) -> None:
+        if token:
+            self._sessions.pop(token, None)
 
 
 def normalize_host_port(host_header: str | None) -> tuple[str, int | None]:
@@ -69,30 +111,76 @@ def normalize_host_port(host_header: str | None) -> tuple[str, int | None]:
     return host, port
 
 
-def validate_host(host_header: str | None) -> bool:
-    """校验 Host 头只允许回环白名单主机：127.0.0.1 / [::1] / localhost。
-
-    端口不参与白名单校验（本机可用任意回环端口），但主机必须精确匹配，
-    不放行整个 127/8（如 127.0.0.2 拒绝）。
-    """
-    bare, _port = normalize_host_port(host_header)
-    if not bare:
-        return False
+def is_loopback_bare(bare: str) -> bool:
+    """裸主机名是否为精确回环白名单主机（127.0.0.1 / ::1 / localhost）。"""
     if bare == "localhost":
         return True
     try:
         ip = ipaddress.ip_address(bare)
     except ValueError:
         return False
-    # 只放行回环且必须是 127.0.0.1 或 ::1（拒绝 127.0.0.2 等回环别名）
-    return (ip.is_loopback) and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
+    return ip.is_loopback and (
+        ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1")
+    )
 
 
-def origin_host_matches(origin: str | None, host_bare: str, host_port: int | None) -> bool:
-    """校验 Origin 与 Host 头同源（host 与端口都一致），且 host 为回环白名单。
+def _allowed_hosts_from_env() -> frozenset[str]:
+    """读取 ``ALLOWED_HOSTS``（逗号分隔），归一化为裸主机名集合（小写）。"""
+    raw = os.environ.get("ALLOWED_HOSTS", "")
+    hosts: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        bare, _port = normalize_host_port(entry)
+        if bare:
+            hosts.add(bare.lower())
+    return frozenset(hosts)
 
-    Origin 形如 ``http://127.0.0.1:<port>``；端口须等于 Host 头端口（若 Origin
-    省略默认端口，http=80 / https=443，与本机监听端口不一致即拒绝）。
+
+def host_is_allowed(bare: str) -> bool:
+    """主机是否在回环白名单或 ``ALLOWED_HOSTS`` 白名单内。"""
+    if is_loopback_bare(bare):
+        return True
+    return bare.lower() in _allowed_hosts_from_env()
+
+
+def validate_host(host_header: str | None) -> bool:
+    """校验 Host 头只允许回环白名单或 ``ALLOWED_HOSTS`` 白名单主机。
+
+    端口不参与白名单校验，但主机必须精确匹配，不放行整个 127/8（如 127.0.0.2 拒绝）。
+    """
+    bare, _port = normalize_host_port(host_header)
+    if not bare:
+        return False
+    return host_is_allowed(bare)
+
+
+def _default_port_for_scheme(scheme: str) -> int:
+    return 80 if scheme == "http" else 443
+
+
+def effective_scheme(scope: dict, headers) -> str:
+    """请求的有效 scheme：优先 ``X-Forwarded-Proto``（反代 HTTPS 落地），否则 scope scheme。
+
+    公网域名经 nginx/反代终止 TLS 后，后端 uvicorn 默认看到 http；但浏览器 Origin 是
+    https。读取 ``X-Forwarded-Proto`` 才能正确把 Host 无端口时补成 443，避免误判 403。
+    仅接受 ``http``/``https`` 两个合法值，其余回退 scope scheme。
+    """
+    xfp = (headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if xfp in {"http", "https"}:
+        return xfp
+    return scope.get("scheme", "http")
+
+
+def origin_host_matches(
+    origin: str | None, host_bare: str, host_port: int | None, scheme: str = "http"
+) -> bool:
+    """校验 Origin 与 Host 头同源（scheme + host + 端口都一致），且 host 在白名单内。
+
+    Origin 形如 ``http://127.0.0.1:<port>`` 或 ``https://temp.os-uat.tcredit.com``；
+    端口须等于 Host 头端口（Host 省略端口时按请求 scheme 补默认端口）。公网域名
+    走 HTTPS 时 Origin 必须同为 https，否则不同源。
     """
     if not origin:
         return False
@@ -104,34 +192,29 @@ def origin_host_matches(origin: str | None, host_bare: str, host_port: int | Non
         return False
     if parsed.scheme not in {"http", "https"}:
         return False
-    origin_host = parsed.hostname or ""
-    if origin_host != host_bare:
+    origin_host = (parsed.hostname or "").lower()
+    if origin_host != host_bare.lower():
         return False
 
     # 端口比对：Origin 缺省端口时按 scheme 补默认端口
     origin_port = parsed.port
     if origin_port is None:
-        origin_port = 80 if parsed.scheme == "http" else 443
+        origin_port = _default_port_for_scheme(parsed.scheme)
     if host_port is None:
-        host_port = 80  # Host 无端口视为 80（http）
+        host_port = _default_port_for_scheme(scheme)
     if origin_port != host_port:
         return False
 
-    # host 白名单（与 validate_host 一致，只允许精确回环地址或 localhost）
-    if origin_host == "localhost":
-        return True
-    try:
-        ip = ipaddress.ip_address(origin_host)
-    except ValueError:
-        return False
-    return ip.is_loopback and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
+    return host_is_allowed(origin_host)
 
 
-def referer_host_matches(referer: str | None, host_bare: str, host_port: int | None) -> bool:
+def referer_host_matches(
+    referer: str | None, host_bare: str, host_port: int | None, scheme: str = "http"
+) -> bool:
     """校验 Referer 的 scheme+host+端口 与 Host 一致（同源 GET 无 Origin，用 Referer 兜底）。
 
-    Referer 形如 ``http://127.0.0.1:<port>/path``；仅校验 scheme、host、端口三项，
-    忽略路径。返回 False 表示缺失或不同源。
+    Referer 形如 ``http://127.0.0.1:<port>/path`` 或 ``https://temp...``；仅校验
+    scheme、host、端口三项，忽略路径。返回 False 表示缺失或不同源。
     """
     if not referer:
         return False
@@ -143,34 +226,41 @@ def referer_host_matches(referer: str | None, host_bare: str, host_port: int | N
         return False
     if parsed.scheme not in {"http", "https"}:
         return False
-    referer_host = parsed.hostname or ""
-    if referer_host != host_bare:
+    referer_host = (parsed.hostname or "").lower()
+    if referer_host != host_bare.lower():
         return False
     referer_port = parsed.port
     if referer_port is None:
-        referer_port = 80 if parsed.scheme == "http" else 443
+        referer_port = _default_port_for_scheme(parsed.scheme)
     if host_port is None:
-        host_port = 80
+        host_port = _default_port_for_scheme(scheme)
     if referer_port != host_port:
         return False
-    if referer_host == "localhost":
+    return host_is_allowed(referer_host)
+
+
+def _path_exempt_from_auth(path: str) -> bool:
+    """登录鉴权免检路径：静态资源、健康检查、登录页与登录/登出接口。"""
+    if path.startswith("/static/"):
         return True
-    try:
-        ip = ipaddress.ip_address(referer_host)
-    except ValueError:
-        return False
-    return ip.is_loopback and (ip == ipaddress.ip_address("127.0.0.1") or ip == ipaddress.ip_address("::1"))
+    return path in _AUTH_EXEMPT_PATHS
+
+
+def _is_api_path(path: str) -> bool:
+    return path.startswith("/api/")
 
 
 class HostCsrfMiddleware:
-    """FastAPI 中间件：Host 校验 + 变更方法 CSRF/Content-Type 校验。
+    """FastAPI 中间件：Host 校验 + 登录鉴权 + 变更方法 CSRF/Content-Type 校验。
 
-    交由 ``BaseHTTPMiddleware`` 包装；普通 GET 只做 Host 校验。
+    交由 ``BaseHTTPMiddleware`` 包装；普通 GET 只做 Host 校验（公网域名额外做鉴权）。
     """
 
-    def __init__(self, app, csrf: CsrfStore):
+    def __init__(self, app, csrf: CsrfStore, sessions: SessionStore, users: auth.UserStore):
         self.app = app
         self.csrf = csrf
+        self.sessions = sessions
+        self.users = users
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -178,13 +268,36 @@ class HostCsrfMiddleware:
             return
 
         request = Request(scope, receive)
+        scheme = effective_scheme(scope, request.headers)
+        path = request.url.path
+
+        # 1) Host 校验（回环白名单 ∪ ALLOWED_HOSTS，未知 Host 403）
         host_header = request.headers.get("host")
         if not validate_host(host_header):
             await _respond_json(send, errors.ApiError("CSRF_INVALID", "Host 不被允许", 403).body(), 403)
             return
 
+        # 2) 登录鉴权：仅公网域名（非回环）需要；回环保持免登录
+        bare_host, _host_port = normalize_host_port(host_header)
+        if not is_loopback_bare(bare_host) and not _path_exempt_from_auth(path):
+            token = request.cookies.get(SESSION_COOKIE)
+            if not self.sessions.valid(token):
+                if _is_api_path(path):
+                    await _respond_json(
+                        send,
+                        {"code": "AUTH_REQUIRED", "message": "请先登录"},
+                        401,
+                    )
+                else:
+                    await _respond_redirect(send, "/login")
+                return
+
+        # 3) 变更方法 CSRF / Content-Type（登录/登出例外）
         method = request.method
-        if method in {"POST", "PUT", "DELETE", "PATCH"}:
+        if method in {"POST", "PUT", "DELETE", "PATCH"} and path not in {
+            "/auth/login",
+            "/auth/logout",
+        }:
             # Content-Type 必须 application/json
             content_type = request.headers.get("content-type", "")
             if not content_type.lower().startswith("application/json"):
@@ -195,10 +308,10 @@ class HostCsrfMiddleware:
                 )
                 return
 
-            # 同源 Origin（host + 端口都一致）
+            # 同源 Origin（scheme + host + 端口都一致）
             bare_host, host_port = normalize_host_port(host_header)
             origin = request.headers.get("origin")
-            if not origin_host_matches(origin, bare_host, host_port):
+            if not origin_host_matches(origin, bare_host, host_port, scheme):
                 await _respond_json(send, errors.csrf_invalid({"reason": "origin_mismatch"}).body(), 403)
                 return
 
@@ -226,6 +339,19 @@ async def _respond_json(send, body: dict, status_code: int):
         "status": status_code,
         "headers": [
             (b"content-type", b"application/json; charset=utf-8"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": payload})
+
+
+async def _respond_redirect(send, location: str):
+    payload = b""
+    await send({
+        "type": "http.response.start",
+        "status": 302,
+        "headers": [
+            (b"location", location.encode("latin-1")),
             (b"content-length", str(len(payload)).encode()),
         ],
     })

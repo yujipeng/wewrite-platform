@@ -80,15 +80,17 @@ docker compose up -d --build
 # 1) 在项目目录（与 docker-compose.yml 同级）新建 .env，写入公网白名单与账号
 cat > .env <<'EOF'
 ALLOWED_HOSTS=temp.os-uat.tcredit.com
-WEWRITE_USERS=alice:$2b$12$替换成上面生成的bcrypt哈希
+WEWRITE_USERS=alice:<整段粘贴上面生成的完整 bcrypt 哈希>
 EOF
 
 # 2) 重建并后台常驻（.env 已生效，变量随服务注入）
 docker-compose up -d --build
 
-# 3) 校验长期服务容器内变量已注入（应能看到两个变量，值为 .env 内容）
-docker-compose exec workbench env | grep -E 'ALLOWED_HOSTS|WEWRITE_USERS'
+# 3) 校验长期服务容器内两个变量已注入（只打印变量名与值的长度，避免回显完整哈希）
+docker-compose exec workbench sh -c 'env | grep -E "ALLOWED_HOSTS|WEWRITE_USERS" | sed -E "s/(=.*)$/=<已设置, 长度 ${#1}>/"'
 ```
+
+> 哈希生成值**自带 `$2b$12$` 前缀**，`.env` 里写 `alice:<完整哈希>` 即可，**替换整个占位符、不要重复保留前缀**（写成 `alice:$2b$12$$2b$12$...` 会被判为非法哈希、该账号 fail closed 无法登录）。docker-compose v1.29.2 从 `.env` 插值时 `$2b$12$...` 会**原样传入容器**（`docker-compose config` 显示的 `$$` 只是 YAML 转义展示，容器内 `env` 实测为单 `$`），无需在文档里转义 `$`。
 
 `.env` 已列入 `.gitignore`（不入 git、不落镜像层）。**变量缺省为空时行为 fail closed**：公网 Host 一律 403、无任何可用账号，回环访问不受影响；这与 `app/auth.py` 的 fail-closed 口径一致。公网反代与 443 端口映射由 JEE-1914 在 product133 承接，本仓库 compose 只映射宿主回环 `127.0.0.1:8765`。
 

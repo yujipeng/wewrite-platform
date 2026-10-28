@@ -121,6 +121,17 @@ def test_artifact_missing(client):
     assert r.status_code == 404
 
 
+def test_artifact_missing_reason_artifact_missing(client):
+    """GET artifact 端点同样带上 artifact_missing 语义（只补 details，状态码仍 404）。"""
+    r = client.get("/api/v1/runs/20261026-080000-a1b2c3/artifact/article")
+    assert r.status_code == 404
+    body = r.json()
+    assert body["code"] == "NOT_FOUND"
+    assert body["details"]["reason"] == "artifact_missing"
+    assert body["details"]["artifact"] == "article"
+    assert body["details"]["run_id"] == "20261026-080000-a1b2c3"
+
+
 def test_run_image_endpoint_whitelist(client):
     """P6 缩略图端点：只允许 images/cover.png 或 images/<n>.png，路径穿越被拒。"""
     # 不存在图片 → 404

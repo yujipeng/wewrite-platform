@@ -442,6 +442,22 @@ def test_config_writer_now_writable(monkeypatch, tmp_path):
     assert body["writer"]["base_url"] == "https://api.openai.com/v1"
 
 
+def test_config_writer_custom_provider_roundtrip(monkeypatch, tmp_path):
+    """验收第 3 条：选 custom 填自建网关地址与模型名，保存后回读一致。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"provider": "custom", "model": "my-model", "base_url": "https://gw.example.com/v1"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["provider"] == "custom"
+    assert body["writer"]["model"] == "my-model"
+    assert body["writer"]["base_url"] == "https://gw.example.com/v1"
+
+
 def test_config_writer_api_key_never_echoed(monkeypatch, tmp_path):
     """writer.api_key 只写不读：响应与回读均无明文、无末四位，仅 api_key_configured。"""
     home = str(tmp_path)

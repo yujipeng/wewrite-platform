@@ -204,3 +204,67 @@ def test_p6_navigate_away_not_locked_by_polling(browser_session):
     assert "生成进行中" not in main_text, "轮询把导航覆盖回 job 页（未停止）"
     assert "配置" in main_text
     assert page_errors == [], f"切换页面抛 JS 异常：{page_errors}"
+
+
+def _kv_control(page, label):
+    """按 kv 表单的 dt 文案定位其后的控件（dd 里的 select/input）。"""
+    return page.locator("dt", has_text=label).locator("xpath=./following-sibling::dd[1]").locator("select, input")
+
+
+def test_p8_config_provider_select_and_linkage(browser_session):
+    """JEE-1935 真浏览器验证：provider 为下拉（10 内置 + 自定义…），选中 doubao 联动填充默认值。"""
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    provider_select = _kv_control(page, "provider")
+    assert provider_select.count() == 1, "provider 应为下拉选择框"
+    options = provider_select.locator("option")
+    assert options.count() == 11, f"应为 10 内置 + 自定义…，实际 {options.count()}"
+    assert "自定义…" in [o.strip() for o in options.all_inner_texts()]
+    assert "doubao" in [o.strip() for o in options.all_inner_texts()]
+
+    # 选中 doubao → model/base_url 自动联动为默认值
+    provider_select.select_option("doubao")
+    model_input = _kv_control(page, "model")
+    base_url_input = _kv_control(page, "base_url")
+    assert model_input.input_value() == "doubao-seedream-5-0-260128"
+    assert base_url_input.input_value() == "https://ark.cn-beijing.volces.com/api/v3"
+
+    # 切换 openai → 两项都刷新为 openai 默认值，不残留 doubao 值
+    provider_select.select_option("openai")
+    assert model_input.input_value() == "dall-e-3"
+    assert base_url_input.input_value() == "https://api.openai.com/v1"
+
+    # 自定义：出现 provider 名输入框，可自由填写
+    provider_select.select_option("__custom__")
+    custom_input = page.locator('input[placeholder="自定义 provider 名称"]')
+    assert custom_input.count() == 1, "选自定义…后应出现 provider 名称输入框"
+    assert custom_input.is_visible(), "自定义 provider 输入框应可见"
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_config_theme_select_from_themes(browser_session):
+    """JEE-1935 真浏览器验证：主题为下拉，选项来自 /api/v1/themes（当前 18 项）。"""
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    theme_select = _kv_control(page, "theme")
+    assert theme_select.count() == 1, "主题应为下拉选择框"
+    option_values = theme_select.locator("option").evaluate_all(
+        "(els) => els.map((e) => e.value)"
+    )
+    assert len(option_values) >= 18, f"主题应来自 /api/v1/themes（18 项），实际 {len(option_values)}"
+    assert "professional-clean" in option_values
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

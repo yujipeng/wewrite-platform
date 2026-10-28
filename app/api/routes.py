@@ -161,6 +161,21 @@ async def list_themes():
     return {"themes": themes}
 
 
+@router.get("/api/v1/image-providers")
+async def list_image_providers():
+    """只读端点：内置图片供应商元数据，供 P8 配置页渲染 provider 下拉与联动。
+
+    只做 Host 校验（与 /themes 一致），不需要 CSRF；数据来自
+    ``wewrite.toolkit.image_gen.PROVIDERS`` 的动态反射，平台侧不硬编码。
+    """
+    from app.adapters import image_providers
+
+    return {
+        "providers": image_providers.list_image_providers(),
+        "supports_custom": True,
+    }
+
+
 @router.post("/api/v1/preview")
 async def preview(request: Request):
     """P3 产物预览：正文来源切换 + 主题 + 转换 + 过滤 + paste_safe。"""

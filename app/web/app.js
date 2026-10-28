@@ -1298,6 +1298,21 @@ async function renderConfig() {
 
   container.innerHTML = "";
 
+  // 图片供应商元数据（GET /api/v1/image-providers，动态读 wewrite PROVIDERS）
+  let providerList = [];
+  try {
+    providerList = (await api("/api/v1/image-providers")).providers || [];
+  } catch (_) {
+    providerList = [];
+  }
+  // 主题清单（GET /api/v1/themes）
+  let themeList = [];
+  try {
+    themeList = (await api("/api/v1/themes")).themes || [];
+  } catch (_) {
+    themeList = [];
+  }
+
   // 公众号
   container.appendChild(el("div", { class: "section-title", text: "公众号（secret 只写不读）" }));
   const appidInput = el("input", { type: "text", value: cfg.wechat.appid || "", placeholder: "AppID" });
@@ -1306,36 +1321,126 @@ async function renderConfig() {
   container.appendChild(kvForm([["AppID", appidInput], ["作者", authorInput], ["AppSecret", secretInput]]));
 
   // 图片供应商
-  container.appendChild(el("div", { class: "section-title", text: "图片供应商与 fallback 链（provider 只读展示，model/base_url 可编辑）" }));
-  const providerInput = el("input", { type: "text", value: cfg.image.provider || "", placeholder: "provider（env 接管时只读）", disabled: true });
-  const modelInput = el("input", { type: "text", value: cfg.image.model || "", placeholder: "model" });
-  const baseUrlInput = el("input", { type: "text", value: cfg.image.base_url || "", placeholder: "base_url" });
-  container.appendChild(kvForm([["provider", providerInput], ["model", modelInput], ["base_url", baseUrlInput]]));
+  container.appendChild(el("div", { class: "section-title", text: "图片供应商与 fallback 链（provider 下拉选择，model/base_url 联动填充）" }));
+  const envManaged = new Set((cfg.env_managed || []).map((m) => m.field));
+  const imageSection = el("div");
+
+  // provider 下拉：内置 provider + 「自定义…」
+  const providerSelect = el("select");
+  providerSelect.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
+  for (const p of providerList) {
+    providerSelect.appendChild(el("option", { value: p.name, text: p.name }));
+  }
+  const providerExtraFields = {}; // name -> extra_fields 提示
+  const providerDefaults = {}; // name -> {model, base_url}
+  for (const p of providerList) {
+    providerDefaults[p.name] = { model: p.default_model || "", base_url: p.default_base_url || "" };
+    providerExtraFields[p.name] = p.extra_fields || [];
+  }
+  const currentProvider = cfg.image.provider || "";
+  if (currentProvider && !(currentProvider in providerDefaults)) {
+    providerSelect.appendChild(el("option", { value: currentProvider, text: currentProvider + "（当前值）" }));
+  }
+  providerSelect.value = currentProvider || "__custom__";
+
+  const providerModelInput = el("input", { type: "text", value: cfg.image.model || "", placeholder: "model" });
+  const providerBaseUrlInput = el("input", { type: "text", value: cfg.image.base_url || "", placeholder: "base_url" });
+  const apiKeyInput = el("input", {
+    type: "password",
+    value: "",
+    placeholder: cfg.image.api_key_configured ? "已配置（留空保持）" : "api_key",
+  });
+  // 自定义 provider 名：选「自定义…」时出现，可自由填写不在内置清单里的名字
+  const customProviderInput = el("input", {
+    type: "text",
+    value: "",
+    placeholder: "自定义 provider 名称",
+    style: "display:none;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%",
+  });
+
+  const extraHint = el("div", { class: "muted", text: "" });
+  const updateExtraHint = () => {
+    const fields = providerExtraFields[providerSelect.value] || [];
+    if (fields.length) {
+      extraHint.textContent = "该 provider 还需要额外参数：" + fields.join("、") + "（当前配置页暂不支持填写，仅提示）";
+    } else {
+      extraHint.textContent = "";
+    }
+  };
+  const refreshCustomInput = () => {
+    const isCustom = providerSelect.value === "__custom__";
+    customProviderInput.style.display = isCustom ? "" : "none";
+  };
+
+  // 选中内置 provider 时联动填充默认 model/base_url；自定义/当前值不覆盖
+  const applyProviderDefaults = () => {
+    const val = providerSelect.value;
+    const def = providerDefaults[val];
+    if (def) {
+      providerModelInput.value = def.model;
+      providerBaseUrlInput.value = def.base_url;
+    } else if (val === "__custom__") {
+      providerModelInput.value = "";
+      providerBaseUrlInput.value = "";
+    }
+    updateExtraHint();
+    refreshCustomInput();
+  };
+  providerSelect.addEventListener("change", applyProviderDefaults);
+
+  const providerRow = el("div");
+  providerRow.appendChild(kvForm([["provider", providerSelect], ["model", providerModelInput], ["base_url", providerBaseUrlInput], ["api_key", apiKeyInput]]));
+  providerRow.appendChild(customProviderInput);
+  providerRow.appendChild(extraHint);
+  imageSection.appendChild(providerRow);
+  container.appendChild(imageSection);
 
   // 主题
   container.appendChild(el("div", { class: "section-title", text: "主题选择" }));
-  const themeInput = el("input", { type: "text", value: cfg.theme || "professional-clean", placeholder: "主题名" });
-  container.appendChild(kvForm([["theme", themeInput]]));
+  const themeSelect = el("select");
+  const currentTheme = cfg.theme || "";
+  if (currentTheme && !themeList.some((t) => t.name === currentTheme)) {
+    themeSelect.appendChild(el("option", { value: currentTheme, text: currentTheme + "（当前值）" }));
+  }
+  for (const t of themeList) {
+    themeSelect.appendChild(el("option", { value: t.name, text: t.name + (t.description ? " — " + t.description : "") }));
+  }
+  themeSelect.value = currentTheme || (themeList[0] && themeList[0].name) || "";
+  container.appendChild(kvForm([["theme", themeSelect]]));
 
   // 时区展示
   container.appendChild(el("div", { class: "muted", text: "时区：Asia/Shanghai（UTC+8）" }));
 
-  // env_managed 提示
+  // env_managed 提示与控件禁用（env 接管优先）
   if (cfg.env_managed && cfg.env_managed.length) {
     const managed = cfg.env_managed.map((m) => m.field + " ← " + m.env).join("、");
     container.appendChild(el("div", { class: "notice", text: "以下字段由环境变量接管，写入将返回 409 ENV_MANAGED：" + managed }));
   }
+  if (envManaged.has("image.provider")) {
+    providerSelect.disabled = true;
+    providerSelect.title = "该字段由环境变量接管，禁止修改";
+  }
+  if (envManaged.has("image.model")) providerModelInput.disabled = true;
+  if (envManaged.has("image.base_url")) providerBaseUrlInput.disabled = true;
+  if (envManaged.has("theme")) themeSelect.disabled = true;
+  if (envManaged.has("image.api_key")) apiKeyInput.disabled = true;
 
   const saveBtn = el("button", { class: "btn", text: "保存配置" });
   const result = el("div", { class: "muted", text: "" });
   container.appendChild(el("div", { class: "preview-controls" }, [saveBtn, result]));
 
   saveBtn.addEventListener("click", async () => {
+    const isCustom = providerSelect.value === "__custom__";
     const body = {
-      theme: themeInput.value || undefined,
-      image: { model: modelInput.value || undefined, base_url: baseUrlInput.value || undefined },
+      theme: themeSelect.value || undefined,
+      image: {
+        provider: isCustom ? (customProviderInput.value.trim() || undefined) : (providerSelect.value || undefined),
+        model: providerModelInput.value || undefined,
+        base_url: providerBaseUrlInput.value || undefined,
+      },
       wechat: { appid: appidInput.value || undefined, author: authorInput.value || undefined },
     };
+    if (apiKeyInput.value) body.image.api_key = apiKeyInput.value;
     if (secretInput.value) body.wechat.secret = secretInput.value;
     try {
       const token = await csrfToken();
@@ -1350,12 +1455,16 @@ async function renderConfig() {
         const err = new Error(message); err.code = code; err.status = res.status; throw err;
       }
       result.textContent = "已保存";
+      result.classList.remove("error-block");
       setTimeout(renderConfig, 400);
     } catch (err) {
       result.textContent = "保存失败：" + (err.code || err.message);
       result.classList.add("error-block");
     }
   });
+
+  // 初始化联动提示（若当前值命中内置 provider，不覆盖已存值，仅提示）
+  updateExtraHint();
 
   // ---------- P8-F3 写作风格 ----------
   container.appendChild(el("div", { class: "section-title", text: "写作风格（style.yaml）" }));

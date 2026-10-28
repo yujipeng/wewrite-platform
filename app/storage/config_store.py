@@ -196,6 +196,7 @@ class ConfigStore:
                 "provider": writer.get("provider", "deepseek"),
                 "model": writer.get("model", "deepseek-chat"),
                 "api_key_configured": secret_configured(writer.get("api_key") or None),
+                "writer_configured": bool(os.environ.get("WEWRITE_WRITER_API_KEY", "").strip()),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},
             "env_managed": [
@@ -342,6 +343,73 @@ class ConfigStore:
         "cover_style",
         "author",
     )
+
+    # 模型生成草稿可接受的字段（STYLE_FIELDS 白名单），多给字段一律丢弃。
+    STYLE_DRAFT_FIELDS = frozenset(STYLE_FIELDS)
+
+    def sanitize_style_draft(self, raw: dict) -> dict:
+        """把模型返回的草稿收敛到 13 字段白名单。
+
+        - 只保留 ``STYLE_FIELDS`` 内的字段，模型多给的一律丢弃；
+        - ``topics``/``blacklist`` 强制转字符串数组（非数组/非字符串丢弃并置空）；
+        - ``word_count`` 转整数（非法置空），其余字段非字符串置空；
+        - 缺失字段补空（数组字段补空数组），保证前端可整体填入控件。
+        """
+        draft: dict = {}
+        for field in self.STYLE_FIELDS:
+            value = raw.get(field)
+            if field in {"topics", "blacklist"}:
+                if isinstance(value, list):
+                    draft[field] = [
+                        str(v).strip() for v in value if str(v).strip()
+                    ]
+                else:
+                    draft[field] = []
+            elif field == "word_count":
+                if isinstance(value, bool):
+                    draft[field] = ""
+                elif isinstance(value, (int, float)) or (
+                    isinstance(value, str) and value.strip().lstrip("-").isdigit()
+                ):
+                    try:
+                        draft[field] = int(value)
+                    except (TypeError, ValueError):
+                        draft[field] = ""
+                else:
+                    draft[field] = ""
+            else:
+                draft[field] = value if isinstance(value, str) else ""
+        return draft
+
+    def generate_style_draft(self, body: dict, backend) -> dict:
+        """生成风格草稿（POST /api/v1/style/generate 逻辑层）。
+
+        校验入参（industry/audience/tone_hint 至少一项非空）→ 调写作模型 →
+        白名单收敛。不落盘，只回显草稿；``source`` 反映是否走真实模型。
+        """
+        if not isinstance(body, dict):
+            raise errors.validation_error("请求体必须为 JSON 对象")
+
+        industry = body.get("industry")
+        audience = body.get("audience")
+        tone_hint = body.get("tone_hint")
+        for field, value in (("industry", industry), ("audience", audience), ("tone_hint", tone_hint)):
+            if value is not None and not isinstance(value, str):
+                raise errors.validation_error(f"{field} 必须为字符串", {"field": field})
+
+        def _nonempty(value) -> bool:
+            return isinstance(value, str) and bool(value.strip())
+
+        if not (_nonempty(industry) or _nonempty(audience) or _nonempty(tone_hint)):
+            raise errors.validation_error(
+                "industry / audience / tone_hint 至少填写一项", {"field": "industry"}
+            )
+
+        raw = backend.generate(
+            industry or "", audience or "", tone_hint or ""
+        )
+        draft = self.sanitize_style_draft(raw if isinstance(raw, dict) else {})
+        return {"draft": draft, "source": "llm"}
 
     def put_style(self, body: dict) -> dict:
         """白名单字段原子写 style.yaml 0600；缺失字段显式保存默认值。"""

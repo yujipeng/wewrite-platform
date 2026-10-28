@@ -87,3 +87,10 @@ def env_managed(message: str = "该字段由环境变量接管，不接受写入
 
 def busy(message: str = "资源正被占用，请稍后重试", details: dict | None = None) -> ApiError:
     return ApiError("BUSY", message, 503, details)
+
+
+def writer_not_configured(
+    message: str = "请先在「写作模型」区配置写作模型", details: dict | None = None
+) -> ApiError:
+    """写作模型未配置（缺 WEWRITE_WRITER_API_KEY），前端应禁用生成入口。"""
+    return ApiError("WRITER_NOT_CONFIGURED", message, 503, details)

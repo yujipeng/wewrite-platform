@@ -603,6 +603,28 @@ async def put_style(request: Request):
         return _error_response(exc)
 
 
+def _style_generate_backend(request: Request):
+    from app.adapters import writer as writer_adapter
+
+    return getattr(request.app.state, "style_generate_backend", None) or writer_adapter.StyleGenerateBackend()
+
+
+@router.post("/api/v1/style/generate")
+async def generate_style(request: Request):
+    """智能生成写作风格草稿（可选 AI 引导入口）。
+
+    出网调用写作模型，绝不落盘，只回显草稿供前端预览/修改；未配置写作模型返回
+    503 WRITER_NOT_CONFIGURED，调用失败返回 502 UPSTREAM_ERROR。
+    """
+    body = await _read_body(request)
+    try:
+        return await run_in_threadpool(
+            _config_store().generate_style_draft, body, _style_generate_backend(request)
+        )
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
 @router.get("/api/v1/runs/{run_id}/publish/preflight")
 async def publish_preflight(run_id: str):
     from app.domain import preflight as preflight_mod

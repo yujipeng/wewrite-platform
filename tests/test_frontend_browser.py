@@ -312,3 +312,98 @@ def test_p8_switch_to_azure_openai_empty_base_url_not_residue(browser_session):
     assert cfg["image"]["provider"] == "azure_openai"
     assert cfg["image"]["base_url"] == ""
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def _style_control(page, label):
+    """按写作风格 kv 表单的 dt 文案定位其后控件（dd 里的 select/input/标签容器）。"""
+    return page.locator("dt", has_text=label).locator("xpath=./following-sibling::dd[1]")
+
+
+def test_p8_style_grouped_and_tone_select_custom_save(browser_session):
+    """JEE-1947 真浏览器验证：写作风格分 4 组、tone 为下拉且自定义值可保存回读一致。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_style():
+        data = urllib.request.urlopen(f"{base}/api/v1/style", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(400)
+
+    # 1) 分组渲染：4 个 .style-group，组标题齐全
+    groups = page.locator(".style-group")
+    assert groups.count() == 4, f"应分 4 组，实际 {groups.count()}"
+    for title in ("定位", "方向", "语气与风格", "产出规格"):
+        assert page.locator(".style-group-head", has_text=title).count() == 1, f"缺少组标题 {title}"
+
+    # 2) tone 为下拉（select），含常用值与自定义…
+    tone_cell = _style_control(page, "语气")
+    tone_select = tone_cell.locator("select")
+    assert tone_select.count() == 1, "语气应为下拉选择框"
+    tone_options = tone_select.locator("option").all_inner_texts()
+    assert "专业" in tone_options and "自定义…" in tone_options
+
+    # 3) 自定义值保存后回读一致（不被下拉拒掉）
+    tone_select.select_option("__custom__")
+    custom_input = tone_cell.locator('input[placeholder="输入自定义语气"]')
+    assert custom_input.count() == 1, "选自定义…后应出现自定义输入框"
+    custom_input.fill("我的自定义语气")
+
+    save_btn = page.locator("button", has_text="保存写作风格")
+    save_btn.click()
+    page.wait_for_timeout(900)
+
+    saved = read_style()
+    assert saved.get("tone") == "我的自定义语气", f"tone 回读应为自定义值，实际 {saved.get('tone')}"
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_style_tags_and_word_count_buttons(browser_session):
+    """JEE-1947 真浏览器验证：topics 标签输入（回车成标签）与字数档位按钮。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_style():
+        data = urllib.request.urlopen(f"{base}/api/v1/style", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(400)
+
+    # 标签输入：topics 输入 "AI，创业" 回车 → 2 个标签
+    topics_cell = _style_control(page, "话题")
+    tag_input = topics_cell.locator('input[placeholder="输入后回车/逗号添加"]')
+    assert tag_input.count() == 1, "话题应为标签输入"
+    tag_input.fill("AI，创业")
+    tag_input.press("Enter")
+    assert topics_cell.locator(".tag-chip").count() == 2, "应生成 2 个标签"
+
+    # 字数档位：点「2000 字」→ word_count 变 2000
+    word_cell = _style_control(page, "字数")
+    btn2000 = word_cell.locator("button", has_text="2000 字")
+    assert btn2000.count() == 1, "应有 2000 字档位按钮"
+    btn2000.click()
+    word_input = word_cell.locator('input[type="number"]')
+    assert word_input.input_value() == "2000", "word_count 应变为 2000"
+
+    save_btn = page.locator("button", has_text="保存写作风格")
+    save_btn.click()
+    page.wait_for_timeout(900)
+
+    saved = read_style()
+    assert saved.get("topics") == ["AI", "创业"], f"topics 回读应为 ['AI','创业']，实际 {saved.get('topics')}"
+    assert saved.get("word_count") == 2000, f"word_count 回读应为 2000，实际 {saved.get('word_count')}"
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

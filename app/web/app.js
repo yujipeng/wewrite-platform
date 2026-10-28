@@ -1396,7 +1396,7 @@ async function renderConfig() {
   container.appendChild(imageSection);
 
   // 主题
-  container.appendChild(el("div", { class: "section-title", text: "主题选择" }));
+  container.appendChild(el("div", { class: "section-title", text: "排版主题" }));
   const themeSelect = el("select");
   const currentTheme = cfg.theme || "";
   if (currentTheme && !themeList.some((t) => t.name === currentTheme)) {
@@ -1482,35 +1482,289 @@ async function renderConfig() {
   // 初始化联动提示（若当前值命中内置 provider，不覆盖已存值，仅提示）
   updateExtraHint();
 
-  // ---------- P8-F3 写作风格 ----------
+  // ---------- P8-F3 写作风格（选项化 + 分组 + AI 引导，JEE-1947） ----------
   container.appendChild(el("div", { class: "section-title", text: "写作风格（style.yaml）" }));
+  container.appendChild(el("div", { class: "muted", text: "下方「写作主题」是写作方向，与上方「主题选择」里的排版主题是两回事，两者相互独立。" }));
 
-  // 四步 onboarding：缺 style.yaml（仅 version 无风格字段）时按定位→方向→语气→主题引导
-  const styleFields = [
-    ["name", "风格名称", "text"],
-    ["industry", "行业", "text"],
-    ["target_audience", "目标受众", "text"],
-    ["topics", "话题（逗号分隔）", "text"],
-    ["tone", "语气", "text"],
-    ["voice", "声音", "text"],
-    ["word_count", "字数", "number"],
-    ["content_style", "内容风格", "text"],
-    ["writing_persona", "写作人格", "text"],
-    ["theme", "写作主题", "text"],
-    ["blacklist", "黑名单（逗号分隔）", "text"],
-    ["cover_style", "封面风格", "text"],
-    ["author", "署名作者", "text"],
-  ];
-  const styleInputs = {};
-  const styleKvRows = [];
-  for (const [key, label, type] of styleFields) {
-    let value = style[key];
-    if (Array.isArray(value)) value = value.join("，");
-    const input = el("input", { type, value: value == null ? "" : String(value), placeholder: label });
-    styleInputs[key] = input;
-    styleKvRows.push([label, input]);
+  // 写作模型是否已配置（env WEWRITE_WRITER_API_KEY 是否存在）
+  const writerConfigured = !!(cfg.writer && cfg.writer.writer_configured);
+
+  const styleInputs = {}; // key -> 控件（input / select / 标签输入容器）
+  const tagStates = {};   // key -> 标签数组（topics / blacklist）
+  const customInputs = {}; // key -> 自定义值输入框（下拉 + 自定义）
+  const wordInput = { el: null };
+
+  // 常用值（UI 便利，非白名单）：用户可自定义任意值并保存
+  const OPTION_VALUES = {
+    tone: ["专业", "亲和", "犀利", "幽默", "克制", "讲故事"],
+    voice: ["第一人称", "第三人称", "编辑口吻"],
+    content_style: ["干货清单", "深度分析", "案例复盘", "观点评论"],
+    cover_style: ["极简", "大字报", "插画", "实拍"],
+  };
+
+  function makeSelectControl(key, label) {
+    const select = el("select", { class: "style-select" });
+    select.appendChild(el("option", { value: "", text: "（不填）" }));
+    let current = style[key];
+    if (Array.isArray(current)) current = "";
+    const hasCustom = current && !OPTION_VALUES[key].includes(current);
+    if (hasCustom) {
+      select.appendChild(el("option", { value: current, text: current + "（当前值）" }));
+    }
+    for (const v of OPTION_VALUES[key]) {
+      select.appendChild(el("option", { value: v, text: v }));
+    }
+    select.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
+    select.value = hasCustom ? current : (current || "");
+
+    const customInput = el("input", {
+      class: "style-custom-input",
+      type: "text",
+      placeholder: "输入自定义" + label,
+      style: "display:none;",
+    });
+    customInput.value = hasCustom ? current : "";
+
+    const refreshCustom = () => {
+      customInput.style.display = select.value === "__custom__" ? "" : "none";
+    };
+    select.addEventListener("change", refreshCustom);
+    customInput.addEventListener("input", () => { select.value = "__custom__"; });
+    refreshCustom();
+    customInputs[key] = customInput;
+    return el("div", {}, [select, customInput]);
   }
-  container.appendChild(kvForm(styleKvRows));
+
+  function selectValue(key) {
+    const select = styleInputs[key].querySelector("select");
+    const customInput = customInputs[key];
+    if (select.value === "__custom__") {
+      return customInput.value.trim();
+    }
+    return select.value;
+  }
+
+  function makeTagInput(key, label) {
+    // 回车/逗号成标签，可删除；value 固定为数组
+    let tags = Array.isArray(style[key]) ? style[key].map((s) => String(s)) : [];
+    if (tags.length === 0 && typeof style[key] === "string" && style[key]) {
+      tags = style[key].split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+    }
+    tagStates[key] = tags;
+
+    const wrap = el("div", { class: "tag-input-wrap" });
+    const input = el("input", {
+      class: "tag-chip-input",
+      type: "text",
+      placeholder: "输入后回车/逗号添加",
+    });
+
+    const renderTags = () => {
+      const chips = wrap.querySelectorAll(".tag-chip");
+      for (const c of chips) c.remove();
+      for (const t of tags) {
+        const chip = el("span", { class: "tag-chip" }, [t]);
+        const rm = el("button", { class: "tag-remove", text: "×", title: "删除" });
+        rm.addEventListener("click", () => {
+          tags = tags.filter((x) => x !== t);
+          tagStates[key] = tags;
+          renderTags();
+        });
+        chip.appendChild(rm);
+        wrap.insertBefore(chip, input);
+      }
+    };
+
+    const commit = () => {
+      const val = input.value.trim();
+      if (!val) return;
+      for (const part of val.split(/[,，]/)) {
+        const p = part.trim();
+        if (p && !tags.includes(p)) tags.push(p);
+      }
+      input.value = "";
+      tagStates[key] = tags;
+      renderTags();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+    });
+    input.addEventListener("blur", commit);
+
+    wrap.appendChild(input);
+    renderTags();
+    return wrap;
+  }
+
+  // 分组定义：4 组语义分组（定位 / 方向 / 语气与风格 / 产出规格）
+  const styleGroups = [
+    {
+      title: "定位", hint: "你是谁、做什么、写给谁",
+      fields: [
+        ["name", "风格名称", "text"],
+        ["industry", "行业", "text"],
+        ["target_audience", "目标受众", "text"],
+      ],
+    },
+    {
+      title: "方向", hint: "写什么话题、避开什么",
+      fields: [
+        ["topics", "话题", "tags"],
+        ["blacklist", "黑名单", "tags"],
+        ["theme", "写作主题", "text"],
+      ],
+    },
+    {
+      title: "语气与风格", hint: "以什么口吻和形式表达",
+      fields: [
+        ["tone", "语气", "select"],
+        ["voice", "声音", "select"],
+        ["content_style", "内容风格", "select"],
+        ["writing_persona", "写作人格", "text"],
+      ],
+    },
+    {
+      title: "产出规格", hint: "篇幅、封面与署名",
+      fields: [
+        ["word_count", "字数", "word_count"],
+        ["cover_style", "封面风格", "select"],
+        ["author", "署名作者", "text"],
+      ],
+    },
+  ];
+
+  for (const group of styleGroups) {
+    const box = el("div", { class: "style-group" });
+    const head = el("div", { class: "style-group-head" }, [group.title]);
+    head.appendChild(el("span", { class: "hint", text: group.hint }));
+    const body = el("div", { class: "style-group-body" });
+    const rows = [];
+    for (const [key, label, type] of group.fields) {
+      let control;
+      if (type === "select") {
+        control = makeSelectControl(key, label);
+      } else if (type === "tags") {
+        control = makeTagInput(key, label);
+      } else if (type === "word_count") {
+        let value = style[key];
+        const input = el("input", { class: "style-custom-input", type: "number", value: value == null ? "" : String(value), placeholder: "字数" });
+        const btns = el("div", { class: "word-btns" });
+        for (const n of [800, 1200, 2000, 3000]) {
+          const b = el("button", { class: "btn sm", text: n + " 字" });
+          b.addEventListener("click", () => { input.value = String(n); });
+          btns.appendChild(b);
+        }
+        control = el("div", {}, [input, btns]);
+        wordInput.el = input;
+      } else {
+        let value = style[key];
+        control = el("input", { class: "style-custom-input", type: "text", value: value == null ? "" : String(value), placeholder: label });
+      }
+      styleInputs[key] = control;
+      rows.push([label, control]);
+    }
+    body.appendChild(kvForm(rows));
+    box.appendChild(head);
+    box.appendChild(body);
+    container.appendChild(box);
+  }
+
+  // AI 引导入口（可选）：低门槛三步，绝不自动保存
+  const aiBox = el("div", { class: "ai-generate-box" });
+  aiBox.appendChild(el("div", { class: "ai-title", text: "智能生成风格（可选）" }));
+  const aiIndustry = el("input", { class: "style-custom-input", type: "text", placeholder: "做什么行业/领域" });
+  const aiAudience = el("input", { class: "style-custom-input", type: "text", placeholder: "写给谁看" });
+  const aiTone = el("input", { class: "style-custom-input", type: "text", placeholder: "希望什么调性（一句话）" });
+  aiBox.appendChild(kvForm([["行业/领域", aiIndustry], ["目标读者", aiAudience], ["调性", aiTone]]));
+  const aiBtn = el("button", { class: "btn", text: "智能生成风格" });
+  const aiResult = el("div", { class: "ai-generate-hint", text: "" });
+  if (!writerConfigured) {
+    aiBtn.disabled = true;
+    aiResult.textContent = "需先配置写作模型（见「写作模型」区，WEWRITE_WRITER_API_KEY）";
+  }
+  aiBox.appendChild(el("div", { class: "preview-controls" }, [aiBtn, aiResult]));
+  container.appendChild(aiBox);
+
+  // 生成结果填控件：只做填表建议，用户确认后再点保存才落盘
+  function fillDraft(draft) {
+    for (const key of Object.keys(draft)) {
+      if (!(key in styleInputs)) continue;
+      const control = styleInputs[key];
+      const value = draft[key];
+      if (key === "topics" || key === "blacklist") {
+        const arr = Array.isArray(value) ? value.map((s) => String(s)) : [];
+        tagStates[key] = arr;
+        // 重新渲染标签：简单重建控件内 chip（复用 makeTagInput 的逻辑太重，直接刷新）
+        const wrap = control;
+        const chips = wrap.querySelectorAll(".tag-chip");
+        for (const c of chips) c.remove();
+        const input = wrap.querySelector(".tag-chip-input");
+        for (const t of arr) {
+          const chip = el("span", { class: "tag-chip" }, [t]);
+          const rm = el("button", { class: "tag-remove", text: "×", title: "删除" });
+          rm.addEventListener("click", () => {
+            tagStates[key] = tagStates[key].filter((x) => x !== t);
+            fillDraft({ [key]: tagStates[key] });
+          });
+          chip.appendChild(rm);
+          wrap.insertBefore(chip, input);
+        }
+      } else if (key === "word_count") {
+        wordInput.el.value = value == null ? "" : String(value);
+      } else {
+        const select = control.querySelector("select");
+        if (select) {
+          const strVal = value == null ? "" : String(value);
+          const isCustom = strVal && !OPTION_VALUES[key].includes(strVal);
+          if (isCustom) {
+            customInputs[key].value = strVal;
+            select.value = "__custom__";
+            customInputs[key].style.display = "";
+          } else {
+            select.value = strVal;
+            customInputs[key].style.display = "none";
+          }
+        } else {
+          control.value = value == null ? "" : String(value);
+        }
+      }
+    }
+  }
+
+  aiBtn.addEventListener("click", async () => {
+    const industry = aiIndustry.value.trim();
+    const audience = aiAudience.value.trim();
+    const toneHint = aiTone.value.trim();
+    if (!industry && !audience && !toneHint) {
+      aiResult.textContent = "请至少填写一项引导信息（行业/受众/调性）";
+      aiResult.classList.add("error-block");
+      return;
+    }
+    aiBtn.disabled = true;
+    aiResult.classList.remove("error-block");
+    aiResult.textContent = "正在生成…";
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/style/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ industry, audience, tone_hint: toneHint }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status, message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const data = await res.json();
+      fillDraft(data.draft || {});
+      aiResult.textContent = "已生成草稿并填入上方控件，请预览修改后点「保存写作风格」落盘（未自动保存）";
+    } catch (err) {
+      aiResult.textContent = "生成失败：" + (err.code || err.message);
+      aiResult.classList.add("error-block");
+    } finally {
+      aiBtn.disabled = !writerConfigured;
+    }
+  });
 
   const styleSaveBtn = el("button", { class: "btn", text: "保存写作风格" });
   const styleResult = el("div", { class: "muted", text: "" });
@@ -1518,14 +1772,18 @@ async function renderConfig() {
 
   styleSaveBtn.addEventListener("click", async () => {
     const body = {};
-    for (const [key, _label, type] of styleFields) {
-      const raw = styleInputs[key].value;
-      if (key === "topics" || key === "blacklist") {
-        body[key] = raw ? raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : [];
-      } else if (key === "word_count") {
-        body[key] = raw ? parseInt(raw, 10) : undefined;
-      } else {
-        body[key] = raw || "";
+    for (const group of styleGroups) {
+      for (const [key, _label, type] of group.fields) {
+        if (type === "tags") {
+          body[key] = (tagStates[key] || []).slice();
+        } else if (type === "word_count") {
+          const raw = wordInput.el.value;
+          body[key] = raw ? parseInt(raw, 10) : undefined;
+        } else if (type === "select") {
+          body[key] = selectValue(key);
+        } else {
+          body[key] = styleInputs[key].value || "";
+        }
       }
     }
     try {
@@ -1541,6 +1799,7 @@ async function renderConfig() {
         const err = new Error(message); err.code = code; err.status = res.status; throw err;
       }
       styleResult.textContent = "已保存";
+      styleResult.classList.remove("error-block");
       setTimeout(renderConfig, 400);
     } catch (err) {
       styleResult.textContent = "保存失败：" + (err.code || err.message);
@@ -1553,7 +1812,10 @@ function kvForm(rows) {
   const dl = el("dl", { class: "kv" });
   for (const [label, input] of rows) {
     dl.appendChild(el("dt", { text: label }));
-    input.style.cssText = "padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%";
+    // 仅对真实表单控件套内联样式；包装容器（select+自定义、标签输入、字数档位）由 CSS class 负责
+    if (input.tagName === "INPUT" || input.tagName === "SELECT" || input.tagName === "TEXTAREA") {
+      input.style.cssText = "padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%";
+    }
     dl.appendChild(el("dd", {}, [input]));
   }
   return dl;

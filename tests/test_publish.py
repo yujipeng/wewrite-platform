@@ -405,6 +405,80 @@ def test_style_unknown_field_rejected(monkeypatch, tmp_path):
     assert not os.path.exists(os.path.join(home, "style.yaml"))
 
 
+# ---------- JEE-1947：智能生成写作风格 ----------
+
+class _FakeStyleBackend:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def generate(self, industry, audience, tone_hint):
+        return self.raw
+
+
+def test_style_generate_not_configured_503(monkeypatch, tmp_path):
+    """未配 WEWRITE_WRITER_API_KEY 时 503 WRITER_NOT_CONFIGURED，不 500 不空草稿。"""
+    home = str(tmp_path)
+    monkeypatch.delenv("WEWRITE_WRITER_API_KEY", raising=False)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "科技"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 503
+    body = r.json()
+    assert body["code"] == "WRITER_NOT_CONFIGURED"
+    assert "写作模型" in body["message"]
+    assert "draft" not in body
+
+
+def test_style_generate_invalid_hints_422(monkeypatch, tmp_path):
+    """三项引导信息均空 → 422 VALIDATION_ERROR。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "", "audience": "", "tone_hint": ""},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_style_generate_whitelist_and_no_persist(monkeypatch, tmp_path):
+    """生成草稿只含白名单 13 字段，多余字段丢弃，且不落盘。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    c.app.state.style_generate_backend = _FakeStyleBackend(
+        {
+            "tone": "专业",
+            "topics": ["AI"],
+            "word_count": 2000,
+            "extra": "丢弃",
+            "api_key": "LEAK",
+        }
+    )
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "科技", "tone_hint": "专业"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "llm"
+    draft = body["draft"]
+    assert set(draft.keys()) == set(
+        ["name", "industry", "target_audience", "topics", "tone", "voice",
+         "word_count", "content_style", "writing_persona", "theme",
+         "blacklist", "cover_style", "author"]
+    )
+    assert draft["tone"] == "专业"
+    assert draft["topics"] == ["AI"]
+    assert draft["word_count"] == 2000
+    assert "extra" not in draft and "api_key" not in draft
+    assert not os.path.exists(os.path.join(home, "style.yaml"))
+
+
 def test_publish_permission_bad_run_id(monkeypatch, tmp_path):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)

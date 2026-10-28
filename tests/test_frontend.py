@@ -65,6 +65,42 @@ def test_p8_style_rendered(client):
     assert '"/api/v1/style"' in js or "/api/v1/style" in js
 
 
+def test_p8_style_grouped_and_options(client):
+    """JEE-1947：13 字段分 4 组、语气/声音/内容风格/封面风格为下拉 + 自定义、标签输入、字数档位。"""
+    js = _app_js(client)
+    # 4 组标题
+    for group in ("定位", "方向", "语气与风格", "产出规格"):
+        assert group in js
+    # 下拉 + 自定义（常用值选项）
+    assert "自定义…" in js
+    assert '"tone", "语气", "select"' in js
+    for v in ("专业", "亲和", "犀利", "幽默", "讲故事"):
+        assert v in js
+    for v in ("第一人称", "第三人称", "编辑口吻"):
+        assert v in js
+    for v in ("干货清单", "深度分析", "案例复盘", "观点评论"):
+        assert v in js
+    for v in ("极简", "大字报", "插画", "实拍"):
+        assert v in js
+    # 标签式输入
+    assert "tag-chip-input" in js
+    assert "输入后回车/逗号添加" in js
+    # 字数档位
+    assert "[800, 1200, 2000, 3000]" in js and '" 字"' in js
+    # 写作主题与排版主题区分文案
+    assert "写作主题" in js and "排版主题" in js
+
+
+def test_p8_style_ai_generate_entry(client):
+    """JEE-1947：智能生成风格入口，未配置模型时按钮禁用 + 中文提示。"""
+    js = _app_js(client)
+    assert "/api/v1/style/generate" in js
+    assert "智能生成风格" in js
+    assert "需先配置写作模型" in js
+    assert "未自动保存" in js
+    assert "writer_configured" in js
+
+
 def test_p8_image_provider_select_and_link(client):
     """P8 图片供应商改为下拉：选项来自 image-providers 端点，含「自定义…」与联动。"""
     js = _app_js(client)

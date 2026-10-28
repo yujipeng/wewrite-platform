@@ -65,6 +65,31 @@ def test_p8_style_rendered(client):
     assert '"/api/v1/style"' in js or "/api/v1/style" in js
 
 
+def test_p8_image_provider_select_and_link(client):
+    """P8 图片供应商改为下拉：选项来自 image-providers 端点，含「自定义…」与联动。"""
+    js = _app_js(client)
+    assert "/api/v1/image-providers" in js
+    assert "自定义…" in js
+    # provider 用 <select>（el("select") 构造），不再是只读文本框
+    assert 'el("select")' in js
+    # 保存请求体包含 image.provider（含 env 接管时不发的分支）
+    assert "image.provider" in js
+    # api_key 为 password 只写不读
+    assert 'type: "password"' in js
+    assert "已配置（留空保持）" in js
+    # extra_fields 提示（deployment / secret_key）
+    assert "还需要额外参数" in js
+
+
+def test_p8_theme_select(client):
+    """P8 主题改为下拉：选项来自 /api/v1/themes，保留不在清单里的当前值。"""
+    js = _app_js(client)
+    assert "/api/v1/themes" in js
+    assert "当前值" in js
+    # 主题用 <select> 渲染（themeSelect 从 themes 填充 option）
+    assert "themeSelect" in js
+
+
 def test_p5_compare_present(client):
     """P5 并排对比（最多 3 条）。"""
     js = _app_js(client)

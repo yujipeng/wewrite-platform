@@ -72,27 +72,16 @@ docker compose up -d --build
 
 打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝（除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权）。
 
-#### 公网部署（作用于长期 `workbench` 服务）
+#### 公网部署（要求说明）
 
-`docker-compose.yml` 的 `workbench.environment` 段已声明 `ALLOWED_HOSTS=${ALLOWED_HOSTS:-}` 与 `WEWRITE_USERS=${WEWRITE_USERS:-}`，docker-compose 会自动读取项目目录下的 `.env` 做插值。给长期服务注入这两个变量的最小可执行步骤：
+`docker-compose.yml` 的 `workbench.environment` 段已声明 `ALLOWED_HOSTS=${ALLOWED_HOSTS:-}` 与 `WEWRITE_USERS=${WEWRITE_USERS:-}`，docker-compose 会自动读取项目目录下的 `.env` 做插值；`.env` 已列入 `.gitignore`（不入 git、不落镜像层）。
 
-```bash
-# 1) 在项目目录（与 docker-compose.yml 同级）新建 .env，写入公网白名单与账号
-cat > .env <<'EOF'
-ALLOWED_HOSTS=temp.os-uat.tcredit.com
-WEWRITE_USERS=alice:<整段粘贴上面生成的完整 bcrypt 哈希>
-EOF
+- `WEWRITE_USERS` 只接受受支持的 bcrypt 哈希（`$2a$` / `$2b$` / `$2y$` 前缀且可被 bcrypt 解析），非哈希条目（含明文口令）fail closed 拒绝、该账号无法登录。
+- 哈希生成值**自带 `$2b$12$` 前缀**，`.env` 里写 `alice:<完整哈希>` 即可，**替换整个占位符、不要重复保留前缀**（写成 `alice:$2b$12$$2b$12$...` 会被判为非法哈希、该账号 fail closed 无法登录）。
+- docker-compose v1.29.2 从 `.env` 插值时 `$2b$12$...` 会**原样传入容器**（`docker-compose config` 显示的 `$$` 只是 YAML 转义展示，容器内 `env` 实测为单 `$`），无需转义 `$`。
+- 变量缺省为空时行为 **fail closed**：公网 Host 一律 403、无任何可用账号，回环访问不受影响；这与 `app/auth.py` 的 fail-closed 口径一致。
 
-# 2) 重建并后台常驻（.env 已生效，变量随服务注入）
-docker-compose up -d --build
-
-# 3) 校验长期服务容器内两个变量已注入（只打印变量名与值的长度，避免回显完整哈希）
-docker-compose exec workbench sh -c 'env | grep -E "ALLOWED_HOSTS|WEWRITE_USERS" | sed -E "s/(=.*)$/=<已设置, 长度 ${#1}>/"'
-```
-
-> 哈希生成值**自带 `$2b$12$` 前缀**，`.env` 里写 `alice:<完整哈希>` 即可，**替换整个占位符、不要重复保留前缀**（写成 `alice:$2b$12$$2b$12$...` 会被判为非法哈希、该账号 fail closed 无法登录）。docker-compose v1.29.2 从 `.env` 插值时 `$2b$12$...` 会**原样传入容器**（`docker-compose config` 显示的 `$$` 只是 YAML 转义展示，容器内 `env` 实测为单 `$`），无需在文档里转义 `$`。
-
-`.env` 已列入 `.gitignore`（不入 git、不落镜像层）。**变量缺省为空时行为 fail closed**：公网 Host 一律 403、无任何可用账号，回环访问不受影响；这与 `app/auth.py` 的 fail-closed 口径一致。公网反代与 443 端口映射由 JEE-1914 在 product133 承接，本仓库 compose 只映射宿主回环 `127.0.0.1:8765`。
+**具体注入、反代、443 端口映射与部署后校验由 JEE-1914 在 product133 实施**，本仓库只提供变量名与语义，不提供可直接照抄的部署命令；本仓库 compose 只映射宿主回环 `127.0.0.1:8765`。
 
 ### 首次配置与密钥注入（env 优先）
 

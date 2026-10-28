@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>已登出 · WeWrite 工作台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="login-wrap">
+    <div class="card">
+      <h1 class="page-title">已登出</h1>
+      <p class="muted">正在清理会话…</p>
+      <a class="btn" href="/login">返回登录</a>
+    </div>
+  </main>
+  <script type="module">
+    // 调用登出接口撤销会话，成功后回登录页
+    try {
+      await fetch("/auth/logout", { method: "POST" });
+    } catch (_) { /* 网络失败也不阻塞跳转 */ }
+    location.href = "/login";
+  </script>
+</body>
+</html>

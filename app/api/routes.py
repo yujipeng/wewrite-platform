@@ -7,10 +7,12 @@ import os
 import re
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
 from app import __version__
+from app import auth
+from app import middleware as mw
 from app.adapters import hotspots as hotspots_adapter
 from app.adapters import preview as preview_adapter
 from app.domain import confirm_gate
@@ -46,6 +48,55 @@ async def bootstrap(request: Request):
 @router.get("/healthz")
 async def healthz():
     return {"status": "ok", "version": __version__}
+
+
+# ---------- S8-c：登录鉴权 ----------
+
+def _login_redirect_back(request: Request) -> RedirectResponse:
+    """登录成功后回到来源页（默认首页），只接受站内相对路径，拦截越权跳转。
+
+    清洗规则与登录页前端、``app.middleware.safe_next`` 共用同一口径（见该函数）。
+    """
+    nxt = mw.safe_next(request.query_params.get("next", ""), default="/")
+    return RedirectResponse(url=nxt, status_code=303)
+
+
+@router.post("/auth/login")
+async def login(request: Request):
+    """账号密码登录：校验通过发会话 cookie（HttpOnly + SameSite）。
+
+    请求为表单（``application/x-www-form-urlencoded``），不要求 CSRF（登录本身无会话）。
+    """
+    form = await request.form()
+    username = str(form.get("username") or "").strip()
+    password = str(form.get("password") or "")
+    if not username or not password or not request.app.state.users.verify(username, password):
+        return JSONResponse(status_code=401, content={"code": "AUTH_INVALID", "message": "账号或密码错误"})
+
+    token = request.app.state.sessions.create()
+    bare_host, _port = mw.normalize_host_port(request.headers.get("host"))
+    secure = mw.effective_scheme(request.scope, request.headers) == "https" and not mw.is_loopback_bare(bare_host)
+    response = JSONResponse(status_code=200, content={"ok": True, "username": username})
+    response.set_cookie(
+        key=auth.SESSION_COOKIE,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path="/",
+        max_age=auth.SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+@router.post("/auth/logout")
+async def logout(request: Request):
+    """登出：撤销当前会话并清除 cookie。"""
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    request.app.state.sessions.revoke(token)
+    response = JSONResponse(status_code=200, content={"ok": True})
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return response
 
 
 @router.get("/api/v1/runs")
@@ -222,10 +273,14 @@ def _require_same_origin_refresh(request: Request) -> bool:
     if sec_fetch_site != "same-origin":
         return False
 
+    # 公网 HTTPS 域名与回环 http 的 scheme 语义不同，origin/referer 校验需按请求
+    # 实际 scheme 计算默认端口（https→443，http→80）。
+    scheme = mw.effective_scheme(request.scope, request.headers)
+
     if origin:
-        return origin_host_matches(origin, bare_host, host_port)
+        return origin_host_matches(origin, bare_host, host_port, scheme)
     if referer:
-        return referer_host_matches(referer, bare_host, host_port)
+        return referer_host_matches(referer, bare_host, host_port, scheme)
     return False
 
 

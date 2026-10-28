@@ -8,6 +8,10 @@ services:
       - wewrite_home:/data/wewrite
     environment:
       - WEWRITE_HOME=/data/wewrite
+      # 公网域名白名单与登录账号：从项目目录 .env 插值注入（见 README「公网域名白名单与登录鉴权」）。
+      # 缺省为空 → 公网 Host 被拒、无可用账号（fail closed），回环访问不受影响。
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
+      - WEWRITE_USERS=${WEWRITE_USERS:-}
     restart: unless-stopped
 
 volumes:

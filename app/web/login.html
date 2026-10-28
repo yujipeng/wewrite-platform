@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · WeWrite 工作台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    .login-wrap { max-width: 380px; margin: 64px auto; }
+    .login-form { display: flex; flex-direction: column; gap: 12px; }
+    .login-form label { font-size: 14px; color: var(--muted); }
+    .login-form input {
+      padding: 10px 12px; border: 1px solid var(--border);
+      border-radius: 6px; font-size: 14px;
+    }
+    .login-error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <main class="login-wrap">
+    <div class="card">
+      <h1 class="page-title">WeWrite 工作台登录</h1>
+      <form id="login-form" class="login-form" method="post" action="/auth/login">
+        <label for="username">账号</label>
+        <input id="username" name="username" type="text" autocomplete="username" required>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <div id="login-error" class="login-error" role="alert"></div>
+        <button type="submit" class="btn">登录</button>
+      </form>
+    </div>
+  </main>
+  <script type="module">
+    // 登录后跳转目标清洗：与后端 app.middleware.safe_next 同一口径。
+    // 只接受站内相对路径（单斜杠开头、非 //、无反斜杠/控制字符/空白），
+    // 其余一律回落到 "/"，防止 javascript: / 协议相对地址等开放重定向。
+    function safeNext(raw) {
+      const fallback = "/";
+      if (!raw) return fallback;
+      if (!raw.startsWith("/") || raw.startsWith("//")) return fallback;
+      if (raw.includes("\\")) return fallback;
+      if (/[\s\u0000-\u001f\u007f]/.test(raw)) return fallback;
+      return raw;
+    }
+
+    const form = document.getElementById("login-form");
+    const err = document.getElementById("login-error");
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      err.textContent = "";
+      const fd = new FormData(form);
+      try {
+        const res = await fetch("/auth/login", { method: "POST", body: fd });
+        if (res.ok) {
+          const params = new URLSearchParams(location.search);
+          const next = safeNext(params.get("next"));
+          location.href = next;
+          return;
+        }
+        let msg = "登录失败";
+        try { msg = (await res.json()).message || msg; } catch (_) { /* ignore */ }
+        err.textContent = msg;
+      } catch (_) {
+        err.textContent = "网络错误，请重试";
+      }
+    });
+  </script>
+</body>
+</html>

@@ -26,9 +26,25 @@ pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
 wewrite-platform serve --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765`（Host 必须是 `127.0.0.1:8765` / `localhost:8765` / `[::1]:8765`，机器 IP 或其它域名会被 403 拒绝）。
+浏览器打开 `http://127.0.0.1:8765`（Host 必须是 `127.0.0.1:8765` / `localhost:8765` / `[::1]:8765`；机器 IP 或其它域名会被 403 拒绝，除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权，见下节「公网域名白名单与登录鉴权」）。
 
 状态根默认 `~/.wewrite`，可用 `WEWRITE_HOME` 覆盖。热榜补抓：`wewrite-platform hotspots refresh [--limit N]`。
+
+### 公网域名白名单与登录鉴权（S8-c）
+
+回环地址（`127.0.0.1` / `localhost` / `[::1]`）保持免登录，本机单机工作流不受影响。经反代暴露公网域名时：
+
+- **域名白名单**：环境变量 `ALLOWED_HOSTS`（逗号分隔，精确匹配），例如 `ALLOWED_HOSTS=temp.os-uat.tcredit.com`。未列入白名单的 Host 一律 403。
+- **登录鉴权**：白名单内、非回环的域名访问任意页面/接口时，未登录会 302 跳 `/login`（API 返回 401 `AUTH_REQUIRED`）。`/healthz` 与 `/static/*` 保持免鉴权。
+- **账号**：环境变量 `WEWRITE_USERS`，逗号分隔 `username:secret`，例如 `alice:$2b$12$...`。secret **只接受受支持的 bcrypt 哈希**（`$2a$` / `$2b$` / `$2y$` 前缀且可被 bcrypt 解析）；非哈希条目（含明文口令）会被 **fail closed 拒绝**，该账号无法登录。未配置任何账号时登录一律失败（fail closed）。
+- **会话**：登录成功签发 HttpOnly + SameSite 会话 cookie（HTTPS 域名自动追加 `Secure`），进程内存保存、重启失效。登出走 `POST /auth/logout` 或访问 `/logout`。
+- **CSRF 保留**：白名单域名放行后，变更方法仍强制同源 `Origin`（scheme + host + 端口一致）+ `Sec-Fetch-Site: same-origin` + `X-CSRF-Token`，不回退、不全局关闭。
+
+生成 bcrypt 哈希（供运维配置真实账号）：
+
+```bash
+python3 -c "import bcrypt; print(bcrypt.hashpw('你的密码'.encode('utf-8'), bcrypt.gensalt()).decode())"
+```
 
 ## 测试
 
@@ -54,11 +70,24 @@ docker-compose up -d --build
 docker compose up -d --build
 ```
 
-打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝。
+打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝（除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权）。
+
+#### 公网部署（要求说明）
+
+`docker-compose.yml` 的 `workbench.environment` 段已声明 `ALLOWED_HOSTS=${ALLOWED_HOSTS:-}` 与 `WEWRITE_USERS=${WEWRITE_USERS:-}`，docker-compose 会自动读取项目目录下的 `.env` 做插值；`.env` 已列入 `.gitignore`（不入 git、不落镜像层）。
+
+- `WEWRITE_USERS` 只接受受支持的 bcrypt 哈希（`$2a$` / `$2b$` / `$2y$` 前缀且可被 bcrypt 解析），非哈希条目（含明文口令）fail closed 拒绝、该账号无法登录。
+- 哈希生成值**自带 `$2b$12$` 前缀**，`.env` 里写 `alice:<完整哈希>` 即可，**替换整个占位符、不要重复保留前缀**（写成 `alice:$2b$12$$2b$12$...` 会被判为非法哈希、该账号 fail closed 无法登录）。
+- docker-compose v1.29.2 从 `.env` 插值时 `$2b$12$...` 会**原样传入容器**（`docker-compose config` 显示的 `$$` 只是 YAML 转义展示，容器内 `env` 实测为单 `$`），无需转义 `$`。
+- 变量缺省为空时行为 **fail closed**：公网 Host 一律 403、无任何可用账号，回环访问不受影响；这与 `app/auth.py` 的 fail-closed 口径一致。
+
+**具体注入、反代、443 端口映射与部署后校验由 JEE-1914 在 product133 实施**，本仓库只提供变量名与语义，不提供可直接照抄的部署命令；本仓库 compose 只映射宿主回环 `127.0.0.1:8765`。
 
 ### 首次配置与密钥注入（env 优先）
 
 密钥**只写不读**：页面写入的 `wechat.secret`、`image.api_key` 只保存在挂载卷 `config.yaml`（0600），不回显明文、不打印日志、不写镜像层。环境变量优先于页面配置，且被环境变量接管的字段写入会返回 `409 ENV_MANAGED`（整包失败不局部提交）。
+
+> 一次性命令（非常驻部署，仅临时跑命令用；默认不映射端口）：
 
 ```bash
 docker-compose run --rm -e WECHAT_APPID=wx... -e WECHAT_SECRET=... workbench wewrite-platform serve
@@ -86,7 +115,7 @@ docker-compose run --rm -v wewrite_home:/data -v "$PWD":/backup alpine tar czf /
 
 - 依赖**全部锁定**在仓库根 `requirements.lock`（`uv pip compile pyproject.toml -o requirements.lock --python-version 3.11` 产物，含全部传递依赖精确版本）；Dockerfile 先按锁定文件安装、再 `--no-deps` 装本项目，重建镜像的 `pip freeze` 输出完全一致。
 - **镜像体积基线**：`wewrite-platform_workbench:latest` 实测 **317 MB**（`python:3.11-slim` + 锁定依赖 + 本项目）。体积回退以该基线判断；若无体积硬约束，此项只记基线不做优化。
-- **SBOM / 许可证清单**见 `docs/sbom-licenses.md`：29 个运行依赖无 GPL/AGPL 强 copyleft，2 个 LGPL 依赖（`cssutils`/`encutils`，`wewrite` 传递引入）留裁决项。
+- **SBOM / 许可证清单**见 `docs/sbom-licenses.md`：31 个运行依赖无 GPL/AGPL 强 copyleft，2 个 LGPL 依赖（`cssutils`/`encutils`，`wewrite` 传递引入）留裁决项。
 
 ## 发布与安全口径
 

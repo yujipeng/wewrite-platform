@@ -6,6 +6,8 @@ annotated-types==0.8.0
     # via pydantic
 anyio==4.15.1
     # via starlette
+bcrypt==5.0.0
+    # via wewrite-platform (pyproject.toml)
 beautifulsoup4==4.15.0
     # via wewrite
 certifi==2026.10.23
@@ -42,6 +44,8 @@ pydantic-core==2.50.1
     # via pydantic
 pygments==2.21.0
     # via wewrite
+python-multipart==0.0.32
+    # via wewrite-platform (pyproject.toml)
 pyyaml==6.0.3
     # via
     #   wewrite-platform (pyproject.toml)

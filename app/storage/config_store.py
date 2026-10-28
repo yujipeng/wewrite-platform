@@ -104,6 +104,40 @@ DEFAULT_CONFIG: dict = {
     "permissions": {"publish": False},
 }
 
+# 缺 style.yaml 时的可编辑默认模板（整文件编辑器初始内容，含中文注释）。
+DEFAULT_STYLE_YAML = """# WeWrite 风格配置
+# 由 WeWrite 生成 —— 直接改这个文件即可，下次写作自动生效
+
+name: ""
+industry: ""
+
+target_audience: ""
+
+topics: []
+
+# 写作风格
+tone: ""
+voice: ""
+word_count: 2000
+
+content_style: ""
+writing_persona: "midnight-friend"
+
+# 禁忌（可写成数组，或对象 {words: [], topics: []}）
+blacklist: []
+
+reference_accounts: []
+
+# 排版主题（写作主题不是排版主题）
+theme: ""
+
+# 封面
+cover_style: ""
+
+# 署名
+author: ""
+"""
+
 
 def _now_iso() -> str:
     from datetime import datetime, timezone
@@ -235,6 +269,8 @@ class ConfigStore:
                 "temperature": _writer_effective("temperature", 1.0),
                 "max_tokens": _writer_effective("max_tokens", 4000),
                 "api_key_configured": _writer_key_configured(),
+                # JEE-1947 前端用：写作模型是否可用（AI 生成入口禁用判断）
+                "writer_configured": _writer_key_configured(),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},
             "env_managed": [
@@ -243,12 +279,18 @@ class ConfigStore:
         }
 
     def project_style(self) -> dict:
-        """非密钥 style 投影 + revision + 四步 onboarding 状态。"""
+        """非密钥 style 投影 + revision + raw（style.yaml 原文）。
+
+        blacklist 两种形态（数组 / 对象）都原样投影，不做归一化改写；
+        raw 供前端整文件编辑器「加载当前配置」使用。
+        """
         style = self.load_style()
         projected = {
             k: v for k, v in style.items() if k not in {"api_key", "secret"}
         }
         projected["revision"] = "sha256:" + self._style_hash(style)
+        raw = self.load_style_raw()
+        projected["raw"] = raw if raw is not None else DEFAULT_STYLE_YAML
         return projected
 
     @staticmethod
@@ -400,16 +442,156 @@ class ConfigStore:
         "writing_persona",
         "theme",
         "blacklist",
+        "reference_accounts",
         "cover_style",
         "author",
     )
 
+    # 模型生成/整文件编辑可接受的字段白名单；blacklist 兼容数组与对象两种形态。
+    STYLE_DRAFT_FIELDS = frozenset(STYLE_FIELDS)
+
+    # YAML 整文件大小上限（字节，建议 64KB）。
+    STYLE_YAML_MAX_BYTES = 64 * 1024
+
+    # ---------- 校验 / 归一化 ----------
+
+    def _style_field_error(self, field: str, message: str) -> errors.ApiError:
+        return errors.validation_error(message, {"field": field})
+
+    def validate_style_data(self, data: dict) -> dict:
+        """校验一份 style dict（结构化 JSON 或 YAML 解析后）并返回白名单收敛结果。
+
+        - 未知字段（含嵌套 ``blacklist.*``）返回 ``warnings`` 列表（点分名称），
+          不静默丢弃也不拒绝；
+        - ``blacklist`` 同时接受数组与对象 ``{words, topics}``；
+        - ``word_count`` 接受整数或字符串（如 ``"1800-2600"``）；
+        - ``topics`` / ``reference_accounts`` 强制为字符串数组；
+        - 字段类型错误抛 ``VALIDATION_ERROR``（调用方决定如何映射行号）；
+        - 返回 ``(style, warnings)``，style 只含白名单字段。
+        """
+        warnings: list[str] = []
+        style: dict = {}
+        for key in data:
+            if key in {"version", "api_key", "secret"}:
+                # 内部字段：version 由平台维护，密钥不回显；均不当作未知字段
+                continue
+            if key not in self.STYLE_FIELDS:
+                warnings.append(key)
+                continue
+        for field in self.STYLE_FIELDS:
+            if field not in data:
+                continue
+            value = data[field]
+            if field in {"topics", "reference_accounts"}:
+                if value is None:
+                    style[field] = []
+                elif isinstance(value, list):
+                    style[field] = [str(v).strip() for v in value if str(v).strip()]
+                elif isinstance(value, str) and value.strip():
+                    style[field] = [value.strip()]
+                else:
+                    raise self._style_field_error(field, f"{field} 必须为数组")
+            elif field == "blacklist":
+                style[field] = self._normalize_blacklist(value, warnings)
+            elif field == "word_count":
+                style[field] = self._normalize_word_count(value)
+            else:
+                if value is None:
+                    style[field] = ""
+                elif isinstance(value, str):
+                    style[field] = value
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    style[field] = str(value)
+                else:
+                    raise self._style_field_error(field, f"{field} 必须为字符串")
+        return style, warnings
+
+    def _normalize_blacklist(self, value, warnings: list[str] | None = None):
+        """blacklist 归一化：数组 → 字符串数组；对象 → ``{words, topics}``。
+
+        对象形态只保留 words/topics 两个键，其它键以 ``blacklist.<key>`` 点分
+        名称记入 ``warnings``（可见，不静默丢弃、不落盘）。
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, dict):
+            words = value.get("words")
+            topics = value.get("topics")
+            out: dict = {}
+            for key in value:
+                if key not in {"words", "topics"} and warnings is not None:
+                    warnings.append(f"blacklist.{key}")
+            if isinstance(words, list):
+                out["words"] = [str(v).strip() for v in words if str(v).strip()]
+            elif words is not None:
+                raise self._style_field_error("blacklist.words", "blacklist.words 必须为数组")
+            if isinstance(topics, list):
+                out["topics"] = [str(v).strip() for v in topics if str(v).strip()]
+            elif topics is not None:
+                raise self._style_field_error("blacklist.topics", "blacklist.topics 必须为数组")
+            return out
+        raise self._style_field_error("blacklist", "blacklist 必须为对象或数组")
+
+    def _normalize_word_count(self, value):
+        """word_count 接受整数或字符串（含区间字符串），统一保留原始语义。"""
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            raise self._style_field_error("word_count", "word_count 必须为整数或字符串")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            return value
+        raise self._style_field_error("word_count", "word_count 必须为整数或字符串")
+
+    # ---------- 读 ----------
+
+    def load_style_raw(self) -> str | None:
+        """返回 style.yaml 原始文本；缺失返回 None（安全读，路径穿越仍 403）。"""
+        return paths.safe_read_root_file(self.home, "style.yaml")
+
+    def style_yaml_or_default(self) -> str:
+        """返回 style.yaml 原始文本；缺失时返回一份带注释的可编辑默认模板。"""
+        raw = self.load_style_raw()
+        if raw is not None:
+            return raw
+        return DEFAULT_STYLE_YAML
+
+    # ---------- 写 ----------
+
     def put_style(self, body: dict) -> dict:
-        """白名单字段原子写 style.yaml 0600；缺失字段显式保存默认值。"""
+        """写 style.yaml：支持旧的结构化 JSON 与新的 ``{yaml: "<全文>"}``。
+
+        - 结构化 JSON（顶层为 STYLE_FIELDS 白名单）保持向后兼容；
+        - ``{yaml: ...}`` 走整文件解析→校验→原子写，未知字段进入 warnings；
+        - 大小超限 / YAML 解析失败 / 校验失败 → 422 VALIDATION_ERROR。
+        """
         if not isinstance(body, dict):
             raise errors.validation_error("请求体必须为 JSON 对象")
 
-        # 未知字段拒绝（顶层只允许 STYLE_FIELDS 白名单）
+        if "yaml" in body:
+            if not isinstance(body["yaml"], str):
+                raise errors.validation_error("yaml 必须为字符串", {"field": "yaml"})
+            text = body["yaml"]
+            if len(text.encode("utf-8")) > self.STYLE_YAML_MAX_BYTES:
+                raise errors.validation_error(
+                    "style.yaml 超过 64KB 大小上限", {"field": "yaml"}
+                )
+            # 先解析+校验，通过后**原样落盘提交的文本**（保真注释/空行/引号形式），
+            # 不重新序列化，保证 GET raw 与提交逐字节相等。
+            data = self.parse_style_yaml(text)
+            _style, warnings = self.validate_style_data(data)
+            self._write_style_raw(text)
+            result = self.project_style()
+            if warnings:
+                result["warnings"] = warnings
+            return result
+
+        # 旧的结构化 JSON 路径：只允许白名单字段
         for key in body:
             if key not in self.STYLE_FIELDS:
                 raise errors.validation_error("未知字段", {"field": key})
@@ -418,16 +600,18 @@ class ConfigStore:
         style.setdefault("version", 1)
         for field in self.STYLE_FIELDS:
             value = body.get(field)
-            if field in {"topics", "blacklist"}:
+            if field in {"topics", "reference_accounts"}:
                 if value is not None and not isinstance(value, list):
                     raise errors.validation_error(f"{field} 必须为数组", {"field": field})
                 style[field] = value if value is not None else []
+            elif field == "blacklist":
+                if value is not None:
+                    style[field] = self._normalize_blacklist(value)
+                else:
+                    style.setdefault(field, [])
             elif field == "word_count":
                 if value is not None:
-                    try:
-                        style[field] = int(value)
-                    except (TypeError, ValueError):
-                        raise errors.validation_error("word_count 必须为整数", {"field": field})
+                    style[field] = self._normalize_word_count(value)
                 else:
                     style.setdefault(field, 2000)
             else:
@@ -437,12 +621,192 @@ class ConfigStore:
                     style[field] = value
                 elif field not in style:
                     style[field] = ""  # 缺失字段显式保存默认值
+        self._write_style_data(style)
+        return self.project_style()
+
+    def _write_style_data(self, style: dict) -> None:
+        """style dict 原子写 style.yaml 0600（走 paths 安全层 + 全局锁）。"""
         paths.safe_write_root_file(
             self.home,
             "style.yaml",
             yaml.safe_dump(style, allow_unicode=True, sort_keys=False),
         )
-        return self.project_style()
+
+    def _write_style_raw(self, text: str) -> None:
+        """原样落盘 style.yaml 文本（整文件编辑路径，保真注释/空行/引号形式）。"""
+        paths.safe_write_root_file(self.home, "style.yaml", text)
+
+    def parse_style_yaml(self, text: str) -> dict:
+        """解析 style.yaml 文本；失败抛 422 并带行号 + 中文原因。"""
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            line = self._yaml_error_line(exc)
+            detail = {"reason": "yaml_parse_error"}
+            if line:
+                detail["line"] = line
+                message = f"第 {line} 行：YAML 语法错误"
+            else:
+                message = "YAML 语法错误"
+            raise errors.validation_error(message, detail) from exc
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise errors.validation_error("style.yaml 必须是 YAML 对象（顶层为键值对）", {"field": "style"})
+        return data
+
+    @staticmethod
+    def _yaml_error_line(exc: yaml.YAMLError) -> int | None:
+        """从 PyYAML 异常中尽力提取出错行号。"""
+        mark = getattr(exc, "problem_mark", None)
+        if mark is not None:
+            return mark.line + 1
+        # MarkedYAMLError 的 context 也可能带位置
+        context = getattr(exc, "context_mark", None)
+        if context is not None:
+            return context.line + 1
+        return None
+
+    @staticmethod
+    def _build_key_line_map(text: str) -> dict[str, int]:
+        """用 ``yaml.compose`` 遍历节点，建立「点分路径 → 键所在行」映射（1-based）。
+
+        能区分同名嵌套键（``blacklist.topics`` 与顶层 ``topics``），也能拿到
+        行内对象（``blacklist: {words: ...}``）里嵌套键的行号，解决文本前缀扫描
+        忽略层级、取首个命中导致的行号失真。compose 失败（语法错误）返回空表。
+        """
+        from yaml.nodes import MappingNode, SequenceNode
+
+        mapping: dict[str, int] = {}
+        try:
+            root = yaml.compose(text)
+        except yaml.YAMLError:
+            return mapping
+
+        def walk(node, prefix: str) -> None:
+            if isinstance(node, MappingNode):
+                for key_node, value_node in node.value:
+                    key = getattr(key_node, "value", None)
+                    if key is None:
+                        continue
+                    path = f"{prefix}.{key}" if prefix else str(key)
+                    mapping[path] = key_node.start_mark.line + 1
+                    walk(value_node, path)
+            elif isinstance(node, SequenceNode):
+                # 序列元素不产生键路径，但元素内部可能是 mapping，继续递归
+                for item in node.value:
+                    walk(item, prefix)
+
+        walk(root, "")
+        return mapping
+
+    def _style_error_line(self, text: str, field: str, line_map: dict[str, int] | None = None) -> int | None:
+        """按点分路径查表取错误行号；查不到回退父路径，再回退 None。"""
+        if not field:
+            return None
+        if line_map is None:
+            line_map = self._build_key_line_map(text)
+        line = line_map.get(field)
+        if line is not None:
+            return line
+        # 回退父路径（如 blacklist.words 查不到时试 blacklist）
+        if "." in field:
+            parent = field.rsplit(".", 1)[0]
+            return line_map.get(parent)
+        return None
+
+    def validate_style_yaml(self, text: str) -> dict:
+        """校验 style.yaml 文本（POST /style/validate）。
+
+        返回 ``{valid, warnings, errors: [{line, field, message}]}``；解析失败
+        抛 422（带行号），字段问题以 errors 列表返回并带 ``line``（按点分路径
+        查 ``yaml.compose`` 映射定位），message 保持中文原因。
+        """
+        if not isinstance(text, str):
+            raise errors.validation_error("yaml 必须为字符串", {"field": "yaml"})
+        if len(text.encode("utf-8")) > self.STYLE_YAML_MAX_BYTES:
+            raise errors.validation_error("style.yaml 超过 64KB 大小上限", {"field": "yaml"})
+
+        data = self.parse_style_yaml(text)
+        line_map = self._build_key_line_map(text)
+        try:
+            style, warnings = self.validate_style_data(data)
+        except errors.ApiError as exc:
+            field = exc.details.get("field") or ""
+            line = self._style_error_line(text, field, line_map)
+            return {
+                "valid": False,
+                "warnings": [],
+                "errors": [{"field": field, "line": line, "message": exc.message}],
+            }
+        return {"valid": True, "warnings": warnings, "errors": [], "fields": list(style.keys())}
+
+    @staticmethod
+    def _blacklist_as_object(value) -> dict:
+        """把 blacklist 归一为对象形态 ``{words, topics}``（生成路径专用）。
+
+        列表入参按语义归入 ``words``、``topics`` 置空（生成结果必须是对象形态，
+        验收第 7/9 条）；对象入参补齐 words/topics 两个键。
+        """
+        if isinstance(value, dict):
+            words = value.get("words")
+            topics = value.get("topics")
+            return {
+                "words": [str(v).strip() for v in words if str(v).strip()] if isinstance(words, list) else [],
+                "topics": [str(v).strip() for v in topics if str(v).strip()] if isinstance(topics, list) else [],
+            }
+        if isinstance(value, list):
+            return {"words": [str(v).strip() for v in value if str(v).strip()], "topics": []}
+        return {"words": [], "topics": []}
+
+    def generate_style_yaml(self, body: dict, backend) -> dict:
+        """生成整份 style.yaml（POST /style/generate 逻辑层）。
+
+        校验入参（industry/audience/tone_hint 至少一项非空，否则 422）→ 调写作
+        模型。模型输出导致的**任何**解析或字段错误 → ``502 UPSTREAM_ERROR``
+        （422 只留给入参不合法）；解析通过后服务端白名单裁剪补默认→重新序列化，
+        ``blacklist`` 缺省或已有值都归一成对象形态。不落盘。
+        """
+        if not isinstance(body, dict):
+            raise errors.validation_error("请求体必须为 JSON 对象")
+
+        industry = body.get("industry")
+        audience = body.get("audience")
+        tone_hint = body.get("tone_hint")
+        for field, value in (("industry", industry), ("audience", audience), ("tone_hint", tone_hint)):
+            if value is not None and not isinstance(value, str):
+                raise errors.validation_error(f"{field} 必须为字符串", {"field": field})
+
+        def _nonempty(value) -> bool:
+            return isinstance(value, str) and bool(value.strip())
+
+        if not (_nonempty(industry) or _nonempty(audience) or _nonempty(tone_hint)):
+            raise errors.validation_error(
+                "industry / audience / tone_hint 至少填写一项", {"field": "industry"}
+            )
+
+        raw_text = backend.generate(industry or "", audience or "", tone_hint or "")
+        # 模型输出导致的解析或字段错误统一归因 502（422 只用于入参）。
+        try:
+            data = self.parse_style_yaml(raw_text)
+            style, warnings = self.validate_style_data(data)
+        except errors.ApiError as exc:
+            raise errors.upstream_error(
+                "写作模型返回无法解析的风格 YAML", {"reason": "invalid_generated_yaml"}
+            ) from exc
+
+        style.setdefault("version", 1)
+        # 补齐白名单字段（缺省补默认，保证结构完整）
+        for field in self.STYLE_FIELDS:
+            if field not in style:
+                if field in {"topics", "reference_accounts"}:
+                    style[field] = []
+                else:
+                    style[field] = ""
+        # 生成路径 blacklist 强制对象形态：缺省或已有值（数组/对象）都归一。
+        style["blacklist"] = self._blacklist_as_object(style.get("blacklist"))
+        serialized = yaml.safe_dump(style, allow_unicode=True, sort_keys=False)
+        return {"yaml": serialized, "source": "llm", "warnings": warnings}
 
 
 def _pick_dotted(body: dict, dotted: str):

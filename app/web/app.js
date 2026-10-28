@@ -638,6 +638,13 @@ function detailBody(d) {
 }
 
 window.addEventListener("hashchange", render);
+// 未保存变更提示：写作风格编辑器有改动时，刷新/离开给一次确认（验收第 11 条）。
+window.addEventListener("beforeunload", (e) => {
+  if (window.__styleDirty) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
 render();
 
 // ============ 窄屏抽屉导航 ============
@@ -1561,7 +1568,7 @@ async function renderConfig() {
   container.appendChild(writerSection);
 
   // 主题
-  container.appendChild(el("div", { class: "section-title", text: "主题选择" }));
+  container.appendChild(el("div", { class: "section-title", text: "排版主题" }));
   const themeSelect = el("select");
   const currentTheme = cfg.theme || "";
   if (currentTheme && !themeList.some((t) => t.name === currentTheme)) {
@@ -1700,65 +1707,195 @@ async function renderConfig() {
   // 初始化联动提示（若当前值命中内置 provider，不覆盖已存值，仅提示）
   updateExtraHint();
 
-  // ---------- P8-F3 写作风格 ----------
+  // ---------- P8-F3 写作风格（整文件 YAML 编辑 + AI 引导，JEE-1947） ----------
   container.appendChild(el("div", { class: "section-title", text: "写作风格（style.yaml）" }));
+  container.appendChild(el("div", { class: "muted", text: "直接编辑下方 style.yaml 全文，保存后下次写作自动生效；写作主题与上方「排版主题」相互独立。" }));
 
-  // 四步 onboarding：缺 style.yaml（仅 version 无风格字段）时按定位→方向→语气→主题引导
-  const styleFields = [
-    ["name", "风格名称", "text"],
-    ["industry", "行业", "text"],
-    ["target_audience", "目标受众", "text"],
-    ["topics", "话题（逗号分隔）", "text"],
-    ["tone", "语气", "text"],
-    ["voice", "声音", "text"],
-    ["word_count", "字数", "number"],
-    ["content_style", "内容风格", "text"],
-    ["writing_persona", "写作人格", "text"],
-    ["theme", "写作主题", "text"],
-    ["blacklist", "黑名单（逗号分隔）", "text"],
-    ["cover_style", "封面风格", "text"],
-    ["author", "署名作者", "text"],
-  ];
-  const styleInputs = {};
-  const styleKvRows = [];
-  for (const [key, label, type] of styleFields) {
-    let value = style[key];
-    if (Array.isArray(value)) value = value.join("，");
-    const input = el("input", { type, value: value == null ? "" : String(value), placeholder: label });
-    styleInputs[key] = input;
-    styleKvRows.push([label, input]);
-  }
-  container.appendChild(kvForm(styleKvRows));
+  // 写作模型是否已配置（env WEWRITE_WRITER_API_KEY 是否存在）
+  const writerConfigured = !!(cfg.writer && cfg.writer.writer_configured);
 
-  const styleSaveBtn = el("button", { class: "btn", text: "保存写作风格" });
-  const styleResult = el("div", { class: "muted", text: "" });
-  container.appendChild(el("div", { class: "preview-controls" }, [styleSaveBtn, styleResult]));
+  const yamlEditor = el("textarea", {
+    class: "style-yaml-editor",
+    spellcheck: "false",
+    placeholder: "name: ...\nindustry: ...",
+  });
+  yamlEditor.value = (style && style.raw) ? style.raw : "";
+  container.appendChild(yamlEditor);
 
-  styleSaveBtn.addEventListener("click", async () => {
-    const body = {};
-    for (const [key, _label, type] of styleFields) {
-      const raw = styleInputs[key].value;
-      if (key === "topics" || key === "blacklist") {
-        body[key] = raw ? raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : [];
-      } else if (key === "word_count") {
-        body[key] = raw ? parseInt(raw, 10) : undefined;
+  // 记录已保存的原文，用于未保存变更提示
+  let savedRaw = yamlEditor.value;
+
+  const validateBox = el("div", { class: "style-validate-box", style: "display:none;" });
+  container.appendChild(validateBox);
+
+  function renderValidateResult(data) {
+    validateBox.style.display = "";
+    validateBox.innerHTML = "";
+    if (data.valid) {
+      validateBox.classList.remove("error-block");
+      validateBox.classList.add("muted");
+      if (data.warnings && data.warnings.length) {
+        validateBox.appendChild(el("div", { text: "校验通过；忽略的未知字段：" + data.warnings.join("、") }));
       } else {
-        body[key] = raw || "";
+        validateBox.appendChild(el("div", { text: "校验通过" }));
+      }
+    } else {
+      validateBox.classList.add("error-block");
+      validateBox.classList.remove("muted");
+      for (const e of data.errors || []) {
+        const lineText = e.line ? "第 " + e.line + " 行：" : "";
+        validateBox.appendChild(el("div", { text: lineText + (e.field ? e.field + "：" : "") + (e.message || "") }));
       }
     }
+  }
+
+  function renderWarnings(data) {
+    // 保存路径的 warnings 可见化（不静默丢弃）
+    if (data && data.warnings && data.warnings.length) {
+      styleResult.textContent = "已保存；忽略的未知字段：" + data.warnings.join("、");
+      styleResult.classList.add("muted");
+    }
+  }
+
+  // 四个操作：加载当前配置 / 智能生成 / 校验 / 保存
+  const styleLoadBtn = el("button", { class: "btn", text: "加载当前配置" });
+  const styleGenBtn = el("button", { class: "btn", text: "智能生成" });
+  const styleValidateBtn = el("button", { class: "btn", text: "校验" });
+  const styleSaveBtn = el("button", { class: "btn", text: "保存" });
+  const styleResult = el("div", { class: "muted", text: "" });
+
+  // AI 引导区（默认折叠）
+  const aiBox = el("div", { class: "ai-generate-box", style: "display:none;" });
+  const aiIndustry = el("input", { class: "style-custom-input", type: "text", placeholder: "做什么行业/领域" });
+  const aiAudience = el("input", { class: "style-custom-input", type: "text", placeholder: "写给谁看" });
+  const aiTone = el("input", { class: "style-custom-input", type: "text", placeholder: "希望什么调性（一句话）" });
+  aiBox.appendChild(kvForm([["行业/领域", aiIndustry], ["目标读者", aiAudience], ["调性", aiTone]]));
+  const aiGoBtn = el("button", { class: "btn", text: "生成" });
+  const aiResult = el("div", { class: "ai-generate-hint", text: "" });
+  if (!writerConfigured) {
+    aiGoBtn.disabled = true;
+    aiResult.textContent = "需先配置写作模型（见「写作模型」区，WEWRITE_WRITER_API_KEY）";
+  }
+  aiBox.appendChild(el("div", { class: "preview-controls" }, [aiGoBtn, aiResult]));
+  container.appendChild(aiBox);
+
+  container.appendChild(el("div", { class: "preview-controls" }, [styleLoadBtn, styleGenBtn, styleValidateBtn, styleSaveBtn, styleResult]));
+
+  // 未保存变更提示：改动后刷新/离开给一次确认
+  function markDirty(dirty) {
+    window.__styleDirty = dirty;
+  }
+  yamlEditor.addEventListener("input", () => { markDirty(yamlEditor.value !== savedRaw); });
+
+  // 加载当前配置
+  styleLoadBtn.addEventListener("click", async () => {
+    try {
+      const s = await api("/api/v1/style");
+      yamlEditor.value = s.raw || "";
+      savedRaw = yamlEditor.value;
+      markDirty(false);
+      styleResult.textContent = "已加载";
+      styleResult.classList.remove("error-block");
+    } catch (err) {
+      styleResult.textContent = "加载失败：" + (err.code || err.message);
+      styleResult.classList.add("error-block");
+    }
+  });
+
+  // 智能生成：展开引导区
+  styleGenBtn.addEventListener("click", () => {
+    aiBox.style.display = aiBox.style.display === "none" ? "" : "none";
+  });
+
+  aiGoBtn.addEventListener("click", async () => {
+    const industry = aiIndustry.value.trim();
+    const audience = aiAudience.value.trim();
+    const toneHint = aiTone.value.trim();
+    if (!industry && !audience && !toneHint) {
+      aiResult.textContent = "请至少填写一项引导信息（行业/受众/调性）";
+      aiResult.classList.add("error-block");
+      return;
+    }
+    aiGoBtn.disabled = true;
+    aiResult.classList.remove("error-block");
+    aiResult.textContent = "正在生成…";
     try {
       const token = await csrfToken();
-      const res = await fetch("/api/v1/style", {
-        method: "PUT",
+      const res = await fetch("/api/v1/style/generate", {
+        method: "POST",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ industry, audience, tone_hint: toneHint }),
       });
       if (!res.ok) {
         let code = "HTTP_" + res.status, message = res.statusText;
         try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
         const err = new Error(message); err.code = code; err.status = res.status; throw err;
       }
+      const data = await res.json();
+      yamlEditor.value = data.yaml || "";
+      markDirty(yamlEditor.value !== savedRaw);
+      aiResult.textContent = "已生成并填入编辑器，请预览修改后点「保存」落盘（未自动保存）";
+    } catch (err) {
+      aiResult.textContent = "生成失败：" + (err.code || err.message);
+      aiResult.classList.add("error-block");
+    } finally {
+      aiGoBtn.disabled = !writerConfigured;
+    }
+  });
+
+  // 校验
+  styleValidateBtn.addEventListener("click", async () => {
+    styleResult.textContent = "";
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/style/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ yaml: yamlEditor.value }),
+      });
+      let data = null;
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        const code = data && data.code ? data.code : "HTTP_" + res.status;
+        const message = data && data.message ? data.message : res.statusText;
+        // 422 解析错误：展示行号 + 中文原因
+        renderValidateResult({ valid: false, errors: [{ field: data && data.details && data.details.field, message: (data && data.details && data.details.line ? "第 " + data.details.line + " 行：" : "") + message }] });
+        styleResult.textContent = "校验失败：" + (code || message);
+        styleResult.classList.add("error-block");
+        return;
+      }
+      renderValidateResult(data);
+      styleResult.textContent = data.valid ? "校验通过" : "校验未通过";
+      styleResult.classList.remove("error-block");
+      if (!data.valid) styleResult.classList.add("error-block");
+    } catch (err) {
+      styleResult.textContent = "校验失败：" + (err.code || err.message);
+      styleResult.classList.add("error-block");
+    }
+  });
+
+  // 保存（提交 yaml 全文）
+  styleSaveBtn.addEventListener("click", async () => {
+    styleResult.textContent = "";
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/style", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ yaml: yamlEditor.value }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status, message = res.statusText;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; throw err;
+      }
+      const saved = await res.json();
+      savedRaw = yamlEditor.value;
+      markDirty(false);
       styleResult.textContent = "已保存";
+      styleResult.classList.remove("error-block");
+      styleResult.classList.remove("muted");
+      renderWarnings(saved);
       setTimeout(renderConfig, 400);
     } catch (err) {
       styleResult.textContent = "保存失败：" + (err.code || err.message);
@@ -1771,7 +1908,10 @@ function kvForm(rows) {
   const dl = el("dl", { class: "kv" });
   for (const [label, input] of rows) {
     dl.appendChild(el("dt", { text: label }));
-    input.style.cssText = "padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%";
+    // 仅对真实表单控件套内联样式；包装容器（select+自定义、标签输入、字数档位）由 CSS class 负责
+    if (input.tagName === "INPUT" || input.tagName === "SELECT" || input.tagName === "TEXTAREA") {
+      input.style.cssText = "padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;width:100%";
+    }
     dl.appendChild(el("dd", {}, [input]));
   }
   return dl;

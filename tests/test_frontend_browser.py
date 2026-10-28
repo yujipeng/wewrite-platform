@@ -406,3 +406,74 @@ def test_p8_writer_numeric_validation_blocks_submit(browser_session):
     page.wait_for_timeout(400)
     assert "温度（0–2）必须是 0 到 2 之间的数字" in page.inner_text("#app")
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_style_yaml_editor_render_and_save(browser_session):
+    """JEE-1947 真浏览器验证：整文件 YAML 编辑器渲染，参考格式粘贴保存成功且原文保真。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_style():
+        data = urllib.request.urlopen(f"{base}/api/v1/style", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(400)
+
+    # 1) 整文件 YAML 编辑器 textarea 渲染，四个操作按钮齐全
+    editor = page.locator("textarea.style-yaml-editor")
+    assert editor.count() == 1, "应渲染 YAML 全文编辑器"
+    for btn in ("加载当前配置", "智能生成", "校验"):
+        assert page.locator("button", has_text=btn).count() >= 1, f"缺少按钮 {btn}"
+    save_btns = page.locator("button").evaluate_all(
+        "(els) => els.map((e) => e.textContent.trim()).filter((t) => t === '保存')"
+    )
+    assert "保存" in save_btns, "缺少「保存」按钮"
+
+    # 2) 参考格式（blacklist 对象 + word_count 字符串 + reference_accounts）原样粘贴保存成功
+    reference = (
+        "# 风格配置\n"
+        "name: 社会现象心理分析\n"
+        "blacklist:\n  words: [震惊]\n  topics: [宗教]\n"
+        "word_count: \"1800-2600\"\n"
+        "reference_accounts: []\n"
+        "tone: 像朋友聊天\n"
+    )
+    editor.fill(reference)
+    page.get_by_role("button", name="保存", exact=True).first.click()
+    page.wait_for_timeout(900)
+
+    saved = read_style()
+    assert saved.get("word_count") == "1800-2600", f"word_count 应为字符串，实际 {saved.get('word_count')}"
+    assert saved.get("reference_accounts") == [], "reference_accounts 应保留"
+    assert isinstance(saved.get("blacklist"), dict), "blacklist 应为对象形态"
+    # 原文保真：含注释的输入应逐字节回读
+    assert saved.get("raw") == reference, "raw 应逐字节等于提交文本"
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_style_validate_error_shows_line(browser_session):
+    """JEE-1947 真浏览器验证：校验坏 YAML 显示中文原因（不 500）。"""
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(400)
+
+    editor = page.locator("textarea.style-yaml-editor")
+    editor.fill("name: ok\n  bad-indent: [unclosed\n")
+    page.locator("button", has_text="校验").click()
+    page.wait_for_timeout(900)
+
+    body_text = page.inner_text("#app")
+    assert "校验失败" in body_text or "YAML" in body_text or "语法" in body_text
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

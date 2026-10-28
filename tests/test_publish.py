@@ -405,6 +405,135 @@ def test_style_unknown_field_rejected(monkeypatch, tmp_path):
     assert not os.path.exists(os.path.join(home, "style.yaml"))
 
 
+# ---------- JEE-1947：写作风格整文件编辑与智能生成 ----------
+
+class _FakeStyleBackend:
+    def __init__(self, text):
+        self.text = text
+
+    def generate(self, industry, audience, tone_hint):
+        return self.text
+
+
+def test_style_generate_not_configured_503(monkeypatch, tmp_path):
+    """未配 WEWRITE_WRITER_API_KEY 时 503 WRITER_NOT_CONFIGURED，不 500 不空草稿。"""
+    home = str(tmp_path)
+    monkeypatch.delenv("WEWRITE_WRITER_API_KEY", raising=False)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "科技"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 503
+    body = r.json()
+    assert body["code"] == "WRITER_NOT_CONFIGURED"
+    assert "写作模型" in body["message"]
+    assert "yaml" not in body
+
+
+def test_style_generate_invalid_hints_422(monkeypatch, tmp_path):
+    """三项引导信息均空 → 422 VALIDATION_ERROR。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "", "audience": "", "tone_hint": ""},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    assert r.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_style_generate_sanitized_yaml_and_no_persist(monkeypatch, tmp_path):
+    """生成返回整份 YAML，服务端裁剪后只含白名单字段且可解析，不落盘。"""
+    import yaml as _yaml
+
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    c.app.state.style_generate_backend = _FakeStyleBackend(
+        "name: 我的风格\ntone: 专业\nfoo: 丢弃\nblacklist:\n  words: [\"震惊\"]\n"
+    )
+    r = c.post(
+        "/api/v1/style/generate",
+        json={"industry": "科技", "tone_hint": "专业"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "llm"
+    parsed = _yaml.safe_load(body["yaml"])
+    assert parsed is not None
+    assert "foo" not in parsed
+    assert parsed["tone"] == "专业"
+    assert not os.path.exists(os.path.join(home, "style.yaml"))
+
+
+def test_style_put_yaml_reference_format_succeeds(monkeypatch, tmp_path):
+    """参考格式（blacklist 对象 + word_count 字符串 + reference_accounts）原样保存成功。"""
+    import yaml as _yaml
+
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    reference = (
+        "name: 测试\nblacklist:\n  words: [\"震惊\"]\n  topics: [\"宗教\"]\n"
+        "word_count: \"1800-2600\"\nreference_accounts: []\n"
+    )
+    r = c.put(
+        "/api/v1/style",
+        json={"yaml": reference},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    data = _yaml.safe_load(open(os.path.join(home, "style.yaml"), encoding="utf-8"))
+    assert isinstance(data["blacklist"], dict)
+    assert data["word_count"] == "1800-2600"
+    assert data["reference_accounts"] == []
+
+
+def test_style_validate_parse_error_with_line(monkeypatch, tmp_path):
+    """坏 YAML 校验 → 422 带行号 + 中文原因。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/validate",
+        json={"yaml": "name: ok\n  bad-indent: [unclosed\n"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["code"] == "VALIDATION_ERROR"
+    assert "YAML" in body["message"]
+    assert "line" in body.get("details", {}) or "行" in body["message"]
+
+
+def test_style_validate_unknown_field_warning(monkeypatch, tmp_path):
+    """未知字段返回 warnings 列表（可见，不静默）。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    r = c.post(
+        "/api/v1/style/validate",
+        json={"yaml": "foo: 1\ntone: 专业\n"},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["valid"] is True
+    assert "foo" in body["warnings"]
+
+
+def test_style_get_returns_raw(monkeypatch, tmp_path):
+    """GET /style 增 raw 字段，返回 style.yaml 原文。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    c.put("/api/v1/style", json={"yaml": "name: 原文测试\n"}, headers=post_headers(c))
+    r = c.get("/api/v1/style")
+    assert r.status_code == 200
+    body = r.json()
+    assert "raw" in body
+    assert "原文测试" in body["raw"]
+
+
 def test_publish_permission_bad_run_id(monkeypatch, tmp_path):
     home = str(tmp_path)
     c = make_client(monkeypatch, home)

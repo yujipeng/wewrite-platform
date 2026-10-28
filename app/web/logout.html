@@ -7,12 +7,22 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <main class="login-wrap">
-    <div class="card">
-      <h1 class="page-title">已登出</h1>
-      <p class="muted">正在清理会话…</p>
-      <a class="btn" href="/login">返回登录</a>
+  <main class="login-shell">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="logo">W</div>
+        <div>
+          <div class="name">WeWrite 工作台</div>
+          <div class="sub">公众号写作流水线</div>
+        </div>
+      </div>
+      <div class="login-body">
+        <h1 class="login-title">已登出</h1>
+        <p class="muted">正在清理会话…</p>
+        <a class="btn primary login-submit" href="/login">返回登录</a>
+      </div>
     </div>
+    <div class="login-foot">WeWrite 工作台 · 本地单机</div>
   </main>
   <script type="module">
     // 调用登出接口撤销会话，成功后回登录页

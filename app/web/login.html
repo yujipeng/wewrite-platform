@@ -5,30 +5,34 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>登录 · WeWrite 工作台</title>
   <link rel="stylesheet" href="/static/styles.css">
-  <style>
-    .login-wrap { max-width: 380px; margin: 64px auto; }
-    .login-form { display: flex; flex-direction: column; gap: 12px; }
-    .login-form label { font-size: 14px; color: var(--muted); }
-    .login-form input {
-      padding: 10px 12px; border: 1px solid var(--border);
-      border-radius: 6px; font-size: 14px;
-    }
-    .login-error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
-  </style>
 </head>
 <body>
-  <main class="login-wrap">
-    <div class="card">
-      <h1 class="page-title">WeWrite 工作台登录</h1>
-      <form id="login-form" class="login-form" method="post" action="/auth/login">
-        <label for="username">账号</label>
-        <input id="username" name="username" type="text" autocomplete="username" required>
-        <label for="password">密码</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
-        <div id="login-error" class="login-error" role="alert"></div>
-        <button type="submit" class="btn">登录</button>
-      </form>
+  <main class="login-shell">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="logo">W</div>
+        <div>
+          <div class="name">WeWrite 工作台</div>
+          <div class="sub">公众号写作流水线</div>
+        </div>
+      </div>
+      <div class="login-body">
+        <h1 class="login-title">登录</h1>
+        <form id="login-form" class="login-form" method="post" action="/auth/login">
+          <div class="field">
+            <label for="username">账号</label>
+            <input id="username" name="username" type="text" autocomplete="username" required>
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+          </div>
+          <div id="login-error" class="login-error" role="alert"></div>
+          <button type="submit" class="btn primary login-submit">登录</button>
+        </form>
+      </div>
     </div>
+    <div class="login-foot">WeWrite 工作台 · 本地单机</div>
   </main>
   <script type="module">
     // 登录后跳转目标清洗：与后端 app.middleware.safe_next 同一口径。

@@ -90,6 +90,39 @@ def test_p8_theme_select(client):
     assert "themeSelect" in js
 
 
+def test_p8_writer_model_section_present(client):
+    """P8「写作模型（文章生成）」区块：provider 下拉/联动/自定义/api_key 只写不读/env 优先。"""
+    js = _app_js(client)
+    assert "/api/v1/writer-providers" in js
+    assert "写作模型（文章生成）" in js
+    # 未配置 api_key 时给用户一眼后果（WRITER_NOT_CONFIGURED）
+    assert "未配置写作模型，文章生成会失败" in js
+    assert "WRITER_NOT_CONFIGURED" in js
+    # 控件齐全：provider/model/base_url/api_key/temperature/max_tokens
+    for label in ("模型提供商", "模型名称", "接口地址", "API 密钥", "温度（0–2）", "最大 token 数"):
+        assert label in js
+    # api_key 只写不读（password + 留空保持占位符）
+    assert 'type: "password"' in js
+    assert "已配置（留空保持）" in js
+    # 保存请求体并入 writer（env 接管的字段不发）
+    assert "writer.provider" in js
+    assert "writer.temperature" in js
+    assert "writer.max_tokens" in js
+
+
+def test_p8_writer_numeric_validation_before_submit(client):
+    """写作模型保存前校验：temperature 0–2 有限、max_tokens 正整数，不合法就地提示中止。"""
+    js = _app_js(client)
+    # 提交前校验存在：不合规则 return 中止，不发起请求
+    assert "温度（0–2）必须是 0 到 2 之间的数字" in js
+    assert "最大 token 数必须为正整数" in js
+    # 禁止 parseInt 静默截断小数：用 Number + isInteger 校验，而不是 parseInt
+    assert "Number.isInteger" in js
+    assert "Number.isFinite" in js
+    # 校验失败路径用 return 中止（不落到 fetch 分支）
+    assert "return;" in js
+
+
 def test_p5_compare_present(client):
     """P5 并排对比（最多 3 条）。"""
     js = _app_js(client)

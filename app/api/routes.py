@@ -227,6 +227,21 @@ async def list_image_providers():
     }
 
 
+@router.get("/api/v1/writer-providers")
+async def list_writer_providers():
+    """只读端点：内置写作模型供应商元数据，供 P8「写作模型」区块渲染 provider 下拉。
+
+    ``custom`` 作为「自定义…」语义由前端处理；数据来自
+    ``app.adapters.writer_providers``，集中一处便于加厂商。
+    """
+    from app.adapters import writer_providers
+
+    return {
+        "providers": writer_providers.list_writer_providers(),
+        "supports_custom": True,
+    }
+
+
 @router.post("/api/v1/preview")
 async def preview(request: Request):
     """P3 产物预览：正文来源切换 + 主题 + 转换 + 过滤 + paste_safe。"""

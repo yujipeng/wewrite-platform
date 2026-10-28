@@ -9,7 +9,7 @@ import os
 import yaml
 
 from app.storage import jobs as jobs_store
-from app.worker.executor import Worker
+from app.worker.executor import Worker, WriterBackend, _writer_env
 
 
 def write_state(home, run_id, state: dict):
@@ -38,8 +38,10 @@ class FakeWriter:
     def __init__(self, exit_code=0, content=None):
         self.exit_code = exit_code
         self.content = content or ("这是生成的正文。" * 40)  # 320 字符
+        self.last_env = None
 
-    def run(self, brief_path, output_path):
+    def run(self, brief_path, output_path, env=None):
+        self.last_env = env
         if self.exit_code == 0:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(self.content)
@@ -67,6 +69,18 @@ def make_queued_job(home, run_id, job_id="j-test000001"):
     return job
 
 
+def write_config(home, writer: dict):
+    """写 config.yaml 的 writer 段（模拟网页保存后的落盘结果）。"""
+    from app.storage.config_store import ConfigStore
+
+    store = ConfigStore(home)
+    cfg = store.load_config()
+    cfg["writer"].update(writer)
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+
 def test_worker_consumes_queued_job_success(tmp_path):
     home = str(tmp_path)
     run_id = "20261026-120000-abcdef"
@@ -91,6 +105,112 @@ def test_worker_writer_exit_3_not_configured(tmp_path):
     result = worker.run_once()
     assert result["status"] == "failed"
     assert result["last_error"]["code"] == "WRITER_NOT_CONFIGURED"
+
+
+def test_worker_writer_env_injected_from_config(tmp_path):
+    """第 7 条核心：网页改 writer 配置后，子进程调 llm-write 时必须注入生效值。
+
+    不是只测「配置存下来了」，而是证明 worker 把 config.yaml 里的 model 等
+    以环境变量传给 writer 后端（默认 WriterBackend 再传给 llm-write 子进程）。
+    """
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_config(home, {
+        "provider": "openai",
+        "model": "my-custom-model",
+        "base_url": "https://gw.example.com/v1",
+        "temperature": 0.7,
+        "max_tokens": 2048,
+        "api_key": "sk-test",
+    })
+    writer = FakeWriter(0)
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    env = writer.last_env
+    assert env is not None
+    assert env["WEWRITE_WRITER_MODEL"] == "my-custom-model"
+    assert env["WEWRITE_WRITER_PROVIDER"] == "openai"
+    assert env["WEWRITE_WRITER_BASE_URL"] == "https://gw.example.com/v1"
+    assert env["WEWRITE_WRITER_TEMPERATURE"] == "0.7"
+    assert env["WEWRITE_WRITER_MAX_TOKENS"] == "2048"
+    assert env["WEWRITE_WRITER_API_KEY"] == "sk-test"
+
+
+def test_worker_writer_env_prefers_environment_variables(tmp_path, monkeypatch):
+    """env 优先：环境变量已接管的字段，config.yaml 不得覆盖。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_config(home, {"model": "config-model", "api_key": "sk-config"})
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "env-model")
+    monkeypatch.setenv("WEWRITE_WRITER_API_KEY", "sk-env")
+    writer = FakeWriter(0)
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    env = writer.last_env
+    # env 已接管的字段不注入（让 llm-write 自己读到环境变量的值）
+    assert "WEWRITE_WRITER_MODEL" not in env
+    assert "WEWRITE_WRITER_API_KEY" not in env
+    # 未被 env 接管的字段仍来自 config.yaml
+    assert env.get("WEWRITE_WRITER_PROVIDER") == "deepseek"
+
+
+def test_writer_env_maps_fields_without_overriding_environment(tmp_path, monkeypatch):
+    """_writer_env 单元：只映射已配置字段，且不覆盖 env 已接管的字段。"""
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "env-model")
+    config = {
+        "writer": {
+            "provider": "openai",
+            "model": "config-model",
+            "base_url": "https://gw.example.com/v1",
+            "temperature": 0.5,
+            "max_tokens": 1000,
+            "api_key": "sk-config",
+        }
+    }
+    env = _writer_env(config)
+    assert env["WEWRITE_WRITER_PROVIDER"] == "openai"
+    assert env["WEWRITE_WRITER_BASE_URL"] == "https://gw.example.com/v1"
+    assert env["WEWRITE_WRITER_TEMPERATURE"] == "0.5"
+    assert env["WEWRITE_WRITER_MAX_TOKENS"] == "1000"
+    assert env["WEWRITE_WRITER_API_KEY"] == "sk-config"
+    # env 已接管的 model 不覆盖
+    assert "WEWRITE_WRITER_MODEL" not in env
+    # 空值字段不注入
+    env2 = _writer_env({"writer": {"model": "", "api_key": None, "base_url": "https://x"}})
+    assert "WEWRITE_WRITER_MODEL" not in env2
+    assert "WEWRITE_WRITER_API_KEY" not in env2
+    assert env2["WEWRITE_WRITER_BASE_URL"] == "https://x"
+
+
+def test_writer_backend_passes_env_to_subprocess(tmp_path, monkeypatch):
+    """WriterBackend.run 把注入的 env 传给子进程（不因空 env 丢失父进程环境）。"""
+    backend = WriterBackend()
+    brief = tmp_path / "brief.md"
+    brief.write_text("# 选题", encoding="utf-8")
+    out = tmp_path / "out.md"
+    monkeypatch.setattr("app.worker.executor.subprocess.run", _FakeRun())
+    backend.run(str(brief), str(out), env={"WEWRITE_WRITER_MODEL": "my-model"})
+    call = _FakeRun.last_call
+    assert call is not None
+    assert call["env"]["WEWRITE_WRITER_MODEL"] == "my-model"
+    # 继承父进程环境的必要变量
+    assert "PATH" in call["env"]
+
+
+class _FakeRun:
+    """记录 subprocess.run 调用，返回退出码 0。"""
+
+    last_call = None
+
+    def __call__(self, cmd, capture_output=True, text=True, timeout=None, env=None):
+        _FakeRun.last_call = {"cmd": cmd, "env": env}
+        import subprocess as sp
+
+        return sp.CompletedProcess(cmd, 0, "", "")
 
 
 def test_worker_writer_exit_4_not_overwrite_existing(tmp_path):

@@ -312,3 +312,97 @@ def test_p8_switch_to_azure_openai_empty_base_url_not_residue(browser_session):
     assert cfg["image"]["provider"] == "azure_openai"
     assert cfg["image"]["base_url"] == ""
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_writer_model_provider_linkage_and_key_not_echoed(browser_session):
+    """JEE-1946 真浏览器验证：写作模型 provider 下拉联动默认值，api_key 不回显。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_config():
+        data = urllib.request.urlopen(f"{base}/api/v1/config", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    # 「写作模型（文章生成）」区块存在
+    assert "写作模型（文章生成）" in page.inner_text("#app")
+
+    writer_provider = _kv_control(page, "模型提供商")
+    assert writer_provider.count() == 1, "写作模型 provider 应为下拉选择框"
+    options = [o.strip() for o in writer_provider.locator("option").all_inner_texts()]
+    assert "自定义…" in options
+    assert "deepseek" in options and "openai" in options
+
+    # 选 openai → model/base_url 联动为默认值
+    writer_provider.select_option("openai")
+    model_input = _kv_control(page, "模型名称")
+    base_url_input = _kv_control(page, "接口地址")
+    assert model_input.input_value() == "gpt-4o"
+    assert base_url_input.input_value() == "https://api.openai.com/v1"
+
+    # 切到 deepseek 同步刷新
+    writer_provider.select_option("deepseek")
+    assert model_input.input_value() == "deepseek-chat"
+    assert base_url_input.input_value() == "https://api.deepseek.com"
+
+    # api_key 只写不读：填密钥保存后 GET /config 无明文、无末四位
+    api_key_input = _kv_control(page, "API 密钥")
+    secret = "SK-WRITER-BROWSER-1234567890"
+    api_key_input.fill(secret)
+    save_btn = page.locator("button", has_text="保存配置")
+    save_btn.click()
+    page.wait_for_timeout(900)
+
+    cfg = read_config()
+    assert cfg["writer"]["api_key_configured"] is True
+    assert "api_key" not in cfg["writer"]
+    assert secret not in json.dumps(cfg)
+    assert "1234567890" not in json.dumps(cfg)
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def test_p8_writer_numeric_validation_blocks_submit(browser_session):
+    """JEE-1946 返修回归：max_tokens=1.5 / temperature=3 保存时不发请求且提示错误。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    def read_config():
+        data = urllib.request.urlopen(f"{base}/api/v1/config", timeout=5)
+        return json.loads(data.read().decode("utf-8"))
+
+    page.goto(f"{base}/#/config", wait_until="networkidle")
+    page.wait_for_timeout(300)
+
+    max_tokens_input = _kv_control(page, "最大 token 数")
+    temp_input = _kv_control(page, "温度（0–2）")
+    save_btn = page.locator("button", has_text="保存配置")
+
+    before = read_config()["writer"]["max_tokens"]
+
+    # max_tokens=1.5：不发起请求，就地报错
+    max_tokens_input.fill("1.5")
+    save_btn.click()
+    page.wait_for_timeout(400)
+    assert "最大 token 数必须为正整数" in page.inner_text("#app")
+    assert read_config()["writer"]["max_tokens"] == before, "非法 max_tokens 不应落盘"
+
+    # temperature=3：不发起请求，就地报错
+    temp_input.fill("3")
+    save_btn.click()
+    page.wait_for_timeout(400)
+    assert "温度（0–2）必须是 0 到 2 之间的数字" in page.inner_text("#app")
+    assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"

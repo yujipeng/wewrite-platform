@@ -426,12 +426,80 @@ def test_publish_reconcile_without_media_id_manual_review(monkeypatch, tmp_path)
     assert "人工" in body["note"]
 
 
-def test_config_writer_readonly_rejected(monkeypatch, tmp_path):
+def test_config_writer_now_writable(monkeypatch, tmp_path):
+    """JEE-1946：writer 从只读放开为可写白名单；改 model 保存后回读一致。"""
     home = str(tmp_path)
     c = make_client(monkeypatch, home)
-    r = c.put("/api/v1/config", json={"writer": {"api_key": "x"}}, headers=post_headers(c))
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"provider": "openai", "model": "gpt-4o", "base_url": "https://api.openai.com/v1"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["provider"] == "openai"
+    assert body["writer"]["model"] == "gpt-4o"
+    assert body["writer"]["base_url"] == "https://api.openai.com/v1"
+
+
+def test_config_writer_api_key_never_echoed(monkeypatch, tmp_path):
+    """writer.api_key 只写不读：响应与回读均无明文、无末四位，仅 api_key_configured。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    secret = "SK-WRITER-PLAIN-9876543210"
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"api_key": secret, "model": "my-model"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    assert secret not in json.dumps(r.json())
+    assert "9876543210" not in json.dumps(r.json())
+
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is True
+    assert "api_key" not in body["writer"]
+    assert secret not in json.dumps(body)
+    assert "9876543210" not in json.dumps(body)
+
+
+def test_config_writer_env_managed_409(monkeypatch, tmp_path):
+    """writer 字段被环境变量接管时写入返回 409 ENV_MANAGED，整包不局部提交。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "env-model")
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"model": "web-model", "provider": "openai"}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "ENV_MANAGED"
+    # env_managed 错误体沿用 image 既有结构（接管字段与变量名随 message 返回）
+    assert r.json()["message"]["field"] == "writer.model"
+    assert r.json()["message"]["env"] == "WEWRITE_WRITER_MODEL"
+    # 整包失败：provider 也不得提交
+    assert c.get("/api/v1/config").json()["writer"]["provider"] == "deepseek"
+
+
+def test_config_writer_temperature_max_tokens_validation(monkeypatch, tmp_path):
+    """temperature / max_tokens 数值校验：非法值整包 422，合法值回读一致。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    # max_tokens 非正整数拒绝
+    r = c.put("/api/v1/config", json={"writer": {"max_tokens": -1}}, headers=post_headers(c))
     assert r.status_code == 422
     assert r.json()["code"] == "VALIDATION_ERROR"
+    # 合法值保存回读
+    r = c.put(
+        "/api/v1/config",
+        json={"writer": {"temperature": 0.7, "max_tokens": 2048}},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["temperature"] == 0.7
+    assert body["writer"]["max_tokens"] == 2048
 
 
 def test_publish_reconcile_text_only_consistent(monkeypatch, tmp_path):

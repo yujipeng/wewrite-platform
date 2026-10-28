@@ -26,7 +26,7 @@ pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
 wewrite-platform serve --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765`（Host 必须是 `127.0.0.1:8765` / `localhost:8765` / `[::1]:8765`，机器 IP 或其它域名会被 403 拒绝）。
+浏览器打开 `http://127.0.0.1:8765`（Host 必须是 `127.0.0.1:8765` / `localhost:8765` / `[::1]:8765`；机器 IP 或其它域名会被 403 拒绝，除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权，见下节「公网域名白名单与登录鉴权」）。
 
 状态根默认 `~/.wewrite`，可用 `WEWRITE_HOME` 覆盖。热榜补抓：`wewrite-platform hotspots refresh [--limit N]`。
 
@@ -36,7 +36,7 @@ wewrite-platform serve --port 8765
 
 - **域名白名单**：环境变量 `ALLOWED_HOSTS`（逗号分隔，精确匹配），例如 `ALLOWED_HOSTS=temp.os-uat.tcredit.com`。未列入白名单的 Host 一律 403。
 - **登录鉴权**：白名单内、非回环的域名访问任意页面/接口时，未登录会 302 跳 `/login`（API 返回 401 `AUTH_REQUIRED`）。`/healthz` 与 `/static/*` 保持免鉴权。
-- **账号**：环境变量 `WEWRITE_USERS`，逗号分隔 `username:secret`，例如 `alice:$2b$12$...`。secret 支持 **bcrypt 哈希**（推荐，`$2b$` 前缀），也支持明文（仅限内网/本地临时使用，不推荐）。未配置任何账号时登录一律失败（fail closed）。
+- **账号**：环境变量 `WEWRITE_USERS`，逗号分隔 `username:secret`，例如 `alice:$2b$12$...`。secret **只接受受支持的 bcrypt 哈希**（`$2a$` / `$2b$` / `$2y$` 前缀且可被 bcrypt 解析）；非哈希条目（含明文口令）会被 **fail closed 拒绝**，该账号无法登录。未配置任何账号时登录一律失败（fail closed）。
 - **会话**：登录成功签发 HttpOnly + SameSite 会话 cookie（HTTPS 域名自动追加 `Secure`），进程内存保存、重启失效。登出走 `POST /auth/logout` 或访问 `/logout`。
 - **CSRF 保留**：白名单域名放行后，变更方法仍强制同源 `Origin`（scheme + host + 端口一致）+ `Sec-Fetch-Site: same-origin` + `X-CSRF-Token`，不回退、不全局关闭。
 
@@ -45,8 +45,6 @@ wewrite-platform serve --port 8765
 ```bash
 python3 -c "import bcrypt; print(bcrypt.hashpw('你的密码'.encode('utf-8'), bcrypt.gensalt()).decode())"
 ```
-
-
 
 ## 测试
 
@@ -72,7 +70,16 @@ docker-compose up -d --build
 docker compose up -d --build
 ```
 
-打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝。
+打开 `http://127.0.0.1:8765`。健康检查与浏览器验收都用回环地址：容器内监听 `0.0.0.0`，但 compose 只把宿主 `127.0.0.1:8765` 映射进来；用机器 IP 或其它域名访问会被 403 拒绝（除非已列入 `ALLOWED_HOSTS` 白名单，白名单内域名走登录鉴权）。
+
+公网部署需额外注入 `ALLOWED_HOSTS` 与 `WEWRITE_USERS`（见「公网域名白名单与登录鉴权」一节），例如：
+
+```bash
+docker-compose run --rm \
+  -e ALLOWED_HOSTS=temp.os-uat.tcredit.com \
+  -e "WEWRITE_USERS=alice:\$2b\$12\$..." \
+  workbench wewrite-platform serve
+```
 
 ### 首次配置与密钥注入（env 优先）
 
@@ -104,7 +111,7 @@ docker-compose run --rm -v wewrite_home:/data -v "$PWD":/backup alpine tar czf /
 
 - 依赖**全部锁定**在仓库根 `requirements.lock`（`uv pip compile pyproject.toml -o requirements.lock --python-version 3.11` 产物，含全部传递依赖精确版本）；Dockerfile 先按锁定文件安装、再 `--no-deps` 装本项目，重建镜像的 `pip freeze` 输出完全一致。
 - **镜像体积基线**：`wewrite-platform_workbench:latest` 实测 **317 MB**（`python:3.11-slim` + 锁定依赖 + 本项目）。体积回退以该基线判断；若无体积硬约束，此项只记基线不做优化。
-- **SBOM / 许可证清单**见 `docs/sbom-licenses.md`：29 个运行依赖无 GPL/AGPL 强 copyleft，2 个 LGPL 依赖（`cssutils`/`encutils`，`wewrite` 传递引入）留裁决项。
+- **SBOM / 许可证清单**见 `docs/sbom-licenses.md`：31 个运行依赖无 GPL/AGPL 强 copyleft，2 个 LGPL 依赖（`cssutils`/`encutils`，`wewrite` 传递引入）留裁决项。
 
 ## 发布与安全口径
 

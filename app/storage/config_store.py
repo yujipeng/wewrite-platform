@@ -185,12 +185,31 @@ class ConfigStore:
             return _get_in(cfg, dotted)
 
         def _writer_key_configured() -> bool:
-            # 最终生效值：env WEWRITE_WRITER_API_KEY 存在且非空 → true；
-            # 否则回落到 config.yaml 的 writer.api_key；两者都无 → false。
+            # 与 worker `_writer_env()` 对齐：env 存在即接管，不看是否非空。
+            # 空串 env 时子进程实际收到空密钥 → 未配置，不得回落到文件值。
             env_value = os.environ.get("WEWRITE_WRITER_API_KEY")
-            if env_value is not None and env_value != "":
-                return True
+            if env_value is not None:
+                return env_value != ""
             return secret_configured(writer.get("api_key") or None)
+
+        # writer 各字段的投影口径与 worker `_writer_env()` 一致：env 存在即以其为准
+        # （空串表示未设置），否则回落到 config.yaml（再回落默认值）。
+        _writer_env_of = {
+            "provider": "WEWRITE_WRITER_PROVIDER",
+            "model": "WEWRITE_WRITER_MODEL",
+            "base_url": "WEWRITE_WRITER_BASE_URL",
+            "temperature": "WEWRITE_WRITER_TEMPERATURE",
+            "max_tokens": "WEWRITE_WRITER_MAX_TOKENS",
+        }
+
+        def _writer_effective(key, default):
+            env_var = _writer_env_of[key]
+            if env_var in os.environ:
+                return os.environ[env_var]
+            val = writer.get(key)
+            if val is None or val == "":
+                return default
+            return val
 
         return {
             "version": 1,
@@ -210,11 +229,11 @@ class ConfigStore:
                 "author": wechat.get("author", "编辑"),
             },
             "writer": {
-                "provider": writer.get("provider", "deepseek"),
-                "model": writer.get("model", "deepseek-chat"),
-                "base_url": writer.get("base_url", "https://api.deepseek.com"),
-                "temperature": writer.get("temperature", 1.0),
-                "max_tokens": writer.get("max_tokens", 4000),
+                "provider": _writer_effective("provider", "deepseek"),
+                "model": _writer_effective("model", "deepseek-chat"),
+                "base_url": _writer_effective("base_url", "https://api.deepseek.com"),
+                "temperature": _writer_effective("temperature", 1.0),
+                "max_tokens": _writer_effective("max_tokens", 4000),
                 "api_key_configured": _writer_key_configured(),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},

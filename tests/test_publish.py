@@ -568,6 +568,52 @@ def test_config_writer_api_key_env_only_configured(monkeypatch, tmp_path):
     assert managed.get("writer.api_key") == "WEWRITE_WRITER_API_KEY"
 
 
+def test_config_writer_api_key_env_empty_string_wins_over_file(monkeypatch, tmp_path):
+    """空串 env 接管：文件里有密钥 + WEWRITE_WRITER_API_KEY="" → api_key_configured False。
+
+    投影必须与 worker `_writer_env()` 一致：env 存在即接管（空串表示未设置），
+    不得回落到文件密钥，否则页面提示与真实运行结果相反。
+    """
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    # 先写文件密钥（投影曾为 true）
+    c.put("/api/v1/config", json={"writer": {"api_key": "SK-FILE-SECRET"}}, headers=post_headers(c))
+    assert c.get("/api/v1/config").json()["writer"]["api_key_configured"] is True
+
+    monkeypatch.setenv("WEWRITE_WRITER_API_KEY", "")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["api_key_configured"] is False
+    # 投影与 worker _writer_env() 注入结果一致：空串 env → worker 不注入该字段
+    from app.worker.executor import _writer_env
+
+    injected = _writer_env({"writer": {"api_key": "SK-FILE-SECRET"}})
+    assert "WEWRITE_WRITER_API_KEY" not in injected
+    # env_managed 仍列出（存在即接管）
+    managed = {m["field"]: m["env"] for m in body["env_managed"]}
+    assert managed.get("writer.api_key") == "WEWRITE_WRITER_API_KEY"
+
+
+def test_config_writer_scalar_env_empty_string_wins_over_file(monkeypatch, tmp_path):
+    """model 等标量字段同口径：WEWRITE_WRITER_MODEL="" + 文件 model=file-model → 投影为空串。
+
+    与 worker `_writer_env()` 一致：env 存在即以其为准（空串表示未设置），
+    不回落到文件值；worker 也不注入该字段（子进程读到空串，走上游默认）。
+    """
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    c.put("/api/v1/config", json={"writer": {"model": "file-model"}}, headers=post_headers(c))
+    assert c.get("/api/v1/config").json()["writer"]["model"] == "file-model"
+
+    monkeypatch.setenv("WEWRITE_WRITER_MODEL", "")
+    body = c.get("/api/v1/config").json()
+    assert body["writer"]["model"] == ""
+    # worker 也不注入该字段（env 存在即接管）
+    from app.worker.executor import _writer_env
+
+    injected = _writer_env({"writer": {"model": "file-model"}})
+    assert "WEWRITE_WRITER_MODEL" not in injected
+
+
 def test_publish_reconcile_text_only_consistent(monkeypatch, tmp_path):
     """有 media_id 时只读 get_draft，双方归一化后比较文本 hash（仅文本核对）。"""
     home = str(tmp_path)

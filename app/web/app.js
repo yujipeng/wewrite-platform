@@ -196,6 +196,13 @@ const IMAGE_STATUS_TEXT = {
   succeeded: "已完成",
   failed: "失败",
 };
+const IMAGE_ERROR_TEXT = {
+  IMAGE_AUTH_FAILED: "图片服务认证失败（密钥或权限错误）",
+  IMAGE_QUOTA_EXCEEDED: "图片服务额度耗尽或限流",
+  IMAGE_MODEL_INVALID: "图片模型名无效或不存在",
+  IMAGE_PROVIDER_ERROR: "图片供应商调用失败",
+  IMAGE_TIMEOUT: "图片生成超时",
+};
 let _jobPollTimer = null;
 
 function stopJobPolling() {
@@ -2382,30 +2389,42 @@ function renderJobBody(job, runId) {
         thumb.addEventListener("error", () => { thumb.style.display = "none"; });
         cell.appendChild(thumb);
       } else if (st === "failed") {
-        cell.appendChild(el("div", { class: "step-error", text: img.error ? ("错误：" + img.error) : "生成失败" }));
-        if (!img.retried) {
-          const retryBtn = el("button", { class: "btn", text: "重试失败图", onclick: async () => {
-            try {
-              const token = await csrfToken();
-              const res = await fetch(`/api/v1/jobs/${job.job_id}/images/retry`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
-                body: JSON.stringify({ indices: [img.index] }),
-              });
-              if (!res.ok) {
-                let code = "HTTP_" + res.status, message = res.statusText;
-                try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
-                throw Object.assign(new Error(message), { code, status: res.status });
-              }
-              refreshJobView();
-            } catch (err) {
+        const errCode = img.error_code;
+        const errText = errCode ? (IMAGE_ERROR_TEXT[errCode] || errCode) + "（" + errCode + "）" : "";
+        const errDetail = img.error ? ("错误详情：" + img.error) : "生成失败";
+        cell.appendChild(el("div", { class: "step-error", text: errText ? (errText + " " + errDetail) : errDetail }));
+        const retryCount = img.retry_count || 0;
+        if (retryCount > 0) {
+          cell.appendChild(el("div", { class: "muted", text: "已重试 " + retryCount + " 次" }));
+        }
+        const retryBtn = el("button", { class: "btn", text: "重试失败图", onclick: async () => {
+          retryBtn.disabled = true;
+          retryBtn.textContent = "已提交重试，正在生成…";
+          try {
+            const token = await csrfToken();
+            const res = await fetch(`/api/v1/jobs/${job.job_id}/images/retry`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+              body: JSON.stringify({ indices: [img.index] }),
+            });
+            if (!res.ok) {
+              let code = "HTTP_" + res.status, message = res.statusText;
+              try { const d = await res.json(); code = d.code || code; message = d.message || message; } catch (_) {}
+              throw Object.assign(new Error(message), { code, status: res.status });
+            }
+            refreshJobView();
+          } catch (err) {
+            retryBtn.disabled = false;
+            retryBtn.textContent = "重试失败图";
+            if (err.status === 409) {
+              window.alert("任务正在生成中，请稍后再试");
+            } else {
               window.alert("重试失败图失败：" + (err.code || err.message));
             }
-          } });
-          cell.appendChild(retryBtn);
-        } else {
-          cell.appendChild(el("div", { class: "muted", text: "已重试一次" }));
-        }
+          }
+        } });
+        cell.appendChild(retryBtn);
+        cell.appendChild(el("div", { class: "muted", text: "如持续失败，请到「配置」页更换图片模型后重试" }));
       }
       grid.appendChild(cell);
     }

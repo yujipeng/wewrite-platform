@@ -273,7 +273,7 @@ class Worker:
         if exit_code != 0:
             raise _worker_error("WRITER_FAILED", f"llm-write 非预期退出码 {exit_code}")
 
-        # 正文校验：非空且 >=200 字符
+        # 正文校验：非空且 >=200 字符（保持 strip 口径，200 字符门不变）
         if not staging_text or len(staging_text.strip()) < 200:
             raise _worker_error("WRITER_FAILED", "写作输出正文校验未通过")
 
@@ -281,7 +281,7 @@ class Worker:
         length_warning = None
         target = self._parse_word_target(style)
         if target is not None:
-            actual = len(staging_text.strip())
+            actual = self._count_chars(staging_text)
             if actual < target["min_chars"]:
                 staging_text, length_warning = self._extend_once(
                     job, run_id, staging_text, target,
@@ -315,6 +315,12 @@ class Worker:
 
         return word_count_domain.target_lower_bound(style.get("word_count"))
 
+    def _count_chars(self, text: str) -> int:
+        """需求 §3.1 口径：去掉空白后的字符数（统一计数入口）。"""
+        from app.domain import word_count as word_count_domain
+
+        return word_count_domain.count_chars(text)
+
     def _extend_once(self, job: dict, run_id: str, current_text: str, target: dict, goal: int | None):
         """目标字数不足时自动续写一次。
 
@@ -335,7 +341,7 @@ class Worker:
 
         def _warning(text: str) -> dict:
             return {
-                "actual": len(text.strip()),
+                "actual": self._count_chars(text),
                 "target_min": target["min_chars"],
                 "target_max": target["max_chars"],
                 "target": goal if goal is not None else target["min_chars"],
@@ -352,12 +358,12 @@ class Worker:
             _unlink_run_file(self.home, run_id, brief_rel_ext)
             _unlink_run_file(self.home, run_id, staging_rel_ext)
 
-        # 续写失败或输出太短（<200）时，以原文为准，不覆盖有效产物。
+        # 续写失败或输出太短（<200，保持 strip 口径）时，以原文为准，不覆盖有效产物。
         if exit_code != 0 or not ext_text or len(ext_text.strip()) < 200:
             return current_text, _warning(current_text)
 
         final_text = ext_text  # 以续写结果为准
-        if len(final_text.strip()) < target["min_chars"]:
+        if self._count_chars(final_text) < target["min_chars"]:
             return final_text, _warning(final_text)
         return final_text, None
 

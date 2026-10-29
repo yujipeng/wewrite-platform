@@ -466,3 +466,176 @@ def test_word_count_extend_failure_keeps_original(tmp_path):
         final = f.read()
     assert "短" in final
     assert len(final.strip()) == 300
+
+
+def test_word_count_internal_whitespace_triggers_extend(tmp_path):
+    """返修第 3 条：目标 2000、首次返回 \"字 \"*1000 → 判定不足并触发续写，actual==1000。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    # strip 后 1999，去空白后 1000：必须按去空白口径判不足
+    padded = "字 " * 1000
+    short = "短" * 300
+    writer = SequenceWriter([padded, short])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2  # 确实触发了续写
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 300  # 续写后仍不足：actual 按去空白计
+
+
+def test_word_count_padded_only_warns_actual_is_1000(tmp_path):
+    """返修第 3 条（反向）：续写后仍不足时 length_warning.actual 必须等于 1000 而非 1999。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    padded = "字 " * 1000
+    writer = SequenceWriter([padded, padded])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 1000  # 不是 1999
+
+
+# ---------- JEE-1963：regenerate 端点（成功但字数不足的真正生成入口） ----------
+
+def _set_succeeded_with_warning(home, run_id, warning=None):
+    """把 job 置 succeeded，并在 run state 写入 length_warning。"""
+    store = jobs_store.JobStore(home)
+    job = store.load("j-test000001")
+    job["status"] = "succeeded"
+    store.write(job)
+    state = base_state(run_id)
+    state["status"] = "completed"
+    if warning is not None:
+        state["length_warning"] = warning
+    write_state(home, run_id, state)
+
+
+def test_job_regenerate_creates_new_queued_job_and_clears_warning(tmp_path, monkeypatch):
+    """返修第 1 条：succeeded + length_warning → 新 queued job，旧警告清除。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    import app.adapters.wewrite as wa
+
+    monkeypatch.setattr(wa.WeWriteAdapter, "resume_run", lambda self, run_id: {"run_id": run_id})
+    store = jobs_store.JobStore(home)
+    new_job = store.regenerate("j-test000001")
+    assert new_job["status"] == "queued"
+    assert new_job["job_id"] != "j-test000001"
+    assert new_job["attempt"] == 2
+    # 旧 job 仍 succeeded，未回改
+    old = store.load("j-test000001")
+    assert old["status"] == "succeeded"
+    # 旧 length_warning 已清除（不污染新任务）
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert "length_warning" not in st
+
+
+def test_job_regenerate_requires_length_warning(tmp_path, monkeypatch):
+    """返修第 2 条（反向）：无 length_warning 的 succeeded 任务拒绝重新生成。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, None)
+
+    import app.adapters.wewrite as wa
+
+    monkeypatch.setattr(wa.WeWriteAdapter, "resume_run", lambda self, run_id: {"run_id": run_id})
+    store = jobs_store.JobStore(home)
+    try:
+        store.regenerate("j-test000001")
+        assert False, "无 length_warning 的 succeeded 任务应拒绝"
+    except Exception as exc:
+        assert exc.code == "CONFLICT"
+        assert exc.details.get("reason") == "no_length_warning"
+
+
+def test_job_regenerate_rejects_inflight_duplicate(tmp_path, monkeypatch):
+    """返修第 1 条（并发保护）：同 run 已有 queued job 时返回冲突，不重复起写作。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    import app.adapters.wewrite as wa
+
+    monkeypatch.setattr(wa.WeWriteAdapter, "resume_run", lambda self, run_id: {"run_id": run_id})
+    store = jobs_store.JobStore(home)
+    first = store.regenerate("j-test000001")
+    # 第一个新 job 仍是 queued（未消费），再次 regenerate 应冲突
+    try:
+        store.regenerate("j-test000001")
+        assert False, "同 run 已有 queued 时应冲突"
+    except Exception as exc:
+        assert exc.code == "CONFLICT"
+        assert exc.details.get("reason") == "already_regenerating"
+
+
+def test_regenerate_endpoint_accepts_and_creates_job(tmp_path, monkeypatch):
+    """返修第 2 条（端点级）：POST /regenerate 接受成功+警告任务并产生新 queued job。"""
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    import app.adapters.wewrite as wa
+
+    monkeypatch.setattr(wa.WeWriteAdapter, "resume_run", lambda self, run_id: {"run_id": run_id})
+    monkeypatch.setenv("WEWRITE_HOME", home)
+    monkeypatch.setenv("WEWRITE_PLATFORM_NO_WORKER", "1")
+    app = create_app()
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c.headers.update({"host": "127.0.0.1:8765"})
+
+    # 取 CSRF token
+    token = c.get("/api/v1/bootstrap").json()["csrf_token"]
+    r = c.post(
+        "/api/v1/jobs/j-test000001/regenerate",
+        json={},
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:8765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": token,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["job_id"] != "j-test000001"
+
+    # 反向：无 length_warning 的 succeeded → 409。先消费掉刚产生的新 queued job，
+    # 避免命中「已有进行中的生成」并发保护（那属于另一个独立用例）。
+    store = jobs_store.JobStore(home)
+    new_job = store.load(body["job_id"])
+    new_job["status"] = "succeeded"
+    store.write(new_job)
+
+    _set_succeeded_with_warning(home, run_id, None)
+    r2 = c.post(
+        "/api/v1/jobs/j-test000001/regenerate",
+        json={},
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:8765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": token,
+        },
+    )
+    assert r2.status_code == 409
+    assert r2.json()["details"]["reason"] == "no_length_warning"

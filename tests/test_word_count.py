@@ -52,6 +52,21 @@ def test_parse_range_swapped_order(tmp_path):
     assert word_count.parse_word_count("2600-1800") == {"min_chars": 1440, "max_chars": 3120}
 
 
+def test_count_chars_removes_all_whitespace(tmp_path):
+    """需求 §3.1：去掉空白后的字符数（空格/换行/制表符都去掉）。"""
+    assert word_count.count_chars("字 " * 1000) == 1000
+    assert word_count.count_chars("字\n\t 字") == 2
+    assert word_count.count_chars("   ") == 0
+    assert word_count.count_chars("") == 0
+
+
+def test_parse_huge_values_do_not_overflow(tmp_path):
+    """JEE-1966 兜底：超大数/超长字符串不抛异常，返回 None。"""
+    assert word_count.parse_word_count("9" * 400) is None
+    assert word_count.parse_word_count(10 ** 400) is None
+    assert word_count.parse_word_count("99999999999") is None  # 超过 10 位上限
+
+
 def test_format_word_count_range(tmp_path):
     """验收第 8 条：区间字符串 brief 含「务必达到」「低于 1800」。"""
     state = {

@@ -213,6 +213,68 @@ class JobStore:
         self.write(job)
         return job
 
+    def regenerate(self, job_id: str) -> dict:
+        """JEE-1963：对「成功但字数不足」的任务发起一次重新生成。
+
+        准入：job 必须 ``succeeded`` 且其 run state 带 ``length_warning``；普通
+        ``succeeded``（无警告）不允许重试，既有语义不放宽。复用上游 ``resume_run``
+        产生新的 queued job（新 attempt），不回改旧 job 的 ``succeeded``；同一 run
+        已有未终态 job 时返回冲突（并发保护，连点两次只产生一次写作）。开始时清除
+        旧 run 的 ``length_warning``，避免新任务未出结果时继续显示旧警告。
+        """
+        from app.adapters import wewrite as wewrite_adapter
+        from app.storage.atomic import PlatformLock
+
+        with PlatformLock(self.home):
+            job = self.get_or_404(job_id)
+            if job.get("status") != "succeeded":
+                raise errors.conflict(
+                    "仅字数不足的成功任务可重新生成",
+                    {"reason": "not_regenerable", "status": job.get("status")},
+                )
+            run_id = job.get("run_id")
+            # 并发保护优先：同 run 已有未终态 job 即冲突（连点两次只产生一次写作）。
+            for existing in self.list_jobs():
+                if existing.get("run_id") == run_id and existing.get("status") in {"queued", "running"}:
+                    raise errors.conflict(
+                        "该任务已有进行中的生成", {"reason": "already_regenerating", "job_id": existing.get("job_id")}
+                    )
+            state = paths.read_state_yaml(self.home, run_id)
+            if not isinstance(state, dict) or not state.get("length_warning"):
+                raise errors.conflict(
+                    "该任务无字数不足警告，不可重新生成", {"reason": "no_length_warning"}
+                )
+
+            adapter = wewrite_adapter.WeWriteAdapter()
+            try:
+                adapter.resume_run(run_id)
+            except errors.ApiError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise errors.upstream_error("上游恢复失败", {"reason": "resume_failed"}) from exc
+
+            # 清除旧警告：新任务未出结果时不显示旧 length_warning（产出达标后也无警告）。
+            self._clear_run_length_warning(run_id)
+
+            new_id = new_job_id()
+            new_job = build_job(new_id, run_id, attempt=int(job.get("attempt") or 0) + 1)
+            self.write(new_job)
+            return new_job
+
+    def _clear_run_length_warning(self, run_id: str) -> None:
+        """清掉 run state 里的 ``length_warning``（幂等，缺失不报错）。"""
+        import yaml
+
+        state = paths.read_state_yaml(self.home, run_id)
+        if not isinstance(state, dict):
+            return
+        if "length_warning" not in state:
+            return
+        state.pop("length_warning", None)
+        paths.safe_write_run_state(
+            self.home, run_id, yaml.safe_dump(state, allow_unicode=True, sort_keys=False)
+        )
+
     def retry_images(self, job_id: str, indices: list[int]) -> dict:
         """失败图人工重试：每个失败索引最多一次，不重试成功图，超限 CONFLICT。"""
         job = self.get_or_404(job_id)

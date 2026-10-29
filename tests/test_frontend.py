@@ -182,7 +182,11 @@ def test_p1_new_task_entry_present(client):
 
 
 def test_jee1963_length_warning_banner_present(client):
-    """JEE-1963：P2/P3 字数提示条（含实际与目标字数，非阻断）。"""
+    """JEE-1963：P2/P3 字数提示条（含实际与目标字数，非阻断）。
+
+    行为级证明（点击 → POST /regenerate）见 test_frontend_visual.py 的
+    test_jee1963_regenerate_button_posts_to_endpoint（Node vm 交互 harness）。
+    """
     js = _app_js(client)
     assert "length_warning" in js
     assert "lengthWarningBanner" in js
@@ -191,3 +195,5 @@ def test_jee1963_length_warning_banner_present(client):
     assert "低于目标 " in js
     # 提供重新生成入口
     assert "重新生成" in js
+    # 真正 POST 到可执行端点
+    assert "/regenerate" in js

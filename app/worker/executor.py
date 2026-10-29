@@ -249,10 +249,13 @@ class Worker:
         - 全部成功 → job 置 succeeded；仍有失败 → job 置 failed；
         - 所有退出路径（正常完成、后端抛异常、预算超限、取消）都把 pending 图
           收敛到 failed 终态，绝不残留 pending；
-        - 不改动 job 既有的 media_id / 发布态字段，state.yaml 只在锁内更新目标图。
+        - 不改动 job 既有的 media_id / 发布态字段，state.yaml 只在锁内更新目标图；
+        - 生效配置在调用前算好，调用已发生/可能已发生的路径都落实际 provider/model
+          审计（预算超限 = 调用前失败 0 次，不伪造执行历史）。
         """
         job_id = job["job_id"]
         run_id = job["run_id"]
+        effective = None  # 本次实际生效配置，调用前算好，供异常路径审计
         try:
             state = _read_run_state(self.home, run_id)
             visual = state.get("visual") or {}
@@ -269,7 +272,7 @@ class Worker:
                 self._finish_image_retry_result(job_id)
                 return
 
-            # 协作式取消：调用前检查，取消即把待处理图收敛为 failed
+            # 协作式取消：调用前检查，取消即把待处理图收敛为 failed（0 次调用，无审计）
             if _check_cancel(self.store, job_id):
                 self._settle_pending_as_failed(
                     job_id, run_id, pending,
@@ -281,7 +284,7 @@ class Worker:
             img_cfg = cfg.get("image") or {}
             est = _num(img_cfg.get("estimated_cost_per_image")) * len(pending)
             if max_cost is not None and est > float(max_cost):
-                # 超预算：待处理图收敛为 failed，backend 调用 0 次，不残留 pending
+                # 超预算：待处理图收敛为 failed，backend 调用 0 次，不残留 pending，不伪造历史
                 self._settle_pending_as_failed(
                     job_id, run_id, pending,
                     code="IMAGE_QUOTA_EXCEEDED", error="图片预算超限，未发起生成",
@@ -298,6 +301,7 @@ class Worker:
                 })
 
             # 实际调用与审计共用同一份生效配置（env 优先 → config.yaml）。
+            # 必须在 generate_batch 之前算好，异常路径才能拿到审计信息。
             effective_cfg = image_effective_config(cfg)
             effective = image_effective_values(effective_cfg)
 
@@ -305,17 +309,17 @@ class Worker:
                 items, config=effective_cfg, max_images=max_images, max_cost=max_cost
             )
 
-            # 生成期间取消：在途调用可能已产生费用，但结果收敛为 failed 不残留 pending
+            # 生成期间取消：在途调用已发生，结果收敛为 failed 并记录审计
             if _check_cancel(self.store, job_id):
                 self._settle_pending_as_failed(
                     job_id, run_id, pending,
                     code="IMAGE_PROVIDER_ERROR", error="任务已取消",
+                    effective=effective, called=True,
                 )
                 return
 
             job = self.store.load(job_id)
             images = list(job.get("images") or [])
-            now = jobs_store._now()
             for offset, idx in enumerate(pending):
                 r = results[offset]
                 img = dict(images[idx])
@@ -328,16 +332,7 @@ class Worker:
                     img["status"] = "failed"
                     img["error"] = _sanitize_error(raw_error)
                     img["error_code"] = classify_image_error(raw_error)
-                img["executed_provider"] = effective["provider"]
-                img["executed_model"] = effective["model"]
-                # 每次实际使用的 provider/model 追加进该图执行历史
-                history = list(img.get("execution_history") or [])
-                history.append({
-                    "provider": effective["provider"],
-                    "model": effective["model"],
-                    "at": now,
-                })
-                img["execution_history"] = history
+                _apply_execution_audit(img, effective)
                 images[idx] = img
             job["images"] = images
             self.store.write(job)
@@ -350,12 +345,16 @@ class Worker:
             _sync_state_images_locked(self.home, run_id, updates)
             self._finish_image_retry_result(job_id)
         except errors.ApiError as exc:
-            self._fail_image_retry(job_id, exc.code, exc.message)
+            self._fail_image_retry(job_id, exc.code, exc.message, effective=effective)
         except Exception as exc:  # noqa: BLE001
-            self._fail_image_retry(job_id, "WORKER_FAILED", f"{type(exc).__name__}: {exc}")
+            self._fail_image_retry(job_id, "WORKER_FAILED", f"{type(exc).__name__}: {exc}", effective=effective)
 
-    def _fail_image_retry(self, job_id: str, code: str, message: str) -> None:
-        """异常退出路径：把 pending 图收敛为 failed（分类+脱敏），job 置 failed。"""
+    def _fail_image_retry(self, job_id: str, code: str, message: str, effective: dict | None = None) -> None:
+        """异常退出路径：把 pending 图收敛为 failed（分类+脱敏+审计），job 置 failed。
+
+        ``effective`` 非空表示后端已被调用（计费已发生），本次实际 provider/model
+        会写入 executed_provider/executed_model 并追加 execution_history。
+        """
         job = self.store.load(job_id)
         if job is None:
             return
@@ -368,6 +367,8 @@ class Worker:
                 images[idx]["status"] = "failed"
                 images[idx]["error"] = _sanitize_error(message)
                 images[idx]["error_code"] = classify_image_error(message)
+                if effective is not None:
+                    _apply_execution_audit(images[idx], effective)
                 changed.append({"index": idx, "status": "failed",
                                 "error": images[idx]["error"],
                                 "error_code": images[idx]["error_code"]})
@@ -381,8 +382,13 @@ class Worker:
             {"code": code, "message": _sanitize_error(message)},
         )
 
-    def _settle_pending_as_failed(self, job_id: str, run_id: str, pending: list, code: str, error: str) -> None:
-        """把指定 pending 图收敛为 failed（预算超限等调用前失败路径）。"""
+    def _settle_pending_as_failed(self, job_id: str, run_id: str, pending: list, code: str, error: str,
+                                  effective: dict | None = None, called: bool = False) -> None:
+        """把指定 pending 图收敛为 failed（预算超限等调用前失败路径）。
+
+        ``called=True``（后端已被调用）时写入实际 provider/model 审计；
+        ``called=False``（调用前失败，0 次调用）不伪造执行历史。
+        """
         job = self.store.load(job_id)
         if job is None:
             return
@@ -393,6 +399,8 @@ class Worker:
             img["status"] = "failed"
             img["error"] = _sanitize_error(error)
             img["error_code"] = code
+            if called and effective is not None:
+                _apply_execution_audit(img, effective)
             images[idx] = img
             updates.append({"index": idx, "status": "failed",
                             "error": img["error"], "error_code": code})
@@ -738,14 +746,28 @@ def classify_image_error(raw: str) -> str:
     return "IMAGE_PROVIDER_ERROR"
 
 
+def _apply_execution_audit(img: dict, effective: dict) -> None:
+    """把本次实际使用的 provider/model 写入单图审计字段（追加历史不覆盖）。"""
+    img["executed_provider"] = effective.get("provider")
+    img["executed_model"] = effective.get("model")
+    history = list(img.get("execution_history") or [])
+    history.append({
+        "provider": effective.get("provider"),
+        "model": effective.get("model"),
+        "at": jobs_store._now(),
+    })
+    img["execution_history"] = history
+
+
 def _sanitize_error(raw: str) -> str:
     """错误文本脱敏，绝不保留 api_key 明文（统一持久化出口）。
 
-    覆盖：
+    两段式：
     1. 独立密钥本体：``sk-`` / ``sk_live-`` / ``ak-`` / ``Bearer `` 前缀 + 长串；
-    2. 字段名后跟值：``api_key`` / ``api key`` / ``apikey`` / ``secret`` /
-       ``token`` / ``access_token`` / ``key`` 字段名之后（允许夹说明文字）的
-       首个「密钥形态」长串。
+    2. 字段名锚点：``api_key`` / ``api key`` / ``apikey`` / ``secret`` /
+       ``token`` / ``access_token`` / ``key`` 之后紧跟的**每个**密钥形态长串，
+       每个字段锚点独立消费，只推进到该字段值末尾，绝不跳过窗口内其它字段。
+
     密钥形态判定：长度 >= 8 且（含数字 或 长度 >= 16），避免把 provided 等
     普通英文词误当密钥。
     """
@@ -761,7 +783,7 @@ def _sanitize_error(raw: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 2) 字段名锚点 + 其后首个密钥形态长串（允许零到多个分隔符/空白与说明文字）
+    # 2) 字段名锚点 + 其后紧邻的密钥形态长串，逐字段独立消费
     field_re = re.compile(
         r"(api[_-]?key|api\s+key|secret|token|access_token|\bkey\b)",
         re.IGNORECASE,
@@ -775,8 +797,9 @@ def _sanitize_error(raw: str) -> str:
     pos = 0
     for m in field_re.finditer(text):
         if m.start() < pos:
-            continue  # 已被前一个字段的窗口覆盖，跳过
+            continue  # 已被前一个字段的处理覆盖，跳过
         out.append(text[pos:m.end()])
+        # 只向后看最多 120 字符，找该字段后紧邻的首个密钥形态长串
         window = text[m.end():m.end() + 120]
         matched = None
         for tm in token_re.finditer(window):
@@ -784,10 +807,12 @@ def _sanitize_error(raw: str) -> str:
                 matched = tm
                 break
         if matched is not None:
-            out.append(window[:matched.start()] + "[REDACTED]" + window[matched.end():])
+            # 只消费「分隔符 + 密钥值」，字段后的其它文本交由后续迭代补
+            out.append(window[:matched.start()] + "[REDACTED]")
+            pos = m.end() + matched.end()
         else:
-            out.append(window)
-        pos = m.end() + len(window)
+            # 该字段后无密钥形态：只消费字段名本身，后续字段不受影响
+            pos = m.end()
     out.append(text[pos:])
     return "".join(out)
 

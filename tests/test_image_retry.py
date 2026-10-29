@@ -466,3 +466,112 @@ def test_rework_config_used_for_call_and_audit(tmp_path, monkeypatch):
     # 执行历史能看出每次实际用的是哪个
     assert img0["execution_history"][-1]["provider"] == "env-provider"
     assert img0["execution_history"][-1]["model"] == "env-model"
+
+
+# ---------- 第四轮返修：脱敏多密钥全遮 / 异常路径审计 / 预算 0 次不伪造历史 ----------
+
+def test_sanitize_error_multiple_keys():
+    """返修 1：同一错误含两个密钥，两个都要变 [REDACTED]。"""
+    k1 = "abcde1234567890"
+    k2 = "xyz9876543210ab"
+    out = _sanitize_error(f"401 api_key: {k1} and access_token: {k2}")
+    assert k1 not in out
+    assert k2 not in out
+    assert out.count("[REDACTED]") == 2
+    out2 = _sanitize_error(f"api_key={k1} secret={k2}")
+    assert k1 not in out2
+    assert k2 not in out2
+    assert out2.count("[REDACTED]") == 2
+
+
+def test_rework_multi_key_full_record_no_leak(tmp_path):
+    """返修 1：双密钥文本，三个出口 × 两条路径共 6 组断言全部零命中。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png", "error": "old"},
+    ])
+    k1 = "abcde1234567890"
+    k2 = "xyz9876543210ab"
+    dual = f"401 api_key: {k1} and access_token: {k2}"
+
+    # 路径 A：异常抛出
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+    image = CountingImage(raise_exc=RuntimeError(dual))
+    Worker(home, image=image).run_once()
+    rec = _full_record(home, "j-retry00001", run_id)
+    assert k1 not in rec and k2 not in rec
+
+    # 路径 B：失败结果返回（重新排队再跑）
+    store = jobs_store.JobStore(home)
+    job = store.load("j-retry00001")
+    job["status"] = "failed"; job["retry_mode"] = None
+    job["images"][0]["status"] = "failed"
+    store.write(job)
+    store.retry_images("j-retry00001", [0])
+    image2 = CountingImage([{"output": f"runs/{run_id}/images/0.png", "ok": False,
+                             "error": f"api_key={k1} secret={k2}"}])
+    Worker(home, image=image2).run_once()
+    rec2 = _full_record(home, "j-retry00001", run_id)
+    assert k1 not in rec2 and k2 not in rec2
+
+
+def test_rework_exception_path_writes_audit(tmp_path, monkeypatch):
+    """返修 2：后端抛异常（调用 1 次）→ 图片 failed 且 executed_model 非空、history >= 1。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    monkeypatch.setenv("WEWRITE_IMAGE_PROVIDER", "env-provider")
+    monkeypatch.setenv("WEWRITE_IMAGE_MODEL", "env-model")
+
+    class RaiseImage:
+        def __init__(self):
+            self.calls = 0
+        def generate_batch(self, items, config=None, max_images=None, max_cost=None):
+            self.calls += 1
+            raise RuntimeError("401 api_key: abcde1234567890")
+
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+    image = RaiseImage()
+    result = Worker(home, image=image).run_once()
+    assert image.calls == 1
+    img0 = result["images"][0]
+    assert img0["status"] == "failed"
+    assert img0["executed_model"] == "env-model"
+    assert img0["executed_provider"] == "env-provider"
+    assert len(img0.get("execution_history") or []) >= 1
+
+
+def test_rework_budget_path_no_fake_history(tmp_path):
+    """返修 2：预算超限调用 0 次，不产生虚假执行历史。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    state = base_state(run_id, max_cost=0)
+    write_state(home, run_id, state)
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("image:\n  estimated_cost_per_image: 1\n")
+
+    class ZeroCallImage:
+        def __init__(self):
+            self.calls = 0
+        def generate_batch(self, items, config=None, max_images=None, max_cost=None):
+            self.calls += 1
+            return [{"ok": True, "output": f"runs/{run_id}/images/0.png"}]
+
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+    image = ZeroCallImage()
+    result = Worker(home, image=image).run_once()
+    assert image.calls == 0
+    img0 = result["images"][0]
+    assert img0["status"] == "failed"
+    assert img0["error_code"] == "IMAGE_QUOTA_EXCEEDED"
+    # 调用 0 次：无 executed_model、无 execution_history
+    assert img0.get("executed_model") is None
+    assert img0.get("execution_history") is None

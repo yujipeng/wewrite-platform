@@ -90,7 +90,8 @@ def busy(message: str = "资源正被占用，请稍后重试", details: dict | 
 
 
 def writer_not_configured(
-    message: str = "请先在「写作模型」区配置写作模型", details: dict | None = None
+    message: str = "写作模型未配置：请在上方「写作模型」区填写 API Key 并保存，或由运维通过环境变量 WEWRITE_WRITER_API_KEY 注入。",
+    details: dict | None = None,
 ) -> ApiError:
-    """写作模型未配置（缺 WEWRITE_WRITER_API_KEY），前端应禁用生成入口。"""
+    """写作模型未配置（env 与 config.yaml 的 writer.api_key 均为空），前端应禁用生成入口。"""
     return ApiError("WRITER_NOT_CONFIGURED", message, 503, details)

@@ -235,3 +235,30 @@ def test_publish_page_action_keeps_url_body_title_highlight_consistent(client):
     ):
         assert by_name[name] is True, f"harness 断言失败：{name}"
 
+
+def test_p8_writer_not_configured_clickable_guide(client):
+    """JEE-1955 返修：未配置时按钮可点击，点击后真实触发 scrollIntoView + config-highlight。"""
+    _app_js(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    for name in (
+        "未配置时按钮可点击（文案「去配置写作模型」）",
+        "存在「写作模型（文章生成）」区块",
+        "点击未配置按钮后真实调用 scrollIntoView",
+        "点击未配置按钮后区块加 config-highlight",
+    ):
+        assert by_name[name] is True, f"harness 断言失败：{name}"
+
+
+def test_p8_writer_not_configured_error_message_no_code(client):
+    """JEE-1955 返修：WRITER_NOT_CONFIGURED 渲染中文提示且不含裸 code。"""
+    _app_js(client)
+    summary = _run_interaction_harness()
+    by_name = {c["name"]: c["ok"] for c in summary["checks"]}
+    for name in (
+        "点击「生成」确实发起了 style/generate 请求",
+        "WRITER_NOT_CONFIGURED 渲染中文可操作提示",
+        "WRITER_NOT_CONFIGURED 渲染不含裸 code",
+    ):
+        assert by_name[name] is True, f"harness 断言失败：{name}"
+

@@ -324,6 +324,15 @@ dl.kv dd { margin: 0; }
 
 .error-block { color: var(--danger); }
 
+/* 配置页区块定位高亮（智能生成失败 / 未配置时引导用户去填对应区块） */
+.config-highlight {
+  outline: 2px solid var(--teal);
+  outline-offset: 4px;
+  background: var(--teal-bg);
+  border-radius: 8px;
+  transition: background 0.4s ease, outline 0.4s ease;
+}
+
 /* ============ stepper 气泡 ============ */
 .stepper { display: flex; align-items: center; gap: 0; margin: 10px 0 20px; }
 .step { flex: 1; text-align: center; position: relative; }

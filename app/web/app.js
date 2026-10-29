@@ -207,6 +207,7 @@ let _jobPollTimer = null;
 // P4 热榜勾选状态（跨 renderHotspots 重建时保留用户选择）
 let _hotspotSelections = new Set();
 let _hotspotExistingCandidates = new Set();
+let _hotspotCandidateByUrl = {};
 let _hotspotCurrentDate = "";
 let _hotspotCurrentItems = [];
 let _hotspotLastBody = null;
@@ -260,6 +261,10 @@ function currentRoute() {
   if (pbm) return { page: "publish", runId: pbm[1] };
   if (hash === "#/hotspots") return { page: "hotspots" };
   if (hash === "#/candidates") return { page: "candidates" };
+  // #/candidates/<set_id>/<candidate_id>：P4「确认选题」把选中标识带进路由，
+  // P5 按该标识直接定位并打开该条候选的确认弹层（验收项 10 一步到位）。
+  const cm = hash.match(/^#\/candidates\/(\d{4}-\d{2}-\d{2}-[a-f0-9]{12})\/(c\d+)$/);
+  if (cm) return { page: "candidates", candidateSetId: cm[1], candidateId: cm[2] };
   if (hash === "#/config") return { page: "config" };
   return { page: "home" };
 }
@@ -294,7 +299,7 @@ async function render() {
   } else if (route.page === "hotspots") {
     await renderHotspots();
   } else if (route.page === "candidates") {
-    await renderCandidates();
+    await renderCandidates(route.candidateSetId, route.candidateId);
   } else if (route.page === "config") {
     await renderConfig();
   } else if (route.page === "publish") {
@@ -1126,12 +1131,20 @@ async function renderHotspots() {
 
   const loadExistingCandidates = async () => {
     _hotspotExistingCandidates.clear();
+    _hotspotCandidateByUrl = {};
     try {
       const body = await api("/api/v1/candidates");
       const sets = body.candidates || [];
       for (const s of sets) {
         for (const it of (s.items || [])) {
           if (it.source_url) _hotspotExistingCandidates.add(it.source_url);
+          // 记录「url → 候选集/候选」映射，供 P4「确认选题」一步定位到该条确认弹层
+          if (it.source_url && it.status === "proposed" && s.set_status === "open") {
+            _hotspotCandidateByUrl[it.source_url] = {
+              set_id: s.candidate_set_id,
+              candidate_id: it.id,
+            };
+          }
         }
       }
     } catch (_) { /* 读取失败不阻断热榜展示 */ }
@@ -1255,12 +1268,17 @@ async function renderHotspots() {
       return;
     }
     const hid = Array.from(_hotspotSelections)[0];
-    // 精确判定：当前选中的热点是否已有候选（按 url 匹配）
+    // 精确判定：当前选中的热点是否已有候选（按 url 匹配），并拿到其候选集/候选 id
     const item = (_hotspotCurrentItems || []).find((it) => (it.item_id || "") === hid);
     const existing = item && item.url && _hotspotExistingCandidates.has(item.url);
     if (existing) {
-      // 直接进入 P5 的确认流程（P5 的确认弹层含图片上限/预算/allow_publish 展示）
-      location.hash = "#/candidates";
+      // 一步进入 P5 并打开该条候选的确认弹层（含图片上限/预算/allow_publish 展示）
+      const target = item && item.url ? _hotspotCandidateByUrl[item.url] : null;
+      if (target) {
+        location.hash = "#/candidates/" + target.set_id + "/" + target.candidate_id;
+      } else {
+        location.hash = "#/candidates";
+      }
       return;
     }
     container.innerHTML = "";
@@ -1277,7 +1295,15 @@ async function renderHotspots() {
         try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
         const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
       }
-      location.hash = "#/candidates";
+      // 生成返回的候选集（1 条），其 items[0].id 即新候选 id；带上路由一步打开确认弹层
+      const body = await res.json();
+      const cid = body.candidate_set_id;
+      const newItemId = (body.items && body.items[0] && body.items[0].id) || "";
+      if (cid && newItemId) {
+        location.hash = "#/candidates/" + cid + "/" + newItemId;
+      } else {
+        location.hash = "#/candidates";
+      }
     } catch (err) {
       container.innerHTML = "";
       if (err.code === "VALIDATION_ERROR" && err.details && err.details.reason === "hotspot_ids_not_found") {
@@ -1334,7 +1360,7 @@ const SET_STATUS_TEXT = {
   expired: "已过期",
 };
 
-async function renderCandidates() {
+async function renderCandidates(confirmSetId, confirmCandidateId) {
   app.innerHTML = "";
   /* 页面标题由顶栏 h1 承载 */
 
@@ -1397,6 +1423,18 @@ async function renderCandidates() {
       if (sets.length === 0) {
         container.appendChild(emptyState("还没有候选集，点「生成候选」从当日热榜快照生成"));
         return;
+      }
+      // P4「确认选题」带来的定位参数：优先打开指定候选集的指定候选确认弹层
+      if (confirmSetId && confirmCandidateId) {
+        const target = sets.find((s) => s.candidate_set_id === confirmSetId);
+        if (target) {
+          const item = (target.items || []).find((it) => it.id === confirmCandidateId);
+          if (item && item.status === "proposed" && target.set_status === "open") {
+            drawSet(target);
+            openConfirm(target, item);
+            return;
+          }
+        }
       }
       const latest = sets[0];
       drawSet(latest);

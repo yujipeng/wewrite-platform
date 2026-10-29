@@ -600,3 +600,45 @@ def test_p4_hotspot_generate_selected_writes_candidate_set(browser_session):
     latest = sets[0]
     assert len(latest["items"]) == 2, f"按 2 条热点生成应为 2 条候选，实际 {len(latest['items'])}"
     assert page_errors == [], f"P4 生成候选交互抛 JS 异常：{page_errors}"
+
+
+def test_p4_confirm_selected_opens_confirm_modal_one_step(browser_session):
+    """返修回归（阻断 1）：只勾选 1 条点「确认选题」→ 一步打开该条候选确认弹层。
+
+    弹层含「确认选题」标题、图片上限/预算输入与 allow_publish 文案，路由带
+    candidate_set_id/candidate_id（#/candidates/<set>/<candidate>）。
+    """
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    # 模块级 fixture 共享 JS 状态：先清空上一条用例残留的勾选，保证本用例从 0 开始
+    page.locator("button", has_text="清空选择").click()
+    page.wait_for_timeout(200)
+
+    # 只勾选 1 条 → 确认选题可用
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    page.wait_for_timeout(200)
+
+    page.locator("button", has_text="确认选题（唯一）").click()
+    page.wait_for_timeout(900)
+
+    # 路由带候选集/候选 id
+    assert "#/candidates/" in page.url, f"应带候选集/候选 id 跳转，实际 {page.url}"
+    # 确认弹层已打开（标题 + 图片上限/预算 + allow_publish 文案）
+    body_text = page.inner_text("#app")
+    assert "确认选题" in body_text, "应打开确认弹层"
+    assert "图片上限（0–10）" in body_text, "确认弹层应有图片上限输入"
+    assert "预算（元）" in body_text, "确认弹层应有预算输入"
+    assert "allow_publish=false" in body_text, "确认弹层应展示 allow_publish=false"
+    # 弹层里的「确认生成」按钮存在
+    assert page.locator("button", has_text="确认生成").count() == 1, "应有「确认生成」按钮"
+    assert page_errors == [], f"P4 确认选题一步打开弹层抛 JS 异常：{page_errors}"

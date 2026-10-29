@@ -984,3 +984,51 @@ def test_confirm_same_candidate_after_retract_not_proposed(tmp_path, monkeypatch
     assert r2.status_code == 409
     assert r2.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
     assert r2.json()["details"]["reason"] == "not_proposed"
+
+
+def test_confirm_after_confirmed_run_cleared_allowed(tmp_path, monkeypatch):
+    """返修回归（阻断 2）：已确认候选的 run 被清理后，确认另一条成功。
+
+    「run_id 仍有效」是唯一性规则的前置条件：run 的 state.yaml 被删（run 失效）
+    后，set_already_confirmed 不再成立，第二条候选应能正常确认。
+    """
+    import shutil
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-run-clear-1").json()
+    run_id = confirmed["run_id"]
+
+    # 清理 run 目录，使 run 失效（state.yaml 不存在）
+    run_dir = os.path.join(home, "runs", run_id)
+    assert os.path.isdir(run_dir)
+    shutil.rmtree(run_dir)
+
+    # run 失效后确认另一条应成功（不再 set_already_confirmed）
+    r2 = _confirm(c, cid, second, "key-run-clear-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2
+
+
+def test_confirm_second_still_blocked_when_run_valid(tmp_path, monkeypatch):
+    """返修回归（阻断 2 补充）：run 仍有效时确认第二条仍被 set_already_confirmed 阻断。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    _confirm(c, cid, first, "key-run-valid-1")
+    # run 目录仍在 → 仍阻断
+    r2 = _confirm(c, cid, second, "key-run-valid-2")
+    assert r2.status_code == 409
+    assert r2.json()["details"]["reason"] == "set_already_confirmed"
+    assert adapter.calls == 1

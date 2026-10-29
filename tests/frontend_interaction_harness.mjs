@@ -228,7 +228,7 @@ function makeContext({ hash, fetchImpl, confirmImpl }) {
     return els[id];
   };
 
-  const location = { hash, replace() {} };
+  const location = { hash, _replaced: [], replace(h) { this._replaced.push(h); this.hash = h; } };
   const windowObj = {
     addEventListener() {},
     alert() {},
@@ -751,11 +751,13 @@ async function testWriterNotConfiguredInteraction() {
 // ============ 9) JEE-1963：重新生成按钮 → 真实 POST /regenerate 端点 ============
 async function testRegenerateInteraction() {
   const runId = "20261026-080000-a1b2c3";
-  const jobId = "j-test000001";
+  const jobId = "j-ffffffffffff";
 
-  // 场景 A：有 length_warning 的成功任务 → 按钮出现，点击真实 POST 到 /regenerate
+  // 场景 A：有 length_warning 的成功任务 → 按钮出现，点击真实 POST 到 /regenerate，
+  // 并且响应里返回的新 job_id（新 < 旧）作为跳转落点（不是含旧任务的 run 页）。
   {
     let regenerateCalls = 0;
+    const newJobId = "j-000000000000";
     const detail = {
       run_id: runId,
       title: "标题",
@@ -766,7 +768,7 @@ async function testRegenerateInteraction() {
       editorial: { decision: "pass", publishable: true },
       length_warning: { actual: 300, target_min: 1600, target_max: 2400, target: 2000 },
     };
-    const { sandbox, els } = makeContext({
+    const { sandbox, els, location } = makeContext({
       hash: `#/runs/${runId}`,
       confirmImpl: () => true,
       fetchImpl: async (path, opts) => {
@@ -775,7 +777,7 @@ async function testRegenerateInteraction() {
         if (path === `/api/v1/jobs?run_id=${runId}`) return okJson({ jobs: [{ job_id: jobId, run_id: runId, status: "succeeded" }] });
         if (path === `/api/v1/jobs/${jobId}/regenerate`) {
           regenerateCalls += 1;
-          return okJson({ job_id: "j-new", run_id: runId, status: "queued" });
+          return okJson({ job_id: newJobId, run_id: "20261026-080001-111111", status: "queued", regenerated_from: jobId });
         }
         throw new Error("unexpected path " + path);
       },
@@ -790,9 +792,47 @@ async function testRegenerateInteraction() {
 
     await dispatchClick(regenBtn);
     check("点击「重新生成」真实 POST /api/v1/jobs/{job_id}/regenerate", regenerateCalls === 1);
+    check("点击后直达新 job（#/jobs/j-000000000000，新编号小于旧编号）", location.hash === `#/jobs/${newJobId}`);
   }
 
-  // 场景 B：无 length_warning 的成功任务 → 按钮不出现（反向用例）
+  // 场景 B：新 job_id > 旧 job_id 时同样直达新 job（参数化两个方向都过）
+  {
+    const oldJobId = "j-000000000000";
+    const newJobId = "j-ffffffffffff";
+    const detail = {
+      run_id: runId,
+      title: "标题",
+      status: "completed",
+      mode: "complete",
+      permissions: { publish: false },
+      publish: { status: "not_published", media_id: null },
+      editorial: { decision: "pass", publishable: true },
+      length_warning: { actual: 300, target_min: 1600, target_max: 2400, target: 2000 },
+    };
+    const { sandbox, els, location } = makeContext({
+      hash: `#/runs/${runId}`,
+      confirmImpl: () => true,
+      fetchImpl: async (path) => {
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === `/api/v1/runs/${runId}`) return okJson(detail);
+        if (path === `/api/v1/jobs?run_id=${runId}`) return okJson({ jobs: [{ job_id: oldJobId, run_id: runId, status: "succeeded" }] });
+        if (path === `/api/v1/jobs/${oldJobId}/regenerate`) {
+          return okJson({ job_id: newJobId, run_id: "20261026-080001-222222", status: "queued", regenerated_from: oldJobId });
+        }
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "render()");
+
+    const regenBtn = findButton(els["app"], "重新生成");
+    check("新编号大于旧编号时按钮仍出现", !!regenBtn);
+    await dispatchClick(regenBtn);
+    check("点击后直达新 job（#/jobs/j-ffffffffffff，新编号大于旧编号）", location.hash === `#/jobs/${newJobId}`);
+  }
+
+  // 场景 C：无 length_warning 的成功任务 → 按钮不出现（反向用例）
   {
     const detail = {
       run_id: runId,

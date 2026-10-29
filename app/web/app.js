@@ -133,8 +133,14 @@ function lengthWarningBanner(d, runId, jobId) {
           try { const b = await res.json(); code = b.code || code; message = b.message || message; } catch (_) {}
           throw Object.assign(new Error(message), { code, status: res.status });
         }
-        window.alert("已发起重新生成，请到「生成进行中」查看进度");
-        location.replace("#/runs/" + runId + "/job");
+        const rb = await res.json();
+        const newJobId = rb.job_id;
+        window.alert("已发起重新生成（新任务），正在跳转…");
+        if (newJobId) {
+          location.replace("#/jobs/" + encodeURIComponent(newJobId));
+        } else {
+          location.replace("#/runs/" + runId + "/job");
+        }
       } catch (err) {
         window.alert("重新生成失败：" + (err.code || err.message));
       }

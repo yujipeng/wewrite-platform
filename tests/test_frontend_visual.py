@@ -264,13 +264,16 @@ def test_p8_writer_not_configured_error_message_no_code(client):
 
 
 def test_jee1963_regenerate_button_posts_to_endpoint(client):
-    """JEE-1963 返修：有 length_warning 时「重新生成」真实 POST /regenerate；无警告不出现按钮。"""
+    """JEE-1963 返修：有 length_warning 时「重新生成」真实 POST /regenerate 并直达新 job；无警告不出现按钮。"""
     _app_js(client)
     summary = _run_interaction_harness()
     by_name = {c["name"]: c["ok"] for c in summary["checks"]}
     for name in (
         "有 length_warning 时详情页出现「重新生成」按钮",
         "点击「重新生成」真实 POST /api/v1/jobs/{job_id}/regenerate",
+        "点击后直达新 job（#/jobs/j-000000000000，新编号小于旧编号）",
+        "新编号大于旧编号时按钮仍出现",
+        "点击后直达新 job（#/jobs/j-ffffffffffff，新编号大于旧编号）",
         "无 length_warning 的成功任务不出现「重新生成」按钮",
     ):
         assert by_name[name] is True, f"harness 断言失败：{name}"

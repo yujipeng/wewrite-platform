@@ -719,3 +719,378 @@ def test_concurrent_confirm_only_one_succeeds(tmp_path, monkeypatch):
     # 只有一个 job 落盘
     jobs = [f for f in os.listdir(os.path.join(home, "jobs")) if f.endswith(".json")]
     assert len(jobs) == 1
+
+
+# ---------- JEE-1962：按指定热点生成候选 + 唯一选题 ----------
+
+from app.adapters import hotspots as hotspots_adapter
+
+
+def hotspot_id_of(item: dict) -> str:
+    """与 hotspots.hotspot_item_id 同口径，供测试构造稳定 hotspot_ids。"""
+    return hotspots_adapter.hotspot_item_id(item)
+
+
+def snapshot_items_with_ids(n=12):
+    """返回带 item_id 的条目列表（item_id 与 read_date 回填同口径）。"""
+    items = snapshot_items(n)
+    for it in items:
+        it["item_id"] = hotspot_id_of(it)
+    return items
+
+
+def ok_snapshot_with_ids(n=12):
+    snap = ok_snapshot()
+    items = snapshot_items(n)
+    for it in items:
+        it["item_id"] = hotspot_id_of(it)
+    snap["items"] = items
+    snap["count"] = len(items)
+    return snap
+
+
+def write_snapshot_with_ids(home, date, n=12):
+    """写带 item_id 的快照（覆盖默认 ok_snapshot 写盘）。"""
+    write_snapshot(home, date, ok_snapshot_with_ids(n))
+
+
+def ids_of(snapshot, indices):
+    items = snapshot["items"]
+    return [items[i]["item_id"] for i in indices]
+
+
+def test_generate_by_hotspot_ids_single(tmp_path, monkeypatch):
+    """验收 2：传 1 个 hotspot_id，生成 1 条候选，source_url/title 对应该热点。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    hid = snap["items"][0]["item_id"]
+
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": [hid]},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["source_url"] == snap["items"][0]["url"]
+    assert item["title"] == snap["items"][0]["title"]
+    assert body["hotspot_ids"] == [hid]
+
+
+def test_generate_by_hotspot_ids_batch(tmp_path, monkeypatch):
+    """验收 3：传 3 个 hotspot_id，生成 3 条候选。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    hids = ids_of(snap, [0, 2, 5])
+
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": hids},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["items"]) == 3
+    # 顺序按总分降序（实现择一：总分降序）
+    totals = [it["scores"]["total"] for it in body["items"]]
+    assert totals == sorted(totals, reverse=True)
+    # 来源集合对应选中的 3 条热点
+    assert {it["source_url"] for it in body["items"]} == {
+        snap["items"][0]["url"], snap["items"][2]["url"], snap["items"][5]["url"]
+    }
+
+
+def test_generate_by_hotspot_ids_unknown_422(tmp_path, monkeypatch):
+    """验收 4：传不存在的 id → 422，details 指明缺失 id，不生成任何候选。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    bogus = "weibo:deadbeefdeadbeef"
+
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": [bogus]},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "VALIDATION_ERROR"
+    assert r.json()["details"]["reason"] == "hotspot_ids_not_found"
+    assert bogus in r.json()["details"]["missing"]
+    # 不写任何候选集
+    cand_dir = os.path.join(home, "candidates")
+    assert not os.path.exists(cand_dir) or not os.listdir(cand_dir)
+
+
+def test_generate_by_hotspot_ids_over_limit_422(tmp_path, monkeypatch):
+    """验收 5：传 21 条 → 422。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    too_many = [f"weibo:{i:016x}" for i in range(21)]
+
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": too_many},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_generate_by_hotspot_ids_old_snapshot_no_item_id(tmp_path, monkeypatch):
+    """验收 6：旧快照无 item_id，读时按回退规则现算 id 并正常工作。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    # 旧快照：无 item_id（模拟历史数据）
+    write_snapshot(home, "2026-10-26", ok_snapshot())
+    # 回退规则与写入规则一致：计算第一条的 id
+    hid = hotspot_id_of(ok_snapshot()["items"][0])
+
+    r = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": [hid]},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["source_url"] == ok_snapshot()["items"][0]["url"]
+
+
+def test_generate_by_hotspot_ids_idempotent_same_ids(tmp_path, monkeypatch):
+    """验收 7（幂等）：同 snapshot + style + 同 hotspot_ids → 返回既有候选集。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    hids = ids_of(snap, [0, 1])
+
+    def gen():
+        return c.post(
+            "/api/v1/candidates",
+            json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": hids},
+            headers=post_headers(c),
+        )
+
+    first = gen()
+    assert first.status_code == 200, first.text
+    second = gen()
+    assert second.status_code == 200, second.text
+    assert first.json()["candidate_set_id"] == second.json()["candidate_set_id"]
+    files = [f for f in os.listdir(os.path.join(home, "candidates")) if f.endswith(".json")]
+    assert len(files) == 1
+
+
+def test_generate_by_hotspot_ids_different_ids_new_set_needs_force(tmp_path, monkeypatch):
+    """同快照、不同 hotspot_ids 是不同候选集，无 force 时需显式 force 另开新集。"""
+    home = str(tmp_path)
+    c = make_client(monkeypatch, home)
+    snap = ok_snapshot_with_ids()
+    write_snapshot(home, "2026-10-26", snap)
+    a = ids_of(snap, [0])
+    b = ids_of(snap, [1])
+
+    r1 = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": a},
+        headers=post_headers(c),
+    )
+    assert r1.status_code == 200, r1.text
+
+    r2 = c.post(
+        "/api/v1/candidates",
+        json={"date": "2026-10-26", "style_revision": "sha256:test", "hotspot_ids": b},
+        headers=post_headers(c),
+    )
+    # 同日期已有 open 集 → 需 force（沿用既有 set_exists_requires_force 语义）
+    assert r2.status_code == 422
+    assert r2.json()["details"]["reason"] == "set_exists_requires_force"
+
+
+def test_unique_confirm_second_candidate_409(tmp_path, monkeypatch):
+    """验收 7：同一候选集内确认第 2 条 → 409 set_already_confirmed，带已确认 id/run_id。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-unique-1").json()
+    run_id = confirmed["run_id"]
+
+    r = _confirm(c, cid, second, "key-unique-2")
+    assert r.status_code == 409
+    assert r.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
+    assert r.json()["details"]["reason"] == "set_already_confirmed"
+    assert r.json()["details"]["confirmed_candidate_id"] == first["id"]
+    assert r.json()["details"]["confirmed_run_id"] == run_id
+    assert adapter.calls == 1  # 不二次调用上游
+
+
+def test_confirm_after_retract_allowed(tmp_path, monkeypatch):
+    """验收 8：撤回已确认项后，确认另一条成功。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    _confirm(c, cid, first, "key-retract-1")
+
+    # 撤回 first
+    r = c.post(
+        f"/api/v1/candidates/{cid}/retract",
+        json={"candidate_id": first["id"]},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200, r.text
+
+    # 集合重新开放，确认 second 成功
+    r2 = _confirm(c, cid, second, "key-retract-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2
+
+
+def test_confirm_same_candidate_after_retract_not_proposed(tmp_path, monkeypatch):
+    """撤回后确认「同一条」仍 409（该候选已是 retracted，不可再确认）。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+
+    _confirm(c, cid, first, "key-same-1")
+    r = c.post(
+        f"/api/v1/candidates/{cid}/retract",
+        json={"candidate_id": first["id"]},
+        headers=post_headers(c),
+    )
+    assert r.status_code == 200
+
+    r2 = _confirm(c, cid, first, "key-same-2")
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "CANDIDATE_NOT_ACTIONABLE"
+    assert r2.json()["details"]["reason"] == "not_proposed"
+
+
+def test_confirm_after_confirmed_run_cleared_allowed(tmp_path, monkeypatch):
+    """返修回归（阻断 2）：已确认候选的 run 被清理后，确认另一条成功。
+
+    「run_id 仍有效」是唯一性规则的前置条件：run 的 state.yaml 被删（run 失效）
+    后，set_already_confirmed 不再成立，第二条候选应能正常确认。
+    """
+    import shutil
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-run-clear-1").json()
+    run_id = confirmed["run_id"]
+
+    # 清理 run 目录，使 run 失效（state.yaml 不存在）
+    run_dir = os.path.join(home, "runs", run_id)
+    assert os.path.isdir(run_dir)
+    shutil.rmtree(run_dir)
+
+    # run 失效后确认另一条应成功（不再 set_already_confirmed）
+    r2 = _confirm(c, cid, second, "key-run-clear-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2
+
+
+def test_confirm_second_still_blocked_when_run_valid(tmp_path, monkeypatch):
+    """返修回归（阻断 2 补充）：run 仍有效时确认第二条仍被 set_already_confirmed 阻断。"""
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    _confirm(c, cid, first, "key-run-valid-1")
+    # run 目录仍在 → 仍阻断
+    r2 = _confirm(c, cid, second, "key-run-valid-2")
+    assert r2.status_code == 409
+    assert r2.json()["details"]["reason"] == "set_already_confirmed"
+    assert adapter.calls == 1
+
+
+def test_confirm_second_allowed_when_state_run_id_mismatch(tmp_path, monkeypatch):
+    """返修回归（阻断 2 标识匹配）：候选记录的 run_id 与 state.yaml 里的 run_id 不符 → 判无效。
+
+    state.yaml 被改写成另一 run_id 后，唯一性规则不再把该确认视为有效，第二条应能正常确认。
+    """
+    import yaml
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-run-mismatch-1").json()
+    run_id = confirmed["run_id"]
+
+    # 篡改 state.yaml 的 run_id，使文件标识与候选记录不符
+    state_path = os.path.join(home, "runs", run_id, "state.yaml")
+    with open(state_path, encoding="utf-8") as f:
+        state = yaml.safe_load(f)
+    state["run_id"] = "20261026-999999-ffffff"
+    with open(state_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(state, f, allow_unicode=True, sort_keys=False)
+
+    # 标识不匹配 → 视为无效，确认第二条成功
+    r2 = _confirm(c, cid, second, "key-run-mismatch-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2
+
+
+def test_confirm_second_allowed_when_job_run_id_mismatch(tmp_path, monkeypatch):
+    """返修回归（阻断 2 标识匹配）：job 文件 run_id 与候选记录不符 → 判无效，第二条可确认。"""
+    import json
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-job-mismatch-1").json()
+    run_id = confirmed["run_id"]
+    job_id = confirmed["job_id"]
+
+    # 篡改 job 文件的 run_id，使文件标识与候选记录不符
+    job_path = os.path.join(home, "jobs", f"{job_id}.json")
+    with open(job_path, encoding="utf-8") as f:
+        job = json.load(f)
+    job["run_id"] = "20261026-888888-eeeeee"
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False)
+
+    # job 标识不匹配 → 视为无效，确认第二条成功
+    r2 = _confirm(c, cid, second, "key-job-mismatch-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2

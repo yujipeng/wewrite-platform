@@ -114,6 +114,11 @@ class ConfirmGate:
             self._mark_item_retracted(data, item["id"])
             self._mark_run_retracted(job.get("run_id"))
             self._job_store.transition_to_cancelled(job)
+            # 唯一选题（issue 3.2）：撤回后若集合内已无其它 confirmed 候选，
+            # 集合从 confirmed 重新开放为 open，允许确认另一条。
+            if not self._find_confirmed_other(data, item["id"]):
+                data["set_status"] = "open"
+                self._write_set(data)
             return {
                 "candidate_set_id": candidate_set_id,
                 "candidate_id": candidate_id,
@@ -148,6 +153,20 @@ class ConfirmGate:
             if item.get("status") == "confirmed":
                 raise errors.conflict(
                     "候选已确认", {"reason": "already_confirmed", "candidate_id": settings["candidate_id"]}
+                )
+
+            # 唯一选题（issue 3.2）：同一候选集内已有其它候选处于 confirmed 且 run 仍有效，
+            # 再次确认另一条 → 409 CANDIDATE_NOT_ACTIONABLE reason=set_already_confirmed，
+            # 并带上已确认的 candidate_id 与 run_id。若已确认那条已 retract，则允许确认另一条。
+            confirmed_other = self._find_confirmed_other(data, settings["candidate_id"])
+            if confirmed_other is not None:
+                raise errors.candidate_not_actionable(
+                    "set_already_confirmed",
+                    details={
+                        "reason": "set_already_confirmed",
+                        "confirmed_candidate_id": confirmed_other.get("id"),
+                        "confirmed_run_id": confirmed_other.get("run_id"),
+                    },
                 )
 
             reason = self._actionable_reason(data, item)
@@ -220,16 +239,71 @@ class ConfirmGate:
                 return it
         raise errors.candidate_not_actionable("not_proposed")
 
+    def _find_confirmed_other(self, data: dict, candidate_id: str) -> dict | None:
+        """返回集合内除 ``candidate_id`` 外仍处 confirmed 且 run 仍有效的候选。
+
+        「唯一选题」判定：已确认的候选若已 retract（status=retracted）不在此列；
+        已确认但 run/job 已失效（被清理）的候选同样不在此列，因此 run 失效后
+        set_already_confirmed 不再成立，允许确认另一条。
+        """
+        for it in data.get("items") or []:
+            if it.get("id") == candidate_id:
+                continue
+            if it.get("status") == "confirmed" and self._confirmed_run_valid(it):
+                return it
+        return None
+
+    def _confirmed_run_valid(self, item: dict) -> bool:
+        """判定某 confirmed 候选的 run 是否仍有效（需求 3.2 前置条件「run_id 仍有效」）。
+
+        有效性落到磁盘真实存在性 + 标识匹配：run 的 state.yaml 可读且 ``state["run_id"]``
+        必须等于候选记录的 ``run_id``；若带 job_id，job 文件必须仍存在且其 ``run_id``
+        也须与候选记录的 ``run_id`` 一致。文件标识与候选记录不符（或任一被清理）即判
+        无效，不再阻挡确认另一条。
+        """
+        run_id = item.get("run_id")
+        if not run_id:
+            return False
+        state = paths.read_state_yaml(self.home, run_id)
+        if not isinstance(state, dict) or state.get("run_id") != run_id:
+            return False
+        job_id = item.get("job_id")
+        if job_id:
+            job = self._job_store.load(job_id)
+            if job is None or job.get("run_id") != run_id:
+                return False
+        return True
+
+    def _has_valid_confirmation(self, data: dict) -> bool:
+        """集合内是否仍有任一「run 仍有效」的 confirmed 候选。"""
+        for it in data.get("items") or []:
+            if it.get("status") == "confirmed" and self._confirmed_run_valid(it):
+                return True
+        return False
+
     def _actionable_reason(self, data: dict, item: dict | None) -> str | None:
         if item is None:
             return "not_proposed"
-        if data.get("set_status") != "open":
+        if not self._set_open_for_confirm(data):
             return "set_closed"
         if item.get("status") != "proposed":
             return "not_proposed"
         if candidates_store.is_expired(data):
             return "expired"
         return None
+
+    def _set_open_for_confirm(self, data: dict) -> bool:
+        """确认前置的集合开放判定。
+
+        正常 open 集可确认；已确认集（set_status=confirmed）在「唯一确认的那条 run
+        已失效/被清理」时视为可重新确认（否则永远被 set_closed 锁死）。
+        """
+        status = data.get("set_status")
+        if status == "open":
+            return True
+        if status == "confirmed":
+            return not self._has_valid_confirmation(data)
+        return False
 
     def _find_job_id(self, data: dict, candidate_id: str) -> str | None:
         intent = self._read_intent(f"{data.get('candidate_set_id')}-{candidate_id}")

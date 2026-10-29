@@ -32,7 +32,10 @@ def _find_chromium() -> str | None:
     env = os.environ.get("WEWRITE_PLAYWRIGHT_EXECUTABLE")
     if env and os.path.exists(env):
         return env
-    # 常见路径（含本机 chrome-cft 的捆绑库浏览器）
+    # 常见路径（含本机 chrome-cft 的捆绑库浏览器）。裸 chrome 二进制缺 libatk 等
+    # 系统库会在 launch 时抛 TargetClosedError，由 fixture 兜底整组 skip；需要真跑
+    # 浏览器时用 WEWRITE_PLAYWRIGHT_EXECUTABLE 指向带 LD_LIBRARY_PATH 的 wrapper
+    # （如 ~/.local/bin/google-chrome）。
     candidates = [
         os.path.expanduser("~/.local/chrome-cft/chrome-linux64/chrome"),
         os.path.expanduser("~/.local/bin/google-chrome"),
@@ -152,7 +155,7 @@ def browser_session(tmp_path_factory):
             except Exception as exc:
                 pytest.skip(f"Chromium 启动失败（缺系统库或不可用）：{type(exc).__name__}")
             try:
-                yield {"ctx": ctx, "base": f"http://127.0.0.1:{port}"}
+                yield {"ctx": ctx, "base": f"http://127.0.0.1:{port}", "home": home}
             finally:
                 ctx.close()
     finally:
@@ -477,3 +480,246 @@ def test_p8_style_validate_error_shows_line(browser_session):
     body_text = page.inner_text("#app")
     assert "校验失败" in body_text or "YAML" in body_text or "语法" in body_text
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def _write_hotspot_snapshot(home: str, date: str, items: list) -> None:
+    """直接写热榜快照 fixture（含 item_id，供 P4 真浏览器用例使用）。"""
+    import json
+
+    from app.adapters import hotspots as hotspots_adapter
+
+    d = os.path.join(home, "hotspots")
+    os.makedirs(d, exist_ok=True)
+    for it in items:
+        it["item_id"] = hotspots_adapter.hotspot_item_id(it)
+    snap = {
+        "version": 1,
+        "date": date,
+        "captured_at_utc": "2026-10-26T01:00:00+00:00",
+        "captured_at_local": "2026-10-26T09:00:00+08:00",
+        "sources": ["weibo", "toutiao", "baidu"],
+        "sources_failed": [],
+        "last_success_at": "2026-10-26T01:00:00+00:00",
+        "count": len(items),
+        "error": None,
+        "items": items,
+        "stale_sources": [],
+    }
+    with open(os.path.join(d, f"{date}.json"), "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False)
+
+
+def _p4_items(n=6):
+    """造 n 条三源热点，带稳定 url。"""
+    items = []
+    for i in range(n):
+        source = ["微博", "今日头条", "百度"][i % 3]
+        source_id = {"微博": "weibo", "今日头条": "toutiao", "百度": "baidu"}[source]
+        items.append({
+            "title": f"热点标题第{i + 1}条",
+            "source": source,
+            "source_id": source_id,
+            "hot": (n - i) * 100 + 10,
+            "url": f"https://example.invalid/{i}",
+            "description": f"切入角度{i + 1}",
+        })
+    return items
+
+
+def test_p4_hotspot_selection_generate_and_unique_confirm(browser_session):
+    """JEE-1962 真浏览器验证：P4 勾选 2 条 →「生成候选（已选 2 条）」可用、
+    「确认选题」禁用；只勾 1 条 →「确认选题」可用。"""
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    gen_btn = page.locator("button", has_text="生成候选（已选")
+    confirm_btn = page.locator("button", has_text="确认选题（唯一）")
+    assert gen_btn.count() == 1, "应有「生成候选（已选 N 条）」按钮"
+    assert confirm_btn.count() == 1, "应有「确认选题（唯一）」按钮"
+
+    # 初始：0 条选中 → 生成禁用、确认禁用
+    assert gen_btn.is_disabled(), "0 条选中时生成候选应禁用"
+    assert confirm_btn.is_disabled(), "0 条选中时确认选题应禁用"
+
+    # 勾选 2 条 → 生成可用、确认禁用并提示只能选一条
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    assert checkboxes.count() == 6, f"应有 6 个勾选框，实际 {checkboxes.count()}"
+    checkboxes.nth(0).check()
+    checkboxes.nth(1).check()
+    page.wait_for_timeout(200)
+    assert not gen_btn.is_disabled(), "勾选 2 条时生成候选应可用"
+    assert "生成候选（已选 2 条）" in gen_btn.inner_text()
+    assert confirm_btn.is_disabled(), "勾选 2 条时确认选题应禁用"
+    assert "选题只能选一条" in page.inner_text("#app")
+
+    # 取消一条 → 只勾 1 条 → 确认选题可用
+    checkboxes.nth(1).uncheck()
+    page.wait_for_timeout(200)
+    assert confirm_btn.is_enabled(), "只勾 1 条时确认选题应可用"
+    assert page_errors == [], f"P4 勾选交互抛 JS 异常：{page_errors}"
+
+
+def test_p4_hotspot_generate_selected_writes_candidate_set(browser_session):
+    """JEE-1962 真浏览器验证：勾选 2 条点「生成候选」→ 按 hotspot_ids 生成候选集并跳转 P5。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    checkboxes.nth(1).check()
+    page.wait_for_timeout(200)
+
+    # 点「生成候选（已选 2 条）」→ 跳转到 P5
+    page.locator("button", has_text="生成候选（已选").click()
+    page.wait_for_timeout(900)
+
+    assert "#/candidates" in page.url, f"应跳转到 P5，实际 {page.url}"
+    # 候选集已落盘：items 数量 == 2
+    data = json.loads(urllib.request.urlopen(f"{base}/api/v1/candidates", timeout=5).read().decode("utf-8"))
+    sets = data.get("candidates") or []
+    assert len(sets) >= 1, "应生成至少一个候选集"
+    latest = sets[0]
+    assert len(latest["items"]) == 2, f"按 2 条热点生成应为 2 条候选，实际 {len(latest['items'])}"
+    assert page_errors == [], f"P4 生成候选交互抛 JS 异常：{page_errors}"
+
+
+def test_p4_confirm_selected_opens_confirm_modal_one_step(browser_session):
+    """返修回归（阻断 1）：只勾选 1 条点「确认选题」→ 一步打开该条候选确认弹层。
+
+    弹层含「确认选题」标题、图片上限/预算输入与 allow_publish 文案，路由带
+    candidate_set_id/candidate_id（#/candidates/<set>/<candidate>）。
+    """
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    # 模块级 fixture 共享 JS 状态：先清空上一条用例残留的勾选，保证本用例从 0 开始
+    page.locator("button", has_text="清空选择").click()
+    page.wait_for_timeout(200)
+
+    # 只勾选 1 条 → 确认选题可用
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    page.wait_for_timeout(200)
+
+    page.locator("button", has_text="确认选题（唯一）").click()
+    page.wait_for_timeout(900)
+
+    # 路由带候选集/候选 id
+    assert "#/candidates/" in page.url, f"应带候选集/候选 id 跳转，实际 {page.url}"
+    # 确认弹层已打开（标题 + 图片上限/预算 + allow_publish 文案）
+    body_text = page.inner_text("#app")
+    assert "确认选题" in body_text, "应打开确认弹层"
+    assert "图片上限（0–10）" in body_text, "确认弹层应有图片上限输入"
+    assert "预算（元）" in body_text, "确认弹层应有预算输入"
+    assert "allow_publish=false" in body_text, "确认弹层应展示 allow_publish=false"
+    # 弹层里的「确认生成」按钮存在
+    assert page.locator("button", has_text="确认生成").count() == 1, "应有「确认生成」按钮"
+    assert page_errors == [], f"P4 确认选题一步打开弹层抛 JS 异常：{page_errors}"
+
+
+def test_p4_confirm_selected_no_confirmable_candidate_shows_hint(browser_session):
+    """返修回归（阻断 1 已有候选分支）：该 URL 只有已确认/已关闭候选时，点「确认选题」
+    必须给出明确的「不可确认」中文提示，不得静默退回候选列表。
+
+    用唯一 url 构造快照，避免被共享 browser 上下文中其它 P4 用例生成的开集候选污染。
+    """
+    import json
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    # 唯一 url，仅本用例使用
+    item = {
+        "title": "唯一热点标题",
+        "source": "微博",
+        "source_id": "weibo",
+        "hot": 999,
+        "url": "https://example.invalid/jee1962-no-confirm",
+        "description": "切入角度",
+    }
+    _write_hotspot_snapshot(home, "2026-10-26", [item])
+
+    # 直写一个「已确认」候选集：source_url 对应该热点，set_status=confirmed（无可确认候选）
+    cand_dir = os.path.join(home, "candidates")
+    os.makedirs(cand_dir, exist_ok=True)
+    cid = "2026-10-26-aaaaaaaacdef"
+    candidate_set = {
+        "version": 1,
+        "candidate_set_id": cid,
+        "set_status": "confirmed",
+        "created_at": "2026-10-26T08:00:00Z",
+        "expires_at": "2026-10-27T08:00:00Z",
+        "timezone": "Asia/Shanghai",
+        "snapshot_sha256": "sha256:deadbeef",
+        "style_revision": "sha256:web-default",
+        "items": [{
+            "id": "c01",
+            "status": "confirmed",
+            "title": "唯一热点标题",
+            "angle": "解读",
+            "scores": {"hot": 999, "hot_normalized": 100.0, "relevance": 80.0, "value": 70.0, "total": 79.0},
+            "framework": "问题-证据-行动",
+            "source": "微博",
+            "source_id": "weibo",
+            "source_url": "https://example.invalid/jee1962-no-confirm",
+            "history_flag": False,
+            "content_hash": "sha256:deadbeef",
+            "run_id": "20261026-120000-abcdef",
+            "job_id": "j-test000001",
+        }],
+    }
+    with open(os.path.join(cand_dir, f"{cid}.json"), "w", encoding="utf-8") as f:
+        json.dump(candidate_set, f, ensure_ascii=False)
+
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    # 模块级 fixture 共享 JS 状态：先清空残留勾选
+    page.locator("button", has_text="清空选择").click()
+    page.wait_for_timeout(200)
+
+    # 只勾选该热点（其候选已确认、无 open/proposed 候选）
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    page.wait_for_timeout(200)
+
+    page.locator("button", has_text="确认选题（唯一）").click()
+    page.wait_for_timeout(600)
+
+    # 仍在 P4（未静默跳转），且给出明确的不可确认中文提示
+    assert "#/hotspots" in page.url, f"不应静默跳转，实际 {page.url}"
+    body_text = page.inner_text("#app")
+    assert "无法再次确认" in body_text, "应提示该热点候选均已确认/关闭无法再次确认"
+    assert "选题确认" in body_text or "生成候选" in body_text, "提示应含下一步动作指引"
+    assert page_errors == [], f"P4 不可确认分支抛 JS 异常：{page_errors}"

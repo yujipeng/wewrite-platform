@@ -430,7 +430,7 @@ async def get_candidate_set(candidate_set_id: str):
 
 @router.post("/api/v1/candidates")
 async def generate_candidates(request: Request):
-    """从指定日期快照生成候选集（10 条，全失败不写）。"""
+    """从指定日期快照生成候选集（整批 10 条，或按指定热点 1 条/个，全失败不写）。"""
     try:
         body = await request.json()
     except Exception:
@@ -441,11 +441,15 @@ async def generate_candidates(request: Request):
     date = body.get("date")
     style_revision = body.get("style_revision")
     force = bool(body.get("force", False))
+    hotspot_ids_raw = body.get("hotspot_ids")
     try:
         candidates.validate_date(date)
         from app.domain import scoring
 
         scoring.validate_style_revision(style_revision)
+        # hotspot_ids 为可选数组；省略/空 = 整批。校验在生成方法内完成（去重/上限/非空）。
+        if hotspot_ids_raw is not None and not isinstance(hotspot_ids_raw, list):
+            raise errors.validation_error("hotspot_ids 必须为数组", {"field": "hotspot_ids"})
     except errors.ApiError as exc:
         return _error_response(exc)
 
@@ -465,7 +469,12 @@ async def generate_candidates(request: Request):
 
     try:
         result = await run_in_threadpool(
-            _candidate_store().generate, date, style_revision, snapshot, force
+            _candidate_store().generate,
+            date,
+            style_revision,
+            snapshot,
+            force,
+            hotspot_ids_raw,
         )
     except errors.ApiError as exc:
         return _error_response(exc)

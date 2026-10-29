@@ -66,6 +66,19 @@ def normalize_hot(items: list[dict], limit: int = 10) -> list[dict]:
     return ordered[:limit]
 
 
+def normalize_hot_no_truncate(items: list[dict]) -> list[dict]:
+    """对全部条目做三源归一化但不做全局截断（issue 3.1.6）。
+
+    与 ``normalize_hot`` 算法完全一致（按 source 分组、组内 hot 降序、0-based
+    rank），区别只是 limit 取全部条目数；供「按指定热点生成候选」复用同一口径，
+    保证某条热点的 ``hot_normalized`` 与整批生成时完全一致。
+    """
+    result = [it for it in items if isinstance(it, dict)]
+    if not result:
+        return result
+    return normalize_hot(result, limit=len(result))
+
+
 def _num(value) -> float:
     try:
         return float(value or 0)

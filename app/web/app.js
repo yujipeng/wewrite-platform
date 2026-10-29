@@ -204,6 +204,13 @@ const IMAGE_ERROR_TEXT = {
   IMAGE_TIMEOUT: "图片生成超时",
 };
 let _jobPollTimer = null;
+// P4 热榜勾选状态（跨 renderHotspots 重建时保留用户选择）
+let _hotspotSelections = new Set();
+let _hotspotExistingCandidates = new Set();
+let _hotspotCandidateByUrl = {};
+let _hotspotCurrentDate = "";
+let _hotspotCurrentItems = [];
+let _hotspotLastBody = null;
 
 function stopJobPolling() {
   if (_jobPollTimer) {
@@ -254,6 +261,10 @@ function currentRoute() {
   if (pbm) return { page: "publish", runId: pbm[1] };
   if (hash === "#/hotspots") return { page: "hotspots" };
   if (hash === "#/candidates") return { page: "candidates" };
+  // #/candidates/<set_id>/<candidate_id>：P4「确认选题」把选中标识带进路由，
+  // P5 按该标识直接定位并打开该条候选的确认弹层（验收项 10 一步到位）。
+  const cm = hash.match(/^#\/candidates\/(\d{4}-\d{2}-\d{2}-[a-f0-9]{12})\/(c\d+)$/);
+  if (cm) return { page: "candidates", candidateSetId: cm[1], candidateId: cm[2] };
   if (hash === "#/config") return { page: "config" };
   return { page: "home" };
 }
@@ -288,7 +299,7 @@ async function render() {
   } else if (route.page === "hotspots") {
     await renderHotspots();
   } else if (route.page === "candidates") {
-    await renderCandidates();
+    await renderCandidates(route.candidateSetId, route.candidateId);
   } else if (route.page === "config") {
     await renderConfig();
   } else if (route.page === "publish") {
@@ -1014,8 +1025,36 @@ async function renderHotspots() {
   dateRow.appendChild(genCandidatesLink);
   app.appendChild(dateRow);
 
+  // P4 勾选操作区：全选/反选、生成候选（已选 N 条）、确认选题（唯一）、清空
+  const selRow = el("div", { class: "preview-controls" });
+  const selectAllBtn = el("button", { class: "btn", text: "全选/反选" });
+  const genSelBtn = el("button", { class: "btn primary", text: "生成候选（已选 0 条）" });
+  const confirmSelBtn = el("button", { class: "btn", text: "确认选题（唯一）" });
+  const clearSelBtn = el("button", { class: "btn", text: "清空选择" });
+  const selHint = el("span", { class: "muted", text: "勾选热点后生成候选；确认选题仅能选一条" });
+  selRow.appendChild(selectAllBtn);
+  selRow.appendChild(genSelBtn);
+  selRow.appendChild(confirmSelBtn);
+  selRow.appendChild(clearSelBtn);
+  selRow.appendChild(selHint);
+  app.appendChild(selRow);
+
   const container = el("div");
   app.appendChild(container);
+
+  const currentDate = () => _hotspotCurrentDate || dateSelect.value || "";
+
+  const refreshSelectionUI = () => {
+    const n = _hotspotSelections.size;
+    genSelBtn.textContent = "生成候选（已选 " + n + " 条）";
+    genSelBtn.disabled = n === 0;
+    // 确认选题：仅恰好选中 1 条时可用；选中 0 或 ≥2 禁用并提示
+    confirmSelBtn.disabled = n !== 1;
+    selHint.textContent = n === 1
+      ? "选题只能选一条"
+      : (n >= 2 ? "选题只能选一条，请只勾选一条后确认" : "勾选热点后生成候选；确认选题仅能选一条");
+    selHint.classList.toggle("error-block", n >= 2);
+  };
 
   const loadDates = async () => {
     try {
@@ -1051,6 +1090,9 @@ async function renderHotspots() {
   const drawList = (body) => {
     container.innerHTML = "";
     const items = body.items || [];
+    if (body.date) _hotspotCurrentDate = body.date;
+    _hotspotCurrentItems = items;
+    _hotspotLastBody = body;
     const meta = el("div", { class: "muted", text: "共 " + (body.count || 0) + " 条　来源：" + (body.sources || []).map((s) => SOURCE_TEXT[s] || s).join("、") + (body.sources_failed && body.sources_failed.length ? "　失败源：" + body.sources_failed.map((s) => SOURCE_TEXT[s] || s).join("、") : "") + (body.last_success_at ? "　上次成功：" + body.last_success_at : "") });
     container.appendChild(meta);
     if (items.length === 0) {
@@ -1059,18 +1101,53 @@ async function renderHotspots() {
     }
     const list = el("ul", { class: "run-list" });
     for (const it of items) {
+      const hid = it.item_id || "";
+      const cb = el("input", { type: "checkbox", title: "勾选该热点" });
+      cb.checked = _hotspotSelections.has(hid);
+      cb.addEventListener("change", () => {
+        if (cb.checked) _hotspotSelections.add(hid);
+        else _hotspotSelections.delete(hid);
+        refreshSelectionUI();
+      });
       const row = el("li", { class: "run-item" }, [
         el("div", { class: "run-main" }, [
           el("div", { class: "run-title", text: (it.title || "") }),
           el("div", { class: "run-meta", text: (it.source_label || it.source || "") + " · 热度 " + (it.hot ?? "—") + (it.hot_normalized != null ? " · 归一化 " + it.hot_normalized : "") }),
         ]),
       ]);
+      // 已生成过候选的条目标「已有候选」徽标
+      if (it.url && _hotspotExistingCandidates.has(it.url)) {
+        row.appendChild(el("span", { class: "badge badge-completed", text: "已有候选" }));
+      }
+      row.appendChild(el("label", { class: "muted", style: "display:inline-flex;align-items:center;gap:4px" }, [cb, " 选"]));
       if (it.url) {
         row.appendChild(el("a", { class: "btn", href: it.url, target: "_blank", rel: "noopener", text: "原文" }));
       }
       list.appendChild(row);
     }
     container.appendChild(list);
+    refreshSelectionUI();
+  };
+
+  const loadExistingCandidates = async () => {
+    _hotspotExistingCandidates.clear();
+    _hotspotCandidateByUrl = {};
+    try {
+      const body = await api("/api/v1/candidates");
+      const sets = body.candidates || [];
+      for (const s of sets) {
+        for (const it of (s.items || [])) {
+          if (it.source_url) _hotspotExistingCandidates.add(it.source_url);
+          // 记录「url → 候选集/候选」映射，供 P4「确认选题」一步定位到该条确认弹层
+          if (it.source_url && it.status === "proposed" && s.set_status === "open") {
+            _hotspotCandidateByUrl[it.source_url] = {
+              set_id: s.candidate_set_id,
+              candidate_id: it.id,
+            };
+          }
+        }
+      }
+    } catch (_) { /* 读取失败不阻断热榜展示 */ }
   };
 
   const loadSaved = async () => {
@@ -1140,10 +1217,136 @@ async function renderHotspots() {
     }
   };
 
+  const doGenerateSelected = async () => {
+    if (_hotspotSelections.size === 0) {
+      window.alert("请先勾选热点");
+      return;
+    }
+    const date = currentDate();
+    if (!date) {
+      window.alert("当前没有可用的热榜快照日期，请先补抓并保存今日快照");
+      return;
+    }
+    const ids = Array.from(_hotspotSelections);
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在生成候选（已选 " + ids.length + " 条）…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/candidates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ date, style_revision: "sha256:web-default", hotspot_ids: ids }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText; let details = null;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
+      }
+      // 成功：跳到 P5（候选对比 + 确认流程）
+      location.hash = "#/candidates";
+    } catch (err) {
+      container.innerHTML = "";
+      // 失败提示（含热点已不在快照内的明确中文提示），不清空用户选择
+      if (err.code === "VALIDATION_ERROR" && err.details && err.details.reason === "hotspot_ids_not_found") {
+        const missing = (err.details.missing || []).length;
+        container.appendChild(errorState("所选热点中有 " + missing + " 条已不在当日快照内，请刷新快照后重选", () => loadSaved()));
+      } else {
+        container.appendChild(errorState("生成候选失败：" + (err.code || err.message), () => doGenerateSelected()));
+      }
+      refreshSelectionUI();
+    }
+  };
+
+  const doConfirmSelected = async () => {
+    if (_hotspotSelections.size !== 1) {
+      window.alert("选题只能选一条");
+      return;
+    }
+    const date = currentDate();
+    if (!date) {
+      window.alert("当前没有可用的热榜快照日期，请先补抓并保存今日快照");
+      return;
+    }
+    const hid = Array.from(_hotspotSelections)[0];
+    // 精确判定：当前选中的热点是否已有候选（按 url 匹配），并拿到其候选集/候选 id
+    const item = (_hotspotCurrentItems || []).find((it) => (it.item_id || "") === hid);
+    const hasAnyCandidate = !!(item && item.url && _hotspotExistingCandidates.has(item.url));
+    if (hasAnyCandidate) {
+      // 二选一给确定结果：要么精确打开可确认候选弹层，要么明确提示「不可确认」。
+      const target = item && item.url ? _hotspotCandidateByUrl[item.url] : null;
+      if (target) {
+        // 一步进入 P5 并打开该条候选的确认弹层（含图片上限/预算/allow_publish 展示）
+        location.hash = "#/candidates/" + target.set_id + "/" + target.candidate_id;
+      } else {
+        // 该 URL 只有已确认/已关闭候选，无 open/proposed 候选可确认：明确提示，不静默退回
+        container.innerHTML = "";
+        container.appendChild(errorState(
+          "该热点已有候选，但均已确认或已关闭，无法再次确认；请到「选题确认」页查看既有候选，或改用「生成候选」重新生成",
+          () => loadSaved()
+        ));
+        refreshSelectionUI();
+      }
+      return;
+    }
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在生成该热点候选并进入选题确认…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/candidates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ date, style_revision: "sha256:web-default", hotspot_ids: [hid] }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText; let details = null;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
+      }
+      // 生成返回的候选集（1 条），其 items[0].id 即新候选 id；带上路由一步打开确认弹层
+      const body = await res.json();
+      const cid = body.candidate_set_id;
+      const newItemId = (body.items && body.items[0] && body.items[0].id) || "";
+      if (cid && newItemId) {
+        location.hash = "#/candidates/" + cid + "/" + newItemId;
+      } else {
+        location.hash = "#/candidates";
+      }
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.code === "VALIDATION_ERROR" && err.details && err.details.reason === "hotspot_ids_not_found") {
+        container.appendChild(errorState("该热点已不在当日快照内，请刷新快照后重选", () => loadSaved()));
+      } else {
+        container.appendChild(errorState("生成候选失败：" + (err.code || err.message), () => doConfirmSelected()));
+      }
+      refreshSelectionUI();
+    }
+  };
+
+  selectAllBtn.addEventListener("click", () => {
+    const items = _hotspotCurrentItems || [];
+    const allSelected = items.length > 0 && items.every((it) => _hotspotSelections.has(it.item_id || ""));
+    if (allSelected) {
+      _hotspotSelections.clear();
+    } else {
+      for (const it of items) {
+        if (it.item_id) _hotspotSelections.add(it.item_id);
+      }
+    }
+    if (_hotspotLastBody) drawList(_hotspotLastBody);
+    else refreshSelectionUI();
+  });
+  clearSelBtn.addEventListener("click", () => {
+    _hotspotSelections.clear();
+    if (_hotspotLastBody) drawList(_hotspotLastBody);
+    else refreshSelectionUI();
+  });
+  genSelBtn.addEventListener("click", doGenerateSelected);
+  confirmSelBtn.addEventListener("click", doConfirmSelected);
   refreshBtn.addEventListener("click", doRefresh);
   persistBtn.addEventListener("click", doPersist);
 
   await loadDates();
+  await loadExistingCandidates();
   await loadSaved();
 }
 
@@ -1164,7 +1367,7 @@ const SET_STATUS_TEXT = {
   expired: "已过期",
 };
 
-async function renderCandidates() {
+async function renderCandidates(confirmSetId, confirmCandidateId) {
   app.innerHTML = "";
   /* 页面标题由顶栏 h1 承载 */
 
@@ -1227,6 +1430,18 @@ async function renderCandidates() {
       if (sets.length === 0) {
         container.appendChild(emptyState("还没有候选集，点「生成候选」从当日热榜快照生成"));
         return;
+      }
+      // P4「确认选题」带来的定位参数：优先打开指定候选集的指定候选确认弹层
+      if (confirmSetId && confirmCandidateId) {
+        const target = sets.find((s) => s.candidate_set_id === confirmSetId);
+        if (target) {
+          const item = (target.items || []).find((it) => it.id === confirmCandidateId);
+          if (item && item.status === "proposed" && target.set_status === "open") {
+            drawSet(target);
+            openConfirm(target, item);
+            return;
+          }
+        }
       }
       const latest = sets[0];
       drawSet(latest);

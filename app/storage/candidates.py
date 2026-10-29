@@ -29,6 +29,7 @@ from app.domain import scoring
 from app.storage import paths
 
 CANDIDATE_COUNT = 10
+HOTSPOT_IDS_MAX = 20
 EXPIRY_HOURS = 24
 TIMEZONE = "Asia/Shanghai"
 
@@ -188,17 +189,30 @@ class CandidateStore:
             "expires_at": data.get("expires_at"),
             "snapshot_sha256": data.get("snapshot_sha256"),
             "style_revision": data.get("style_revision"),
+            "hotspot_ids": data.get("hotspot_ids") or [],
             "items": data.get("items") or [],
         }
 
     # ---------- 写（生成） ----------
 
-    def generate(self, date: str, style_revision: str, snapshot: dict, force: bool = False) -> tuple[dict, bool]:
-        """从指定日期快照生成候选集（10 条，全失败不写）。
+    def generate(
+        self,
+        date: str,
+        style_revision: str,
+        snapshot: dict,
+        force: bool = False,
+        hotspot_ids: list[str] | None = None,
+    ) -> tuple[dict, bool]:
+        """从指定日期快照生成候选集（整批 top-10，或按指定热点生成）。
 
         幂等：相同 snapshot_sha256 + style_revision 且存在 open 集 → 返回既有集
         （``created=False``）。同日期已有其它 open 集（不同快照或不同风格）时，
         另开新集必须显式 ``force=true``（否则 VALIDATION_ERROR 提示）。
+
+        ``hotspot_ids``（可选）：仅对指定热点生成候选，每条 1 条、数量等于传入条数
+        （不再固定 10 条）；省略或空 = 现有整批 top-10 行为。传入 id 在快照里缺失
+        由路由层在校验后抛 ``422 VALIDATION_ERROR``（不得静默跳过）；本方法仍做
+        防御性校验，缺任一 id 直接抛错。
 
         覆盖保护（硬要求，优先于 force）：目标文件名 ``<date>-<snapshot_sha256 前
         12 位>`` 已存在时，若该旧集**有下游引用**（item 已 confirmed/retracted、
@@ -208,30 +222,46 @@ class CandidateStore:
         ``force=true`` 才允许原地重建，重建前写审计（事件名 ``candidate_set_rebuilt``，
         区别于 ``candidate_set_superseded``）。
 
-        全失败（无法产出 10 条候选）→ 抛 VALIDATION_ERROR（reason=all_failed），
+        全失败（无法产出候选）→ 抛 VALIDATION_ERROR（reason=all_failed），
         **不写任何候选集文件**。
         """
         validate_date(date)
         scoring.validate_style_revision(style_revision)
+        hotspot_ids = self._normalize_hotspot_ids(hotspot_ids)
 
         snap_hash = snapshot_sha256_of(snapshot)
 
-        # 幂等：找到相同 snapshot_sha256 + style_revision 的既有 open 集
-        existing = self._find_open_set(snap_hash, style_revision)
+        # 幂等：找到相同 snapshot_sha256 + style_revision + hotspot_ids 的既有 open 集
+        existing = self._find_open_set(snap_hash, style_revision, hotspot_ids)
         if existing is not None and not force:
             return existing, False
 
-        # 生成候选：全失败（无任何条目）或条目不足（<10 条）都不写，语义分开
-        items = self._generate_items(snapshot)
-        if not items:
-            raise errors.validation_error(
-                "当日快照全源失败或无可用条目，无法生成候选", {"reason": "all_failed"}
-            )
-        if len(items) < CANDIDATE_COUNT:
-            raise errors.validation_error(
-                "当日快照可用条目不足 10 条，无法生成候选",
-                {"reason": "insufficient_items", "available": len(items)},
-            )
+        # 生成候选：全失败（无任何条目）或条目不足都不写，语义分开
+        if hotspot_ids:
+            # 指定热点：校验全部存在（缺失即 422，不得静默跳过）
+            missing = self._missing_hotspot_ids(snapshot, hotspot_ids)
+            if missing:
+                raise errors.validation_error(
+                    "所选热点中有热点已不在当日快照内",
+                    {"reason": "hotspot_ids_not_found", "missing": missing},
+                )
+            items = self._generate_items_for_hotspots(snapshot, hotspot_ids)
+            if not items:
+                raise errors.validation_error(
+                    "当日快照全源失败或无可用条目，无法生成候选", {"reason": "all_failed"}
+                )
+        else:
+            # 整批 top-10：保持既有语义（条目不足 10 条不写）
+            items = self._generate_items(snapshot)
+            if not items:
+                raise errors.validation_error(
+                    "当日快照全源失败或无可用条目，无法生成候选", {"reason": "all_failed"}
+                )
+            if len(items) < CANDIDATE_COUNT:
+                raise errors.validation_error(
+                    "当日快照可用条目不足 10 条，无法生成候选",
+                    {"reason": "insufficient_items", "available": len(items)},
+                )
 
         now = _now_utc()
         cid = candidate_set_id_for(date, snap_hash)
@@ -245,12 +275,13 @@ class CandidateStore:
             "hotspot_snapshot": f"hotspots/{date}.json",
             "snapshot_sha256": snap_hash,
             "style_revision": style_revision,
+            "hotspot_ids": hotspot_ids,
             "items": items,
         }
 
         with _platform_lock(self.home):
             # 重入锁后再查一次（并发下仍幂等）
-            again = self._find_open_set(snap_hash, style_revision)
+            again = self._find_open_set(snap_hash, style_revision, hotspot_ids)
             if again is not None and not force:
                 return again, False
 
@@ -326,7 +357,7 @@ class CandidateStore:
         return result
 
     def _generate_items(self, snapshot: dict) -> list[dict]:
-        """规则生成桩：从快照 items 生成候选（非 AI）。"""
+        """规则生成桩：从快照 items 生成候选（非 AI），整批 top-10。"""
         raw_items = [it for it in (snapshot.get("items") or []) if isinstance(it, dict)]
         if not raw_items:
             return []
@@ -338,24 +369,86 @@ class CandidateStore:
             c = scoring.score_candidate(raw, idx)
             if c is not None:
                 candidates.append(c)
-        # 总分降序（设计第 3 节：P5 页面按总分降序展示）
+        return self._finalize_items(candidates)
+
+    def _generate_items_for_hotspots(self, snapshot: dict, hotspot_ids: list[str]) -> list[dict]:
+        """按指定热点生成候选：每条热点 1 条候选，不固定 10 条。
+
+        归一化口径不变：先对**整份快照**做三源归一化（同一来源的 rank/hot_normalized
+        与整批生成完全一致），再按 hotspot_ids 逐个取对应条目打分；顺序按传入顺序。
+        生成失败（无 title/source 或无热度）的条目直接跳过，保持与整批一致的不凑数。
+        """
+        raw_items = [it for it in (snapshot.get("items") or []) if isinstance(it, dict)]
+        by_id = {}
+        if raw_items:
+            # 先做整份快照归一化（保证口径一致），再按 id 建索引
+            normalized = scoring.normalize_hot_no_truncate(raw_items)
+            by_id = {str(it.get("item_id") or ""): it for it in normalized if it.get("item_id")}
+
+        candidates = []
+        for idx, hid in enumerate(hotspot_ids):
+            raw = by_id.get(hid)
+            if raw is None:
+                continue
+            c = scoring.score_candidate(raw, idx)
+            if c is not None:
+                candidates.append(c)
+        return self._finalize_items(candidates)
+
+    def _finalize_items(self, candidates: list[dict]) -> list[dict]:
+        """总分降序 + 重新编号 c01..cN（设计第 3 节：P5 按总分降序展示）。"""
         candidates.sort(key=lambda c: c["scores"]["total"], reverse=True)
-        # 重新编号：保持服务端生成格式 c01..c10
         for i, c in enumerate(candidates):
             c["id"] = f"c{i + 1:02d}"
         return candidates
 
-    def _find_open_set(self, snap_hash: str, style_revision: str) -> dict | None:
+    def _normalize_hotspot_ids(self, hotspot_ids: list[str] | None) -> list[str]:
+        """归一化并校验 hotspot_ids：去重保持顺序、每条必须为非空字符串。"""
+        if hotspot_ids is None:
+            return []
+        if not isinstance(hotspot_ids, list):
+            raise errors.validation_error("hotspot_ids 必须为数组", {"field": "hotspot_ids"})
+        if len(hotspot_ids) > HOTSPOT_IDS_MAX:
+            raise errors.validation_error(
+                f"hotspot_ids 一次最多 {HOTSPOT_IDS_MAX} 条",
+                {"field": "hotspot_ids", "max": HOTSPOT_IDS_MAX},
+            )
+        result = []
+        seen = set()
+        for hid in hotspot_ids:
+            if not isinstance(hid, str) or not hid.strip():
+                raise errors.validation_error("hotspot_ids 元素必须为非空字符串", {"field": "hotspot_ids"})
+            hid = hid.strip()
+            if hid not in seen:
+                seen.add(hid)
+                result.append(hid)
+        return result
+
+    def _missing_hotspot_ids(self, snapshot: dict, hotspot_ids: list[str]) -> list[str]:
+        """返回快照里找不到的 hotspot_ids（保持传入顺序）。"""
+        items = [it for it in (snapshot.get("items") or []) if isinstance(it, dict)]
+        present = {str(it.get("item_id") or "") for it in items if it.get("item_id")}
+        return [hid for hid in hotspot_ids if hid not in present]
+
+    def _find_open_set(self, snap_hash: str, style_revision: str, hotspot_ids: list[str] | None = None) -> dict | None:
+        """按 snapshot_sha256 + style_revision + hotspot_ids 找既有 open 集（幂等）。
+
+        ``hotspot_ids`` 为 None 时表示「整批生成」语义：仅匹配同样没有 hotspot_ids
+        字段（或字段为空）的既有集，避免把按热点生成的子集误判为整批幂等命中。
+        """
+        want = hotspot_ids or []
         for fname in paths.safe_list_subdir_filenames(self.home, "candidates"):
             if not fname.endswith(".json"):
                 continue
             data = self.load(fname[:-5])
             if data is None:
                 continue
+            have = list(data.get("hotspot_ids") or [])
             if (
                 data.get("set_status") == "open"
                 and data.get("snapshot_sha256") == snap_hash
                 and data.get("style_revision") == style_revision
+                and have == want
             ):
                 return data
         return None

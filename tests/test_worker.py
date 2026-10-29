@@ -9,6 +9,7 @@ import os
 import yaml
 
 from app.storage import jobs as jobs_store
+from app.storage import paths
 from app.worker.executor import Worker, WriterBackend, _writer_env
 
 
@@ -712,3 +713,69 @@ def test_regenerate_endpoint_returns_new_job_id(tmp_path, monkeypatch):
     assert body["run_id"] == new_run_id
     assert body["job_id"] != "j-test000001"
     assert body["regenerated_from"] == "j-test000001"
+
+
+# ---------- JEE-1967：重新生成继承 topic 细节（keywords/source/framework_hint） ----------
+
+def _set_succeeded_with_warning_and_topic(home, run_id, topic, warning=None):
+    """把 job 置 succeeded，写入 length_warning，并给旧 run 指定 topic 细节。"""
+    store = jobs_store.JobStore(home)
+    job = store.load("j-test000001")
+    job["status"] = "succeeded"
+    store.write(job)
+    state = base_state(run_id)
+    state["status"] = "completed"
+    state["mode"] = "complete"
+    state["visual"] = {"mode": "none", "max_images": 0, "max_cost": None}
+    state["topic"] = topic
+    if warning is not None:
+        state["length_warning"] = warning
+    write_state(home, run_id, state)
+
+
+def test_job_regenerate_backfills_topic_details(tmp_path, monkeypatch):
+    """JEE-1967 第 5 条：旧 run 的 keywords/source/framework_hint 补写进新 run，
+    且 _build_brief_text 不再是空/默认值；旧 run 三项逐字节不变。"""
+    from app.worker.executor import _build_brief_text
+
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    new_run_id = "20261026-120001-fedcba"
+    make_queued_job(home, run_id)
+    # framework_hint 用与默认值「问题-证据-行动」不同的值，行为级断言才可能失败。
+    old_topic = {
+        "title": "旧选题标题",
+        "keywords": ["a", "b"],
+        "source": "热榜",
+        "framework_hint": "背景-冲突-方案",
+    }
+    _set_succeeded_with_warning_and_topic(
+        home, run_id, old_topic,
+        {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000},
+    )
+
+    _install_fake_wewrite_runs(monkeypatch, home, new_run_id)
+    store = jobs_store.JobStore(home)
+    new_job = store.regenerate("j-test000001")
+
+    # 新 run 绑定新 run_id，其 state 中三项与旧 run 一致
+    new_state = paths.read_state_yaml(home, new_job["run_id"])
+    new_topic = new_state["topic"]
+    assert new_topic["keywords"] == ["a", "b"]
+    assert new_topic["source"] == "热榜"
+    assert new_topic["framework_hint"] == "背景-冲突-方案"
+    # title 以新 run 已有值为准（假上游 create_run 继承的 title 是旧标题）
+    assert new_topic["title"] == "旧选题标题"
+
+    # 行为级断言：brief 的 关键词/切入点/框架 不再是空/默认值
+    brief = _build_brief_text(new_state, {"version": 1})
+    assert "关键词：a, b" in brief
+    assert "切入点：热榜" in brief
+    assert "框架：背景-冲突-方案" in brief
+
+    # 旧 run 三项逐字节不变
+    old_state = paths.read_state_yaml(home, run_id)
+    assert old_state["topic"]["keywords"] == ["a", "b"]
+    assert old_state["topic"]["source"] == "热榜"
+    assert old_state["topic"]["framework_hint"] == "背景-冲突-方案"
+    assert old_state["topic"]["title"] == "旧选题标题"

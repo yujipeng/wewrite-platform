@@ -14,6 +14,8 @@ import json
 import secrets
 from datetime import datetime, timezone
 
+import yaml
+
 from app.domain import errors
 from app.storage import paths
 
@@ -274,11 +276,44 @@ class JobStore:
             if not new_run_id:
                 raise errors.upstream_error("上游返回缺少 run_id", {"reason": "missing_run_id"})
 
+            # JEE-1967：上游 create_run 只接收 title 字符串，硬编码把 topic 其余字段
+            # 置空（wewrite/runs.py::create_run），导致重新生成的 brief 丢失 keywords /
+            # source / framework_hint。平台侧在新建 run 成功后、写 job 前，把旧 run 的
+            # 这三个 topic 子字段补写回新 run 的 state.yaml（title 以新 run 为准）。
+            self._backfill_topic_details(old_state, new_run_id)
+
             new_id = new_job_id()
             new_job = build_job(new_id, new_run_id, attempt=1)
             new_job["regenerated_from"] = job_id
             self.write(new_job)
             return new_job
+
+    def _backfill_topic_details(self, old_state: dict, new_run_id: str) -> None:
+        """把旧 run 的 topic 细节补写进新 run 的 state（JEE-1967）。
+
+        只覆盖 ``keywords`` / ``source`` / ``framework_hint`` 三个子字段，
+        ``title`` 以新 run 已有值为准（上游 create_run 已正确继承标题），其余
+        字段一律不动。读取走 ``paths.read_state_yaml``，写回走
+        ``paths.safe_write_run_state``；调用方已持有 ``PlatformLock``，此处不加锁。
+        """
+        old_topic = old_state.get("topic") if isinstance(old_state, dict) else None
+        if not isinstance(old_topic, dict):
+            return
+        new_state = paths.read_state_yaml(self.home, new_run_id)
+        if not isinstance(new_state, dict):
+            return
+        new_topic = new_state.setdefault("topic", {})
+        if not isinstance(new_topic, dict):
+            new_topic = {}
+            new_state["topic"] = new_topic
+        for field in ("keywords", "source", "framework_hint"):
+            if field in old_topic:
+                new_topic[field] = old_topic[field]
+        paths.safe_write_run_state(
+            self.home,
+            new_run_id,
+            yaml.safe_dump(new_state, allow_unicode=True, sort_keys=False),
+        )
 
     def retry_images(self, job_id: str, indices: list[int]) -> dict:
         """失败图人工重试：每个失败索引最多一次，不重试成功图，超限 CONFLICT。"""

@@ -32,7 +32,10 @@ def _find_chromium() -> str | None:
     env = os.environ.get("WEWRITE_PLAYWRIGHT_EXECUTABLE")
     if env and os.path.exists(env):
         return env
-    # 常见路径（含本机 chrome-cft 的捆绑库浏览器）
+    # 常见路径（含本机 chrome-cft 的捆绑库浏览器）。裸 chrome 二进制缺 libatk 等
+    # 系统库会在 launch 时抛 TargetClosedError，由 fixture 兜底整组 skip；需要真跑
+    # 浏览器时用 WEWRITE_PLAYWRIGHT_EXECUTABLE 指向带 LD_LIBRARY_PATH 的 wrapper
+    # （如 ~/.local/bin/google-chrome）。
     candidates = [
         os.path.expanduser("~/.local/chrome-cft/chrome-linux64/chrome"),
         os.path.expanduser("~/.local/bin/google-chrome"),
@@ -152,7 +155,7 @@ def browser_session(tmp_path_factory):
             except Exception as exc:
                 pytest.skip(f"Chromium 启动失败（缺系统库或不可用）：{type(exc).__name__}")
             try:
-                yield {"ctx": ctx, "base": f"http://127.0.0.1:{port}"}
+                yield {"ctx": ctx, "base": f"http://127.0.0.1:{port}", "home": home}
             finally:
                 ctx.close()
     finally:
@@ -477,3 +480,123 @@ def test_p8_style_validate_error_shows_line(browser_session):
     body_text = page.inner_text("#app")
     assert "校验失败" in body_text or "YAML" in body_text or "语法" in body_text
     assert page_errors == [], f"配置页抛 JS 异常：{page_errors}"
+
+
+def _write_hotspot_snapshot(home: str, date: str, items: list) -> None:
+    """直接写热榜快照 fixture（含 item_id，供 P4 真浏览器用例使用）。"""
+    import json
+
+    from app.adapters import hotspots as hotspots_adapter
+
+    d = os.path.join(home, "hotspots")
+    os.makedirs(d, exist_ok=True)
+    for it in items:
+        it["item_id"] = hotspots_adapter.hotspot_item_id(it)
+    snap = {
+        "version": 1,
+        "date": date,
+        "captured_at_utc": "2026-10-26T01:00:00+00:00",
+        "captured_at_local": "2026-10-26T09:00:00+08:00",
+        "sources": ["weibo", "toutiao", "baidu"],
+        "sources_failed": [],
+        "last_success_at": "2026-10-26T01:00:00+00:00",
+        "count": len(items),
+        "error": None,
+        "items": items,
+        "stale_sources": [],
+    }
+    with open(os.path.join(d, f"{date}.json"), "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False)
+
+
+def _p4_items(n=6):
+    """造 n 条三源热点，带稳定 url。"""
+    items = []
+    for i in range(n):
+        source = ["微博", "今日头条", "百度"][i % 3]
+        source_id = {"微博": "weibo", "今日头条": "toutiao", "百度": "baidu"}[source]
+        items.append({
+            "title": f"热点标题第{i + 1}条",
+            "source": source,
+            "source_id": source_id,
+            "hot": (n - i) * 100 + 10,
+            "url": f"https://example.invalid/{i}",
+            "description": f"切入角度{i + 1}",
+        })
+    return items
+
+
+def test_p4_hotspot_selection_generate_and_unique_confirm(browser_session):
+    """JEE-1962 真浏览器验证：P4 勾选 2 条 →「生成候选（已选 2 条）」可用、
+    「确认选题」禁用；只勾 1 条 →「确认选题」可用。"""
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    gen_btn = page.locator("button", has_text="生成候选（已选")
+    confirm_btn = page.locator("button", has_text="确认选题（唯一）")
+    assert gen_btn.count() == 1, "应有「生成候选（已选 N 条）」按钮"
+    assert confirm_btn.count() == 1, "应有「确认选题（唯一）」按钮"
+
+    # 初始：0 条选中 → 生成禁用、确认禁用
+    assert gen_btn.is_disabled(), "0 条选中时生成候选应禁用"
+    assert confirm_btn.is_disabled(), "0 条选中时确认选题应禁用"
+
+    # 勾选 2 条 → 生成可用、确认禁用并提示只能选一条
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    assert checkboxes.count() == 6, f"应有 6 个勾选框，实际 {checkboxes.count()}"
+    checkboxes.nth(0).check()
+    checkboxes.nth(1).check()
+    page.wait_for_timeout(200)
+    assert not gen_btn.is_disabled(), "勾选 2 条时生成候选应可用"
+    assert "生成候选（已选 2 条）" in gen_btn.inner_text()
+    assert confirm_btn.is_disabled(), "勾选 2 条时确认选题应禁用"
+    assert "选题只能选一条" in page.inner_text("#app")
+
+    # 取消一条 → 只勾 1 条 → 确认选题可用
+    checkboxes.nth(1).uncheck()
+    page.wait_for_timeout(200)
+    assert confirm_btn.is_enabled(), "只勾 1 条时确认选题应可用"
+    assert page_errors == [], f"P4 勾选交互抛 JS 异常：{page_errors}"
+
+
+def test_p4_hotspot_generate_selected_writes_candidate_set(browser_session):
+    """JEE-1962 真浏览器验证：勾选 2 条点「生成候选」→ 按 hotspot_ids 生成候选集并跳转 P5。"""
+    import json
+    import urllib.request
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    _write_hotspot_snapshot(home, "2026-10-26", _p4_items(6))
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    checkboxes.nth(1).check()
+    page.wait_for_timeout(200)
+
+    # 点「生成候选（已选 2 条）」→ 跳转到 P5
+    page.locator("button", has_text="生成候选（已选").click()
+    page.wait_for_timeout(900)
+
+    assert "#/candidates" in page.url, f"应跳转到 P5，实际 {page.url}"
+    # 候选集已落盘：items 数量 == 2
+    data = json.loads(urllib.request.urlopen(f"{base}/api/v1/candidates", timeout=5).read().decode("utf-8"))
+    sets = data.get("candidates") or []
+    assert len(sets) >= 1, "应生成至少一个候选集"
+    latest = sets[0]
+    assert len(latest["items"]) == 2, f"按 2 条热点生成应为 2 条候选，实际 {len(latest['items'])}"
+    assert page_errors == [], f"P4 生成候选交互抛 JS 异常：{page_errors}"

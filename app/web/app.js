@@ -204,6 +204,12 @@ const IMAGE_ERROR_TEXT = {
   IMAGE_TIMEOUT: "图片生成超时",
 };
 let _jobPollTimer = null;
+// P4 热榜勾选状态（跨 renderHotspots 重建时保留用户选择）
+let _hotspotSelections = new Set();
+let _hotspotExistingCandidates = new Set();
+let _hotspotCurrentDate = "";
+let _hotspotCurrentItems = [];
+let _hotspotLastBody = null;
 
 function stopJobPolling() {
   if (_jobPollTimer) {
@@ -1014,8 +1020,36 @@ async function renderHotspots() {
   dateRow.appendChild(genCandidatesLink);
   app.appendChild(dateRow);
 
+  // P4 勾选操作区：全选/反选、生成候选（已选 N 条）、确认选题（唯一）、清空
+  const selRow = el("div", { class: "preview-controls" });
+  const selectAllBtn = el("button", { class: "btn", text: "全选/反选" });
+  const genSelBtn = el("button", { class: "btn primary", text: "生成候选（已选 0 条）" });
+  const confirmSelBtn = el("button", { class: "btn", text: "确认选题（唯一）" });
+  const clearSelBtn = el("button", { class: "btn", text: "清空选择" });
+  const selHint = el("span", { class: "muted", text: "勾选热点后生成候选；确认选题仅能选一条" });
+  selRow.appendChild(selectAllBtn);
+  selRow.appendChild(genSelBtn);
+  selRow.appendChild(confirmSelBtn);
+  selRow.appendChild(clearSelBtn);
+  selRow.appendChild(selHint);
+  app.appendChild(selRow);
+
   const container = el("div");
   app.appendChild(container);
+
+  const currentDate = () => _hotspotCurrentDate || dateSelect.value || "";
+
+  const refreshSelectionUI = () => {
+    const n = _hotspotSelections.size;
+    genSelBtn.textContent = "生成候选（已选 " + n + " 条）";
+    genSelBtn.disabled = n === 0;
+    // 确认选题：仅恰好选中 1 条时可用；选中 0 或 ≥2 禁用并提示
+    confirmSelBtn.disabled = n !== 1;
+    selHint.textContent = n === 1
+      ? "选题只能选一条"
+      : (n >= 2 ? "选题只能选一条，请只勾选一条后确认" : "勾选热点后生成候选；确认选题仅能选一条");
+    selHint.classList.toggle("error-block", n >= 2);
+  };
 
   const loadDates = async () => {
     try {
@@ -1051,6 +1085,9 @@ async function renderHotspots() {
   const drawList = (body) => {
     container.innerHTML = "";
     const items = body.items || [];
+    if (body.date) _hotspotCurrentDate = body.date;
+    _hotspotCurrentItems = items;
+    _hotspotLastBody = body;
     const meta = el("div", { class: "muted", text: "共 " + (body.count || 0) + " 条　来源：" + (body.sources || []).map((s) => SOURCE_TEXT[s] || s).join("、") + (body.sources_failed && body.sources_failed.length ? "　失败源：" + body.sources_failed.map((s) => SOURCE_TEXT[s] || s).join("、") : "") + (body.last_success_at ? "　上次成功：" + body.last_success_at : "") });
     container.appendChild(meta);
     if (items.length === 0) {
@@ -1059,18 +1096,45 @@ async function renderHotspots() {
     }
     const list = el("ul", { class: "run-list" });
     for (const it of items) {
+      const hid = it.item_id || "";
+      const cb = el("input", { type: "checkbox", title: "勾选该热点" });
+      cb.checked = _hotspotSelections.has(hid);
+      cb.addEventListener("change", () => {
+        if (cb.checked) _hotspotSelections.add(hid);
+        else _hotspotSelections.delete(hid);
+        refreshSelectionUI();
+      });
       const row = el("li", { class: "run-item" }, [
         el("div", { class: "run-main" }, [
           el("div", { class: "run-title", text: (it.title || "") }),
           el("div", { class: "run-meta", text: (it.source_label || it.source || "") + " · 热度 " + (it.hot ?? "—") + (it.hot_normalized != null ? " · 归一化 " + it.hot_normalized : "") }),
         ]),
       ]);
+      // 已生成过候选的条目标「已有候选」徽标
+      if (it.url && _hotspotExistingCandidates.has(it.url)) {
+        row.appendChild(el("span", { class: "badge badge-completed", text: "已有候选" }));
+      }
+      row.appendChild(el("label", { class: "muted", style: "display:inline-flex;align-items:center;gap:4px" }, [cb, " 选"]));
       if (it.url) {
         row.appendChild(el("a", { class: "btn", href: it.url, target: "_blank", rel: "noopener", text: "原文" }));
       }
       list.appendChild(row);
     }
     container.appendChild(list);
+    refreshSelectionUI();
+  };
+
+  const loadExistingCandidates = async () => {
+    _hotspotExistingCandidates.clear();
+    try {
+      const body = await api("/api/v1/candidates");
+      const sets = body.candidates || [];
+      for (const s of sets) {
+        for (const it of (s.items || [])) {
+          if (it.source_url) _hotspotExistingCandidates.add(it.source_url);
+        }
+      }
+    } catch (_) { /* 读取失败不阻断热榜展示 */ }
   };
 
   const loadSaved = async () => {
@@ -1140,10 +1204,116 @@ async function renderHotspots() {
     }
   };
 
+  const doGenerateSelected = async () => {
+    if (_hotspotSelections.size === 0) {
+      window.alert("请先勾选热点");
+      return;
+    }
+    const date = currentDate();
+    if (!date) {
+      window.alert("当前没有可用的热榜快照日期，请先补抓并保存今日快照");
+      return;
+    }
+    const ids = Array.from(_hotspotSelections);
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在生成候选（已选 " + ids.length + " 条）…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/candidates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ date, style_revision: "sha256:web-default", hotspot_ids: ids }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText; let details = null;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
+      }
+      // 成功：跳到 P5（候选对比 + 确认流程）
+      location.hash = "#/candidates";
+    } catch (err) {
+      container.innerHTML = "";
+      // 失败提示（含热点已不在快照内的明确中文提示），不清空用户选择
+      if (err.code === "VALIDATION_ERROR" && err.details && err.details.reason === "hotspot_ids_not_found") {
+        const missing = (err.details.missing || []).length;
+        container.appendChild(errorState("所选热点中有 " + missing + " 条已不在当日快照内，请刷新快照后重选", () => loadSaved()));
+      } else {
+        container.appendChild(errorState("生成候选失败：" + (err.code || err.message), () => doGenerateSelected()));
+      }
+      refreshSelectionUI();
+    }
+  };
+
+  const doConfirmSelected = async () => {
+    if (_hotspotSelections.size !== 1) {
+      window.alert("选题只能选一条");
+      return;
+    }
+    const date = currentDate();
+    if (!date) {
+      window.alert("当前没有可用的热榜快照日期，请先补抓并保存今日快照");
+      return;
+    }
+    const hid = Array.from(_hotspotSelections)[0];
+    // 精确判定：当前选中的热点是否已有候选（按 url 匹配）
+    const item = (_hotspotCurrentItems || []).find((it) => (it.item_id || "") === hid);
+    const existing = item && item.url && _hotspotExistingCandidates.has(item.url);
+    if (existing) {
+      // 直接进入 P5 的确认流程（P5 的确认弹层含图片上限/预算/allow_publish 展示）
+      location.hash = "#/candidates";
+      return;
+    }
+    container.innerHTML = "";
+    container.appendChild(loadingState("正在生成该热点候选并进入选题确认…"));
+    try {
+      const token = await csrfToken();
+      const res = await fetch("/api/v1/candidates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ date, style_revision: "sha256:web-default", hotspot_ids: [hid] }),
+      });
+      if (!res.ok) {
+        let code = "HTTP_" + res.status; let message = res.statusText; let details = null;
+        try { const d = await res.json(); code = d.code || code; message = d.message || message; details = d.details || null; } catch (_) {}
+        const err = new Error(message); err.code = code; err.status = res.status; err.details = details; throw err;
+      }
+      location.hash = "#/candidates";
+    } catch (err) {
+      container.innerHTML = "";
+      if (err.code === "VALIDATION_ERROR" && err.details && err.details.reason === "hotspot_ids_not_found") {
+        container.appendChild(errorState("该热点已不在当日快照内，请刷新快照后重选", () => loadSaved()));
+      } else {
+        container.appendChild(errorState("生成候选失败：" + (err.code || err.message), () => doConfirmSelected()));
+      }
+      refreshSelectionUI();
+    }
+  };
+
+  selectAllBtn.addEventListener("click", () => {
+    const items = _hotspotCurrentItems || [];
+    const allSelected = items.length > 0 && items.every((it) => _hotspotSelections.has(it.item_id || ""));
+    if (allSelected) {
+      _hotspotSelections.clear();
+    } else {
+      for (const it of items) {
+        if (it.item_id) _hotspotSelections.add(it.item_id);
+      }
+    }
+    if (_hotspotLastBody) drawList(_hotspotLastBody);
+    else refreshSelectionUI();
+  });
+  clearSelBtn.addEventListener("click", () => {
+    _hotspotSelections.clear();
+    if (_hotspotLastBody) drawList(_hotspotLastBody);
+    else refreshSelectionUI();
+  });
+  genSelBtn.addEventListener("click", doGenerateSelected);
+  confirmSelBtn.addEventListener("click", doConfirmSelected);
   refreshBtn.addEventListener("click", doRefresh);
   persistBtn.addEventListener("click", doPersist);
 
   await loadDates();
+  await loadExistingCandidates();
   await loadSaved();
 }
 

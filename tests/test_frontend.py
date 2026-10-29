@@ -188,6 +188,22 @@ def test_p4_history_snapshots_present(client):
     assert "/api/v1/hotspots/" in js
 
 
+def test_p4_hotspot_selection_actions_present(client):
+    """JEE-1962：P4 热榜勾选 + 按指定热点生成候选 + 唯一选题确认入口。"""
+    js = _app_js(client)
+    # 勾选操作区：全选/反选、生成候选（已选 N 条）、确认选题（唯一）、清空
+    for label in ("全选/反选", "生成候选（已选", "确认选题（唯一）", "清空选择"):
+        assert label in js
+    # 按指定热点生成：调用 /api/v1/candidates 并携带 hotspot_ids
+    assert "hotspot_ids" in js
+    # 确认选题唯一语义：仅恰好选中 1 条可用，0 或 ≥2 禁用并提示
+    assert "选题只能选一条" in js
+    # 失败中文提示：热点已被新快照替换
+    assert "已不在当日快照内" in js
+    # 已生成过候选的条目标「已有候选」徽标
+    assert "已有候选" in js
+
+
 def test_p1_new_task_entry_present(client):
     """P1「新建任务」入口跳转每日热榜。"""
     js = _app_js(client)

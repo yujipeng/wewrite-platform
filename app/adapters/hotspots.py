@@ -106,8 +106,28 @@ class HotspotFetcher:
         return data
 
 
+def hotspot_item_id(item: dict) -> str:
+    """计算热点稳定标识（issue 3.1.3）：``{source_id}:{sha256(标题|url|hot)前16位}``。
+
+    同一来源的同一热点（标题优先，标题缺失退化为 url，再退化为 hot）稳定映射到同一 id；
+    写入快照时固化为 ``item_id``，读旧快照时按同样规则回退现算，避免老数据不可用。
+    """
+    source_id = str(item.get("source_id") or item.get("source") or "unknown")
+    stable = str(item.get("title") or item.get("url") or item.get("hot") or "")
+    digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    return f"{source_id}:{digest}"
+
+
+def ensure_item_ids(items: list) -> list:
+    """给每条 item 补齐 ``item_id``（写入路径与旧快照回退计算共用同一规则）。"""
+    for item in items:
+        if isinstance(item, dict) and not item.get("item_id"):
+            item["item_id"] = hotspot_item_id(item)
+    return items
+
+
 def normalize_items(items: list) -> list:
-    """给每条 item 补齐英文 source_id 并保留中文 source_label。
+    """给每条 item 补齐英文 source_id、中文 source_label 与稳定 item_id。
 
     上游 items[].source 是中文展示名（微博/百度/今日头条）；用映射表补英文 ID。
     未知中文名无法映射时按未知源处理，不伪造 ID。
@@ -121,6 +141,7 @@ def normalize_items(items: list) -> list:
         out = dict(item)
         out["source_label"] = label
         out["source_id"] = source_id
+        out["item_id"] = out.get("item_id") or hotspot_item_id(out)
         result.append(out)
     return result
 
@@ -248,9 +269,13 @@ class HotspotStore:
             raise
         with os.fdopen(fd, "r", encoding="utf-8") as f:
             try:
-                return json.load(f)
+                snap = json.load(f)
             except json.JSONDecodeError:
                 raise errors.not_found()
+        # 旧快照无 item_id：读时按同规则回退现算（issue 3.1.3），不改写磁盘。
+        if isinstance(snap, dict):
+            ensure_item_ids(snap.get("items") or [])
+        return snap
 
     def list_dates(self) -> list[str]:
         """列出快照日期（仅最近 30 天，升序）。"""

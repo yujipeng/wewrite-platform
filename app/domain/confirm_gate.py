@@ -114,6 +114,11 @@ class ConfirmGate:
             self._mark_item_retracted(data, item["id"])
             self._mark_run_retracted(job.get("run_id"))
             self._job_store.transition_to_cancelled(job)
+            # 唯一选题（issue 3.2）：撤回后若集合内已无其它 confirmed 候选，
+            # 集合从 confirmed 重新开放为 open，允许确认另一条。
+            if not self._find_confirmed_other(data, item["id"]):
+                data["set_status"] = "open"
+                self._write_set(data)
             return {
                 "candidate_set_id": candidate_set_id,
                 "candidate_id": candidate_id,
@@ -148,6 +153,20 @@ class ConfirmGate:
             if item.get("status") == "confirmed":
                 raise errors.conflict(
                     "候选已确认", {"reason": "already_confirmed", "candidate_id": settings["candidate_id"]}
+                )
+
+            # 唯一选题（issue 3.2）：同一候选集内已有其它候选处于 confirmed 且 run 仍有效，
+            # 再次确认另一条 → 409 CANDIDATE_NOT_ACTIONABLE reason=set_already_confirmed，
+            # 并带上已确认的 candidate_id 与 run_id。若已确认那条已 retract，则允许确认另一条。
+            confirmed_other = self._find_confirmed_other(data, settings["candidate_id"])
+            if confirmed_other is not None:
+                raise errors.candidate_not_actionable(
+                    "set_already_confirmed",
+                    details={
+                        "reason": "set_already_confirmed",
+                        "confirmed_candidate_id": confirmed_other.get("id"),
+                        "confirmed_run_id": confirmed_other.get("run_id"),
+                    },
                 )
 
             reason = self._actionable_reason(data, item)
@@ -219,6 +238,19 @@ class ConfirmGate:
             if it.get("id") == candidate_id:
                 return it
         raise errors.candidate_not_actionable("not_proposed")
+
+    def _find_confirmed_other(self, data: dict, candidate_id: str) -> dict | None:
+        """返回集合内除 ``candidate_id`` 外仍处 confirmed 且 run 有效的候选。
+
+        「唯一选题」判定：已确认的候选若已 retract（status=retracted）则不在此列，
+        因此撤回后 set_already_confirmed 不再成立，允许确认另一条。
+        """
+        for it in data.get("items") or []:
+            if it.get("id") == candidate_id:
+                continue
+            if it.get("status") == "confirmed" and it.get("run_id"):
+                return it
+        return None
 
     def _actionable_reason(self, data: dict, item: dict | None) -> str | None:
         if item is None:

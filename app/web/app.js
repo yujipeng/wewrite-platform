@@ -1567,6 +1567,15 @@ async function renderConfig() {
   writerSection.appendChild(writerRow);
   container.appendChild(writerSection);
 
+  // 定位并高亮「写作模型」区块（智能生成失败 / 未配置时引导用户去填）。
+  function highlightWriterSection() {
+    if (writerSection.scrollIntoView) {
+      writerSection.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    writerSection.classList.add("config-highlight");
+    window.setTimeout(() => writerSection.classList.remove("config-highlight"), 2600);
+  }
+
   // 主题
   container.appendChild(el("div", { class: "section-title", text: "排版主题" }));
   const themeSelect = el("select");
@@ -1838,6 +1847,10 @@ async function renderConfig() {
     } catch (err) {
       aiResult.textContent = "生成失败：" + (err.code || err.message);
       aiResult.classList.add("error-block");
+      // 未配置时定位并高亮「写作模型」区块，让用户知道去哪填。
+      if (err.code === "WRITER_NOT_CONFIGURED") {
+        highlightWriterSection();
+      }
     } finally {
       aiGoBtn.disabled = !writerConfigured;
     }

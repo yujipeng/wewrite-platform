@@ -43,6 +43,61 @@ ENV_FIELD_MAP: dict[str, tuple[str, ...]] = {
     "WEWRITE_WRITER_MAX_TOKENS": ("writer", "max_tokens"),
 }
 
+# writer 运行时字段 → 环境变量名。与 ENV_FIELD_MAP 的 writer.* 段、worker
+# `_writer_env()` 的 `_WRITER_ENV_FIELDS` 保持同一套口径（env 优先，其次 config.yaml）。
+WRITER_ENV_OF: dict[str, str] = {
+    "api_key": "WEWRITE_WRITER_API_KEY",
+    "provider": "WEWRITE_WRITER_PROVIDER",
+    "base_url": "WEWRITE_WRITER_BASE_URL",
+    "model": "WEWRITE_WRITER_MODEL",
+    "temperature": "WEWRITE_WRITER_TEMPERATURE",
+    "max_tokens": "WEWRITE_WRITER_MAX_TOKENS",
+}
+
+# writer 运行时字段默认值（env 与 config.yaml 都没有时才生效的上游默认）。
+WRITER_DEFAULTS: dict = {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com",
+    "temperature": 1.0,
+    "max_tokens": 4000,
+    "api_key": "",
+}
+
+
+def writer_effective_values(config: dict) -> dict:
+    """合并「env 优先 → config.yaml 兜底 → 默认值」，返回 writer 生效配置。
+
+    - api_key：env 存在即以其为准（空串 = 未配置，不回落到文件）；env 不存在取文件值。
+    - 其余标量字段：env 存在即以其为准（空串 = 未设置，交上游默认）；env 不存在取
+      config.yaml 值，仍为空才回落默认值。
+    返回的 api_key 仅供内部使用，绝不回显。
+    """
+    writer = config.get("writer") or {}
+    merged: dict = {}
+    for key, env_var in WRITER_ENV_OF.items():
+        if env_var in os.environ:
+            merged[key] = os.environ[env_var]
+            continue
+        value = writer.get(key)
+        if key == "api_key":
+            merged[key] = value if isinstance(value, str) else ""
+        elif value is None or value == "":
+            merged[key] = WRITER_DEFAULTS[key]
+        else:
+            merged[key] = value
+    return merged
+
+
+def writer_configured_value(config: dict) -> bool:
+    """写作模型是否已配置：env WEWRITE_WRITER_API_KEY 非空，或 config.yaml 的 writer.api_key 非空。"""
+    env_value = os.environ.get(WRITER_ENV_OF["api_key"])
+    if env_value is not None:
+        return bool(env_value.strip())
+    writer = config.get("writer") or {}
+    return bool((writer.get("api_key") or "").strip())
+
+
 # PUT /config 可写的白名单字段（叶字段键），secret/api_key 只写不读。
 WRITABLE_CONFIG_FIELDS = frozenset(
     {
@@ -213,37 +268,14 @@ class ConfigStore:
         env_managed = env_managed_map()
         image = cfg.get("image") or {}
         wechat = cfg.get("wechat") or {}
-        writer = cfg.get("writer") or {}
 
         def _field_value(dotted: str):
             return _get_in(cfg, dotted)
 
-        def _writer_key_configured() -> bool:
-            # 与 worker `_writer_env()` 对齐：env 存在即接管，不看是否非空。
-            # 空串 env 时子进程实际收到空密钥 → 未配置，不得回落到文件值。
-            env_value = os.environ.get("WEWRITE_WRITER_API_KEY")
-            if env_value is not None:
-                return env_value != ""
-            return secret_configured(writer.get("api_key") or None)
-
-        # writer 各字段的投影口径与 worker `_writer_env()` 一致：env 存在即以其为准
-        # （空串表示未设置），否则回落到 config.yaml（再回落默认值）。
-        _writer_env_of = {
-            "provider": "WEWRITE_WRITER_PROVIDER",
-            "model": "WEWRITE_WRITER_MODEL",
-            "base_url": "WEWRITE_WRITER_BASE_URL",
-            "temperature": "WEWRITE_WRITER_TEMPERATURE",
-            "max_tokens": "WEWRITE_WRITER_MAX_TOKENS",
-        }
-
-        def _writer_effective(key, default):
-            env_var = _writer_env_of[key]
-            if env_var in os.environ:
-                return os.environ[env_var]
-            val = writer.get(key)
-            if val is None or val == "":
-                return default
-            return val
+        # writer 投影复用 writer_effective_values / writer_configured_value 的同一口径
+        # （env 优先，其次 config.yaml，再回落默认值），保证前端提示与 writer 适配器、
+        # worker `_writer_env()` 三者一致。
+        writer_effective = writer_effective_values(cfg)
 
         return {
             "version": 1,
@@ -263,14 +295,14 @@ class ConfigStore:
                 "author": wechat.get("author", "编辑"),
             },
             "writer": {
-                "provider": _writer_effective("provider", "deepseek"),
-                "model": _writer_effective("model", "deepseek-chat"),
-                "base_url": _writer_effective("base_url", "https://api.deepseek.com"),
-                "temperature": _writer_effective("temperature", 1.0),
-                "max_tokens": _writer_effective("max_tokens", 4000),
-                "api_key_configured": _writer_key_configured(),
+                "provider": writer_effective["provider"],
+                "model": writer_effective["model"],
+                "base_url": writer_effective["base_url"],
+                "temperature": writer_effective["temperature"],
+                "max_tokens": writer_effective["max_tokens"],
+                "api_key_configured": writer_configured_value(cfg),
                 # JEE-1947 前端用：写作模型是否可用（AI 生成入口禁用判断）
-                "writer_configured": _writer_key_configured(),
+                "writer_configured": writer_configured_value(cfg),
             },
             "permissions": {"publish": bool((cfg.get("permissions") or {}).get("publish", False))},
             "env_managed": [

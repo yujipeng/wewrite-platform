@@ -1,8 +1,10 @@
 """写作模型适配器：为「智能生成风格」调用写作大模型。
 
-按 JEE-1947：复用 ``WEWRITE_WRITER_*`` 配置（与上游 ``llm-write`` 同一套环境变量，
-不新增配置面）。模型未配置（缺 ``WEWRITE_WRITER_API_KEY``）时返回
-``503 WRITER_NOT_CONFIGURED`` 并给中文提示，不得抛 500、不得返回空草稿；调用失败
+按 JEE-1947 / JEE-1955：复用 ``WEWRITE_WRITER_*`` 环境变量（env 优先，其次
+``config.yaml``，再回落上游默认值）。写作模型配置的生效口径与 worker
+``_writer_env()``、config_store 投影三者一致。模型未配置（env 的
+``WEWRITE_WRITER_API_KEY`` 与 ``config.yaml`` 的 ``writer.api_key`` 均为空）时返回
+``503 WRITER_NOT_CONFIGURED`` 并给中文可操作提示，不得抛 500、不得返回空草稿；调用失败
 返回 ``502 UPSTREAM_ERROR``。
 
 调用协议为 OpenAI 兼容的 ``/chat/completions``（DeepSeek / OpenAI 同构），与上游
@@ -15,14 +17,7 @@ from __future__ import annotations
 import os
 
 from app.domain import errors
-
-# 与 config_store.WRITER_ENV_VARS 一致的环境变量（写作模型配置唯一来源）
-_WRITER_API_KEY = "WEWRITE_WRITER_API_KEY"
-_WRITER_PROVIDER = "WEWRITE_WRITER_PROVIDER"
-_WRITER_BASE_URL = "WEWRITE_WRITER_BASE_URL"
-_WRITER_MODEL = "WEWRITE_WRITER_MODEL"
-_WRITER_TEMPERATURE = "WEWRITE_WRITER_TEMPERATURE"
-_WRITER_MAX_TOKENS = "WEWRITE_WRITER_MAX_TOKENS"
+from app.storage import config_store
 
 # 生成端点调用超时（秒），按 issue 建议 30s。
 _REQUEST_TIMEOUT = 30
@@ -39,29 +34,39 @@ _STYLE_SYSTEM_PROMPT = (
 )
 
 
+def _writer_effective_config() -> dict:
+    """读取最终生效的写作模型配置（env 优先 → config.yaml 兜底 → 默认值）。"""
+    home = os.environ.get("WEWRITE_HOME", "") or os.path.join(os.path.expanduser("~"), ".wewrite")
+    config = config_store.ConfigStore(home).load_config()
+    return config_store.writer_effective_values(config)
+
+
 def writer_configured() -> bool:
-    """写作模型是否已配置（以 WEWRITE_WRITER_API_KEY 是否存在为准）。"""
-    return bool(os.environ.get(_WRITER_API_KEY, "").strip())
+    """写作模型是否已配置：env 的 WEWRITE_WRITER_API_KEY 或 config.yaml 的 writer.api_key 非空。"""
+    home = os.environ.get("WEWRITE_HOME", "") or os.path.join(os.path.expanduser("~"), ".wewrite")
+    config = config_store.ConfigStore(home).load_config()
+    return config_store.writer_configured_value(config)
 
 
 def _writer_config() -> dict:
     """读取写作模型配置；未配置抛 503 WRITER_NOT_CONFIGURED。"""
-    key = os.environ.get(_WRITER_API_KEY, "").strip()
+    effective = _writer_effective_config()
+    key = effective.get("api_key", "").strip()
     if not key:
         raise errors.writer_not_configured()
     try:
-        temperature = float(os.environ.get(_WRITER_TEMPERATURE, "1.0"))
+        temperature = float(effective.get("temperature", 1.0))
     except (TypeError, ValueError):
         temperature = 1.0
     try:
-        max_tokens = int(os.environ.get(_WRITER_MAX_TOKENS, "4000"))
+        max_tokens = int(effective.get("max_tokens", 4000))
     except (TypeError, ValueError):
         max_tokens = 4000
     return {
-        "provider": os.environ.get(_WRITER_PROVIDER, "deepseek").strip() or "deepseek",
+        "provider": str(effective.get("provider") or "deepseek").strip() or "deepseek",
         "key": key,
-        "base_url": os.environ.get(_WRITER_BASE_URL, "https://api.deepseek.com").rstrip("/"),
-        "model": os.environ.get(_WRITER_MODEL, "deepseek-chat").strip() or "deepseek-chat",
+        "base_url": str(effective.get("base_url") or "https://api.deepseek.com").rstrip("/"),
+        "model": str(effective.get("model") or "deepseek-chat").strip() or "deepseek-chat",
         "temperature": temperature,
         "max_tokens": max_tokens,
     }

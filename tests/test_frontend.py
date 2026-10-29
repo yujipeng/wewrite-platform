@@ -92,6 +92,16 @@ def test_p8_style_ai_generate_entry(client):
     assert "writer_configured" in js
 
 
+def test_p8_style_generate_not_configured_guides_to_writer(client):
+    """JEE-1955：未配置时智能生成失败会定位并高亮「写作模型」区块。"""
+    js = _app_js(client)
+    # 生成失败分支捕获 WRITER_NOT_CONFIGURED 后滚动定位 + 高亮写作模型区块
+    assert "WRITER_NOT_CONFIGURED" in js
+    assert "highlightWriterSection" in js
+    assert "scrollIntoView" in js
+    assert "config-highlight" in js
+
+
 def test_p8_image_provider_select_and_link(client):
     """P8 图片供应商改为下拉：选项来自 image-providers 端点，含「自定义…」与联动。"""
     js = _app_js(client)

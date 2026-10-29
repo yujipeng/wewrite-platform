@@ -147,7 +147,12 @@ def _build_brief_text(state: dict, style: dict | None = None) -> str:
             parts.append(f"话题方向：{', '.join(str(t) for t in topics)}\n")
         word_count = style.get("word_count")
         if word_count not in (None, "", 0):
-            parts.append(f"目标字数：{word_count}\n")
+            # JEE-1963：把字数要求写硬（含「务必达到」「低于 N 字视为不合格」），
+            # 真正的保证靠生成后校验与自动续写，这里只是辅助提示。
+            from app.domain import word_count as word_count_domain
+
+            hint = word_count_domain.format_word_count_hint(word_count)
+            parts.append(hint if hint is not None else f"目标字数：{word_count}\n")
         blacklist = style.get("blacklist")
         if isinstance(blacklist, list) and blacklist:
             parts.append(f"禁忌词：{', '.join(str(b) for b in blacklist)}\n")
@@ -248,8 +253,7 @@ class Worker:
 
         # staging 临时文件（与 article.md 同目录语义：先写 run 目录内临时名）
         staging_rel = f".article-{job['job_id']}.staging.md"
-        staging_bytes = brief_text.encode("utf-8")
-        paths.safe_write_run_file(self.home, run_id, staging_rel, staging_bytes)
+        paths.safe_write_run_file(self.home, run_id, staging_rel, brief_text.encode("utf-8"))
 
         # llm-write 是文件到文件；这里把 brief 写到 run 目录下临时 brief
         brief_rel = f".brief-{job['job_id']}.md"
@@ -269,9 +273,20 @@ class Worker:
         if exit_code != 0:
             raise _worker_error("WRITER_FAILED", f"llm-write 非预期退出码 {exit_code}")
 
-        # 正文校验：非空且 >=200 字符
+        # 正文校验：非空且 >=200 字符（保持 strip 口径，200 字符门不变）
         if not staging_text or len(staging_text.strip()) < 200:
             raise _worker_error("WRITER_FAILED", "写作输出正文校验未通过")
+
+        # JEE-1963：解析目标字数，不足则自动续写一次；续写失败不毁稿。
+        length_warning = None
+        target = self._parse_word_target(style)
+        if target is not None:
+            actual = self._count_chars(staging_text)
+            if actual < target["min_chars"]:
+                staging_text, length_warning = self._extend_once(
+                    job, run_id, staging_text, target,
+                    self._word_goal(style),
+                )
 
         # 原子推广为 article.md
         paths.safe_write_run_file(self.home, run_id, "article.md", staging_text.encode("utf-8"))
@@ -279,10 +294,78 @@ class Worker:
         _unlink_run_file(self.home, run_id, staging_rel)
         _unlink_run_file(self.home, run_id, brief_rel)
 
-        # 更新 state.artifacts.article
+        # 更新 state.artifacts.article 与 length_warning
         state = _read_run_state(self.home, run_id)
         state.setdefault("artifacts", {})["article"] = f"runs/{run_id}/article.md"
+        if length_warning is not None:
+            state["length_warning"] = length_warning
+        else:
+            state.pop("length_warning", None)
         _write_run_state(self.home, run_id, state)
+
+    def _parse_word_target(self, style: dict) -> dict | None:
+        """解析 style.word_count 得到可判定区间；无法解析返回 None（不校验）。"""
+        from app.domain import word_count as word_count_domain
+
+        return word_count_domain.parse_word_count(style.get("word_count"))
+
+    def _word_goal(self, style: dict) -> int | None:
+        """返回目标字数原文下限（扩写指令瞄准用户真实目标，而非判定阈值）。"""
+        from app.domain import word_count as word_count_domain
+
+        return word_count_domain.target_lower_bound(style.get("word_count"))
+
+    def _count_chars(self, text: str) -> int:
+        """需求 §3.1 口径：去掉空白后的字符数（统一计数入口）。"""
+        from app.domain import word_count as word_count_domain
+
+        return word_count_domain.count_chars(text)
+
+    def _extend_once(self, job: dict, run_id: str, current_text: str, target: dict, goal: int | None):
+        """目标字数不足时自动续写一次。
+
+        复用现有 writer 后端与环境注入（``_invoke_writer``），不另建模型调用；
+        续写失败（非 0 退出码 / 超时 / 输出太短）保留原文并返回 ``length_warning``，
+        不把 job 判失败（原稿是有效产物）。
+        合并策略：以续写结果为准（扩写指令要求模型回全量扩写稿）。
+        返回 ``(final_text, length_warning_or_none)``。
+        """
+        aim = goal if goal is not None else target["min_chars"]
+        extension_brief = (
+            current_text
+            + f"\n\n请把以上文章扩写到约 {aim} 字，保持原有结构与风格，不要重复已有段落。\n"
+        )
+        brief_rel_ext = f".brief-{job['job_id']}.extend.md"
+        staging_rel_ext = f".article-{job['job_id']}.staging.extend.md"
+        paths.safe_write_run_file(self.home, run_id, brief_rel_ext, extension_brief.encode("utf-8"))
+
+        def _warning(text: str) -> dict:
+            return {
+                "actual": self._count_chars(text),
+                "target_min": target["min_chars"],
+                "target_max": target["max_chars"],
+                "target": goal if goal is not None else target["min_chars"],
+            }
+
+        try:
+            exit_code = self._invoke_writer(job, run_id, brief_rel_ext, staging_rel_ext)
+            ext = paths.safe_read_run_relative(self.home, run_id, staging_rel_ext)
+            ext_text = ext.decode("utf-8") if ext else ""
+        except Exception:
+            # 续写失败（超时等）不毁稿，保留原文并写警告。
+            return current_text, _warning(current_text)
+        finally:
+            _unlink_run_file(self.home, run_id, brief_rel_ext)
+            _unlink_run_file(self.home, run_id, staging_rel_ext)
+
+        # 续写失败或输出太短（<200，保持 strip 口径）时，以原文为准，不覆盖有效产物。
+        if exit_code != 0 or not ext_text or len(ext_text.strip()) < 200:
+            return current_text, _warning(current_text)
+
+        final_text = ext_text  # 以续写结果为准
+        if self._count_chars(final_text) < target["min_chars"]:
+            return final_text, _warning(final_text)
+        return final_text, None
 
     def _load_style(self) -> dict:
         """读取 style.yaml（供 brief 注入）；缺失返回空 dict，不阻断写作。"""

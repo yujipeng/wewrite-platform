@@ -48,6 +48,27 @@ class FakeWriter:
         return self.exit_code
 
 
+class SequenceWriter:
+    """按调用顺序返回不同结果，用于验证「自动续写一次」确实触发第二次调用。"""
+
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.calls = 0
+
+    def run(self, brief_path, output_path, env=None):
+        idx = self.calls
+        self.calls += 1
+        if idx >= len(self.contents):
+            return 4  # 超出预期次数按失败处理
+        item = self.contents[idx]
+        # item 为字符串 → 写文件返回 0；为 int → 按退出码返回
+        if isinstance(item, str):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(item)
+            return 0
+        return item
+
+
 class FakeReviewer:
     def review(self, run_id, article_text):
         return {"decision": "pass", "publishable": True, "note": "规则审稿桩"}
@@ -79,6 +100,13 @@ def write_config(home, writer: dict):
     os.makedirs(home, exist_ok=True)
     with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+
+def write_style(home, word_count):
+    """写 style.yaml 只含 word_count（模拟网页保存风格配置后的落盘结果）。"""
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "style.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({"version": 1, "word_count": word_count}, f, allow_unicode=True, sort_keys=False)
 
 
 def test_worker_consumes_queued_job_success(tmp_path):
@@ -361,3 +389,326 @@ def test_list_jobs_by_run_id(monkeypatch, tmp_path):
     r = c.get("/api/v1/jobs?run_id=not-a-valid-id")
     assert r.status_code == 400
     assert r.json()["code"] == "RUN_ID_INVALID"
+
+
+# ---------- JEE-1963：目标字数校验 + 自动续写一次 ----------
+
+def test_word_count_auto_extend_twice(tmp_path):
+    """验收第 4 条：首次 300 字、二次 2000 字 → 写作后端调用 2 次，最终正文 >=1600。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    long = "长" * 2000
+    writer = SequenceWriter([short, long])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert len(final.strip()) >= 1600
+
+
+def test_word_count_short_no_extra_call_without_style(tmp_path):
+    """验收第 7 条：style 无 word_count → 只校验 >=200，无额外调用。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    writer = SequenceWriter(["这是生成的正文。" * 40])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 1
+
+
+def test_word_count_still_short_after_extend_warns(tmp_path):
+    """验收第 5 条：两次都返回 300 字 → job 仍成功，length_warning 含实际/目标。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    writer = SequenceWriter([short, short])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    warn = st["length_warning"]
+    assert warn["actual"] == 300
+    assert warn["target_min"] == 1600
+    assert warn["target_max"] == 2400
+    # 原稿保留（300 字正文仍落盘）
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert len(final.strip()) == 300
+
+
+def test_word_count_extend_failure_keeps_original(tmp_path):
+    """验收第 6 条：首次 300 字、二次退出码 4 → 保留首次正文，job 成功，length_warning 存在。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    writer = SequenceWriter([short, 4])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 300
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert "短" in final
+    assert len(final.strip()) == 300
+
+
+def test_word_count_internal_whitespace_triggers_extend(tmp_path):
+    """返修第 3 条：目标 2000、首次返回 \"字 \"*1000 → 判定不足并触发续写，actual==1000。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    # strip 后 1999，去空白后 1000：必须按去空白口径判不足
+    padded = "字 " * 1000
+    short = "短" * 300
+    writer = SequenceWriter([padded, short])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2  # 确实触发了续写
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 300  # 续写后仍不足：actual 按去空白计
+
+
+def test_word_count_padded_only_warns_actual_is_1000(tmp_path):
+    """返修第 3 条（反向）：续写后仍不足时 length_warning.actual 必须等于 1000 而非 1999。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    padded = "字 " * 1000
+    writer = SequenceWriter([padded, padded])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 1000  # 不是 1999
+
+
+# ---------- JEE-1963：regenerate 端点（成功但字数不足的真正生成入口） ----------
+
+def _set_succeeded_with_warning(home, run_id, warning=None):
+    """把 job 置 succeeded，并在 run state 写入 length_warning。"""
+    store = jobs_store.JobStore(home)
+    job = store.load("j-test000001")
+    job["status"] = "succeeded"
+    store.write(job)
+    state = base_state(run_id)
+    state["status"] = "completed"
+    state["mode"] = "complete"
+    state["visual"] = {"mode": "none", "max_images": 0, "max_cost": None}
+    if warning is not None:
+        state["length_warning"] = warning
+    write_state(home, run_id, state)
+
+
+def _run_count(home):
+    """统计 home/runs 下的 run 子目录数量。"""
+    runs_dir = os.path.join(home, "runs")
+    if not os.path.isdir(runs_dir):
+        return 0
+    return len([n for n in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, n))])
+
+
+def _install_fake_wewrite_runs(monkeypatch, home, new_run_id, *, create_error=None):
+    """注入符合真实上游契约的假 ``wewrite.runs`` 模块（不替换 WeWriteAdapter）。
+
+    - ``create_run``：真实写一份 state.yaml 到 ``home/runs/<new_run_id>/`` 并返回；
+    - ``resume_run``：对 completed run 抛 ValueError（镜像上游 ``runs.py:296``）；
+    - ``update_run``：对 completed run 的 status 写入抛 ValueError。
+    让 ``app/adapters/wewrite.py`` 的真实代码跑在这个假上游上。
+    """
+    import types
+    import sys as _sys
+
+    fake = types.ModuleType("wewrite.runs")
+
+    def create_run(*, topic="", mode="draft", visual_mode=None, max_images=4, max_image_cost=None, allow_publish=False):
+        if create_error is not None:
+            raise create_error
+        run_dir = os.path.join(home, "runs", new_run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        state = {
+            "version": 4,
+            "run_id": new_run_id,
+            "created": "2026-10-29T00:00:00+08:00",
+            "updated": "2026-10-29T00:00:00+08:00",
+            "status": "active",
+            "mode": mode,
+            "permissions": {"publish": bool(allow_publish)},
+            "visual": {"mode": visual_mode or "none", "max_images": max_images, "max_cost": max_image_cost},
+            "topic": {"title": topic, "keywords": [], "source": "", "framework_hint": ""},
+            "artifacts": {},
+            "steps": {},
+            "last_error": None,
+        }
+        with open(os.path.join(run_dir, "state.yaml"), "w", encoding="utf-8") as f:
+            yaml.safe_dump(state, f, allow_unicode=True, sort_keys=False)
+        return state
+
+    def resume_run(run_id):
+        st = paths.read_state_yaml(home, run_id)
+        if st and st.get("status") == "completed":
+            raise ValueError("Completed runs are immutable; start a new run to revise the article.")
+        return st
+
+    def update_run(patch, run_id, _control=False):
+        st = paths.read_state_yaml(home, run_id)
+        if st and st.get("status") == "completed" and "status" in (patch or {}):
+            raise ValueError("Completed runs are immutable")
+        return st
+
+    fake.create_run = create_run
+    fake.resume_run = resume_run
+    fake.update_run = update_run
+    monkeypatch.setitem(_sys.modules, "wewrite.runs", fake)
+
+
+def test_job_regenerate_creates_new_run_and_job(tmp_path, monkeypatch):
+    """返修第三轮第 1 条：succeeded+警告 → 新建 run + 新 job，旧 run/job/警告不动。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    new_run_id = "20261026-120001-fedcba"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+    assert _run_count(home) == 1
+
+    _install_fake_wewrite_runs(monkeypatch, home, new_run_id)
+    store = jobs_store.JobStore(home)
+    new_job = store.regenerate("j-test000001")
+
+    assert new_job["status"] == "queued"
+    assert new_job["run_id"] == new_run_id  # 新 job 绑定新 run_id
+    assert new_job["run_id"] != run_id
+    assert new_job["attempt"] == 1
+    assert new_job["regenerated_from"] == "j-test000001"
+    assert _run_count(home) == 2  # run 总数 +1
+
+    # 旧 run 仍是 completed、旧 job 仍是 succeeded、旧警告仍在
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        old_state = yaml.safe_load(f)
+    assert old_state["status"] == "completed"
+    assert old_state["length_warning"]["actual"] == 300
+    assert store.load("j-test000001")["status"] == "succeeded"
+
+
+def test_job_regenerate_requires_length_warning(tmp_path, monkeypatch):
+    """返修第三轮第 3 条（反向）：无 length_warning 的 succeeded 拒绝。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, None)
+
+    _install_fake_wewrite_runs(monkeypatch, home, "20261026-120001-fedcba")
+    store = jobs_store.JobStore(home)
+    try:
+        store.regenerate("j-test000001")
+        assert False, "无 length_warning 的 succeeded 任务应拒绝"
+    except Exception as exc:
+        assert exc.code == "CONFLICT"
+        assert exc.details.get("reason") == "no_length_warning"
+    assert _run_count(home) == 1  # 未新建 run
+
+
+def test_job_regenerate_rejects_inflight_duplicate(tmp_path, monkeypatch):
+    """返修第三轮第 4 条（并发）：同一旧 job 连点两次只产生一个 run，第二次冲突。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    # 每次调用返回不同的新 run_id，模拟真实上游的随机 run_id。
+    new_ids = iter(["20261026-120001-fedcba", "20261026-120002-123456"])
+    _install_fake_wewrite_runs(monkeypatch, home, next(new_ids))
+
+    store = jobs_store.JobStore(home)
+    first = store.regenerate("j-test000001")
+    assert first["status"] == "queued"
+    assert first["regenerated_from"] == "j-test000001"
+    assert _run_count(home) == 2
+
+    # 换一个 run_id 再试第二次：应按 regenerated_from 判冲突，不新建第二个 run
+    _install_fake_wewrite_runs(monkeypatch, home, next(new_ids))
+    try:
+        store.regenerate("j-test000001")
+        assert False, "同一旧 job 已有 queued 下游时应冲突"
+    except Exception as exc:
+        assert exc.code == "CONFLICT"
+        assert exc.details.get("reason") == "already_regenerating"
+    assert _run_count(home) == 2  # run 总数仍只 +1，不是 +2
+
+
+def test_job_regenerate_create_run_error_does_not_create_job(tmp_path, monkeypatch):
+    """返修第三轮第 5 条：上游 create_run 抛错 → 不产生任何 job，错误如实透出。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    _install_fake_wewrite_runs(monkeypatch, home, "20261026-120001-fedcba", create_error=ValueError("bad"))
+    store = jobs_store.JobStore(home)
+    before_jobs = len(store.list_jobs())
+    try:
+        store.regenerate("j-test000001")
+        assert False, "create_run 抛错应透出"
+    except Exception as exc:
+        assert exc.code == "VALIDATION_ERROR"  # adapter 把 ValueError 归一为 VALIDATION_ERROR
+        assert exc.details.get("reason") == "upstream_rejected"
+    assert len(store.list_jobs()) == before_jobs  # 未新增 job
+    assert _run_count(home) == 1  # 未新建 run
+
+
+def test_regenerate_endpoint_returns_new_job_id(tmp_path, monkeypatch):
+    """返修第三轮（端点级）：POST /regenerate 返回新 job（绑定新 run_id + regenerated_from）。"""
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    new_run_id = "20261026-120001-fedcba"
+    make_queued_job(home, run_id)
+    _set_succeeded_with_warning(home, run_id, {"actual": 300, "target_min": 1600, "target_max": 2400, "target": 2000})
+
+    _install_fake_wewrite_runs(monkeypatch, home, new_run_id)
+    monkeypatch.setenv("WEWRITE_HOME", home)
+    monkeypatch.setenv("WEWRITE_PLATFORM_NO_WORKER", "1")
+    app = create_app()
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c.headers.update({"host": "127.0.0.1:8765"})
+
+    token = c.get("/api/v1/bootstrap").json()["csrf_token"]
+    r = c.post(
+        "/api/v1/jobs/j-test000001/regenerate",
+        json={},
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "http://127.0.0.1:8765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": token,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["run_id"] == new_run_id
+    assert body["job_id"] != "j-test000001"
+    assert body["regenerated_from"] == "j-test000001"

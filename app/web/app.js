@@ -105,6 +105,51 @@ function forbiddenState() {
   return el("div", { class: "state-block" }, ["本机工作台目录不可读，无法展示任务列表"]);
 }
 
+// JEE-1963：终稿字数低于目标时的提示条（P2 任务详情 / P3 预览页，非阻断）。
+// 「重新生成」真实 POST /api/v1/jobs/{job_id}/regenerate（后端准入：succeeded 且带 length_warning）。
+function lengthWarningBanner(d, runId, jobId) {
+  const w = d && d.length_warning;
+  if (!w) return null;
+  const actual = w.actual == null ? "?" : w.actual;
+  const goal = w.target == null ? (w.target_min == null ? "?" : w.target_min) : w.target;
+  const tmin = w.target_min == null ? "?" : w.target_min;
+  const tmax = w.target_max == null ? "?" : w.target_max;
+  const banner = el("div", { class: "notice notice-warn" }, [
+    "正文约 " + actual + " 字，低于目标 " + goal + " 字（可接受区间 " + tmin + "–" + tmax + " 字），可重新生成一次以扩写。",
+  ]);
+  if (runId && jobId) {
+    const regenBtn = el("button", { class: "btn", text: "重新生成" });
+    regenBtn.addEventListener("click", async () => {
+      if (!window.confirm("将重新生成一次（新的生成任务），原结果保留。确认？")) return;
+      try {
+        const token = await csrfToken();
+        const res = await fetch(`/api/v1/jobs/${encodeURIComponent(jobId)}/regenerate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+          let code = "HTTP_" + res.status, message = res.statusText;
+          try { const b = await res.json(); code = b.code || code; message = b.message || message; } catch (_) {}
+          throw Object.assign(new Error(message), { code, status: res.status });
+        }
+        const rb = await res.json();
+        const newJobId = rb.job_id;
+        window.alert("已发起重新生成（新任务），正在跳转…");
+        if (newJobId) {
+          location.replace("#/jobs/" + encodeURIComponent(newJobId));
+        } else {
+          location.replace("#/runs/" + runId + "/job");
+        }
+      } catch (err) {
+        window.alert("重新生成失败：" + (err.code || err.message));
+      }
+    });
+    banner.appendChild(regenBtn);
+  }
+  return banner;
+}
+
 const STATUS_TEXT = {
   active: "进行中",
   failed: "失败",
@@ -441,11 +486,22 @@ async function renderDetail(runId) {
     return;
   }
 
+  // JEE-1963：找到该 run 最近的 succeeded job，供「重新生成」按钮定位（后端准入 length_warning）。
+  let jobId = null;
+  try {
+    const jobsBody = await api("/api/v1/jobs?run_id=" + encodeURIComponent(runId));
+    const jobs = (jobsBody.jobs || []).slice().reverse();
+    const succeeded = jobs.find((j) => j.status === "succeeded");
+    jobId = succeeded ? succeeded.job_id : null;
+  } catch (_) {
+    jobId = null;
+  }
+
   container.innerHTML = "";
-  container.appendChild(detailBody(detail));
+  container.appendChild(detailBody(detail, jobId));
 }
 
-function detailBody(d) {
+function detailBody(d, jobId) {
   const status = d.status || "unknown";
   // 页面标题由顶栏 h1 承载（「任务详情」），此处用卡片头 h2 展示文章题名
   const title = el("div", { class: "card-head" }, [
@@ -489,6 +545,10 @@ function detailBody(d) {
   const infoCard = el("div", { class: "card" }, [title, el("div", { class: "card-body" }, [kv])]);
 
   const sections = [infoCard, statusCard, el("div", { class: "preview-controls" }, [previewBtn, jobLink])];
+
+  // JEE-1963：字数低于目标的提示条（非阻断）
+  const lengthWarn = lengthWarningBanner(d, d.run_id, jobId);
+  if (lengthWarn) sections.push(lengthWarn);
 
   // P2-F5：失败/取消/未知任务的重试入口
   if (status === "failed" || status === "cancelled" || status === "unknown") {
@@ -722,6 +782,30 @@ async function renderPreview(runId) {
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
   /* 页面标题由顶栏 h1 承载 */
 
+  // 先取 run 详情，据此标注来源可用性、默认选中来源，并渲染字数提示条。
+  let detail = null;
+  try {
+    detail = await api("/api/v1/runs/" + runId);
+  } catch (_) {
+    detail = null;
+  }
+  const artifacts = (detail && detail.artifacts) || {};
+
+  // JEE-1963：找到最近 succeeded job 供「重新生成」定位。
+  let jobId = null;
+  try {
+    const jobsBody = await api("/api/v1/jobs?run_id=" + encodeURIComponent(runId));
+    const jobs = (jobsBody.jobs || []).slice().reverse();
+    const succeeded = jobs.find((j) => j.status === "succeeded");
+    jobId = succeeded ? succeeded.job_id : null;
+  } catch (_) {
+    jobId = null;
+  }
+
+  // JEE-1963：字数低于目标的提示条（非阻断）
+  const lengthWarn = lengthWarningBanner(detail, runId, jobId);
+  if (lengthWarn) app.appendChild(lengthWarn);
+
   // 常驻口径提示：每个来源/主题切换后提示仍在
   app.appendChild(el("div", { class: "notice" }, [
     "本地预览，图片上传后 URL 会被替换",
@@ -731,15 +815,6 @@ async function renderPreview(runId) {
 
   const controls = el("div", { class: "preview-controls" });
   const sourceSelect = el("select");
-
-  // 先取 run 详情里的 artifacts，据此标注来源可用性并默认选中第一个实际存在的来源。
-  let artifacts = {};
-  try {
-    const detail = await api("/api/v1/runs/" + runId);
-    artifacts = detail.artifacts || {};
-  } catch (_) {
-    artifacts = {};
-  }
 
   // 3.4：来源下拉旁只读产物状态提示（与实际 artifacts 一致）
   const artStatus = el("div", { class: "muted" });

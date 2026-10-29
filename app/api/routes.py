@@ -763,6 +763,19 @@ async def resume_job(job_id: str):
         return _error_response(exc)
 
 
+@router.post("/api/v1/jobs/{job_id}/regenerate")
+async def regenerate_job(job_id: str, request: Request):
+    """JEE-1963：「成功但字数不足」任务重新生成（产生新 job，不清旧成功记录）。
+
+    准入：旧 job ``succeeded`` 且其 run 带 ``length_warning``；并发保护下连点两次
+    只产生一次写作（第二次 CONFLICT）。普通 succeeded（无警告）仍不可重试。
+    """
+    try:
+        return await run_in_threadpool(jobs.JobStore(_home()).regenerate, job_id)
+    except errors.ApiError as exc:
+        return _error_response(exc)
+
+
 @router.post("/api/v1/jobs/{job_id}/accept-existing")
 async def accept_existing_job(job_id: str, request: Request):
     body = await _read_body(request)

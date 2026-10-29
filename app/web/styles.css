@@ -446,6 +446,16 @@ dl.kv dd { margin: 0; }
   font-size: 13px;
 }
 
+/* JEE-1963：字数低于目标的非阻断提示条 */
+.notice-warn {
+  border-color: var(--warn);
+  background: var(--amber-bg);
+  color: #7a5200;
+}
+.notice-warn .btn {
+  margin-left: 10px;
+}
+
 .preview-controls {
   display: flex;
   align-items: center;

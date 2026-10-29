@@ -281,24 +281,77 @@ class JobStore:
             return new_job
 
     def retry_images(self, job_id: str, indices: list[int]) -> dict:
-        """失败图人工重试：每个失败索引最多一次，不重试成功图，超限 CONFLICT。"""
-        job = self.get_or_404(job_id)
-        images = job.get("images") or []
-        to_retry = []
-        for idx in indices:
-            if not isinstance(idx, int) or idx < 0 or idx >= len(images):
-                raise errors.validation_error("indices 越界", {"field": "indices"})
-            img = images[idx]
-            if img.get("status") == "succeeded":
-                raise errors.conflict({"reason": "already_succeeded", "index": idx})
-            if img.get("retried"):
-                raise errors.conflict({"reason": "already_retried", "index": idx})
-            to_retry.append(idx)
-        for idx in to_retry:
-            images[idx]["retried"] = True
-            images[idx]["status"] = "pending"
-            images[idx]["error"] = None
-        job["images"] = images
-        job["updated_at"] = _now()
-        self.write(job)
-        return job
+        """失败图人工重试：置 pending 并把 job 重新排回 queued，真正触发生成。
+
+        - 不重试成功图（``already_succeeded`` 409）；
+        - 允许对同一失败索引多次重试（换模型后再试是合法流程），每次递增
+          ``retry_count`` 并追加 ``retry_history``（记录当次 provider/model）；
+        - job 正在 ``running`` 时返回 409 ``job_running``（避免与运行中 worker 抢写）；
+        - 幂等：job 已处于「图片重试排队」且请求的索引都已是 pending → 原样返回，
+          不重复递增 attempt。
+        """
+        from app.storage.atomic import PlatformLock
+
+        if not indices:
+            raise errors.validation_error("indices 不能为空", {"field": "indices"})
+
+        with PlatformLock(self.home):
+            job = self.get_or_404(job_id)
+            if job.get("status") == "running":
+                raise errors.conflict("任务正在生成中，请稍后再试", {"reason": "job_running", "job_id": job_id})
+
+            images = job.get("images") or []
+            for idx in indices:
+                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= len(images):
+                    raise errors.validation_error("indices 越界", {"field": "indices"})
+            for idx in indices:
+                if images[idx].get("status") == "succeeded":
+                    raise errors.conflict({"reason": "already_succeeded", "index": idx})
+
+            # 幂等：同一 job 的重试请求，若已全部 pending 且仍处排队态 → 直接返回
+            if (
+                job.get("retry_mode") == "images"
+                and job.get("status") == "queued"
+                and all(images[idx].get("status") == "pending" for idx in indices)
+            ):
+                return job
+
+            provider, model = self._image_provider_model()
+            now = _now()
+            for idx in indices:
+                img = images[idx]
+                img["retried"] = True
+                img["status"] = "pending"
+                img["error"] = None
+                img["error_code"] = None
+                img["retry_count"] = int(img.get("retry_count") or 0) + 1
+                history = list(img.get("retry_history") or [])
+                history.append({"provider": provider, "model": model, "at": now})
+                img["retry_history"] = history
+
+            job["images"] = images
+            job["retry_mode"] = "images"
+            job["status"] = "queued"
+            job["cancel_requested"] = False
+            job["attempt"] = int(job.get("attempt") or 0) + 1
+            job["step"] = "visual"
+            job["last_error"] = None
+            job["updated_at"] = now
+            self.write(job)
+            return job
+
+    def _image_provider_model(self) -> tuple[str, str]:
+        """读取本次重试生效的图片 provider/model（env 优先，其次 config.yaml）。"""
+        import os
+
+        from app.storage.config_store import ConfigStore
+
+        cfg = ConfigStore(self.home).load_config()
+        image = cfg.get("image") or {}
+        provider = os.environ.get("WEWRITE_IMAGE_PROVIDER") or image.get("provider") or ""
+        model = os.environ.get("WEWRITE_IMAGE_MODEL") or image.get("model") or ""
+        providers = image.get("providers")
+        if isinstance(providers, list) and providers:
+            provider = ", ".join(str(p.get("provider") or "") for p in providers)
+            model = ", ".join(str(p.get("model") or "") for p in providers)
+        return provider, model

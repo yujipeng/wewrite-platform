@@ -47,6 +47,20 @@ def test_p6_job_page_present(client):
     assert "/resume" in js
 
 
+def test_p6_image_retry_feedback_present(client):
+    """JEE-1961：重试有可感知反馈——立即显示提交中、409 提示、错误码与换模型引导。"""
+    js = _app_js(client)
+    assert "已提交重试，正在生成…" in js
+    assert "任务正在生成中，请稍后再试" in js
+    # 错误码中文说明
+    assert "IMAGE_AUTH_FAILED" in js
+    assert "IMAGE_QUOTA_EXCEEDED" in js
+    assert "IMAGE_MODEL_INVALID" in js
+    assert "IMAGE_TIMEOUT" in js
+    # 换模型引导
+    assert "更换图片模型后重试" in js
+
+
 def test_p7_reconcile_entry_present(client):
     """P7「核对草稿箱」入口调用 POST /publish/reconcile。"""
     js = _app_js(client)

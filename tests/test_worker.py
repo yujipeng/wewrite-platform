@@ -348,14 +348,24 @@ def test_job_retry_images_once_only(tmp_path):
         assert False, "应拒绝重试成功图"
     except Exception as exc:
         assert exc.code == "CONFLICT"
-    # 失败图重试一次
-    store.retry_images("j-test000001", [0])
-    # 二次重试拒绝
-    try:
-        store.retry_images("j-test000001", [0])
-        assert False, "应拒绝二次重试"
-    except Exception as exc:
-        assert exc.code == "CONFLICT"
+    # 失败图重试一次：置 pending 且重新排队
+    retried = store.retry_images("j-test000001", [0])
+    assert retried["status"] == "queued"
+    assert retried["images"][0]["status"] == "pending"
+    assert retried["images"][0]["retry_count"] == 1
+    # 幂等：job 仍在图片重试排队态，重复请求直接返回，不重复递增
+    idem = store.retry_images("j-test000001", [0])
+    assert idem["images"][0]["retry_count"] == 1
+    # 模拟 worker 跑完后图 0 仍失败（换模型后再重试的合法流程）
+    job = store.load("j-test000001")
+    job["status"] = "failed"
+    job["retry_mode"] = None
+    job["images"][0]["status"] = "failed"
+    store.write(job)
+    # 换模型后再次重试（不再 already_retried），retry_count 递增为 2
+    retried2 = store.retry_images("j-test000001", [0])
+    assert retried2["images"][0]["retry_count"] == 2
+    assert retried2["status"] == "queued"
 
 
 # ---------- GET /api/v1/jobs?run_id= ----------

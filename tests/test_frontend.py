@@ -82,12 +82,12 @@ def test_p8_style_grouped_and_options(client):
 
 
 def test_p8_style_ai_generate_entry(client):
-    """JEE-1947：智能生成风格入口，未配置模型时按钮禁用 + 中文提示。"""
+    """JEE-1947：智能生成风格入口，未配置模型时可点击引导 + 中文提示。"""
     js = _app_js(client)
     assert "/api/v1/style/generate" in js
     assert "/api/v1/style/validate" in js
     assert "智能生成" in js
-    assert "需先配置写作模型" in js
+    assert "去配置写作模型" in js
     assert "未自动保存" in js
     assert "writer_configured" in js
 

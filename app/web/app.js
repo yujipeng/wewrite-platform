@@ -1573,7 +1573,7 @@ async function renderConfig() {
       writerSection.scrollIntoView({ behavior: "smooth", block: "start" });
     }
     writerSection.classList.add("config-highlight");
-    window.setTimeout(() => writerSection.classList.remove("config-highlight"), 2600);
+    setTimeout(() => writerSection.classList.remove("config-highlight"), 2600);
   }
 
   // 主题
@@ -1782,8 +1782,9 @@ async function renderConfig() {
   const aiGoBtn = el("button", { class: "btn", text: "生成" });
   const aiResult = el("div", { class: "ai-generate-hint", text: "" });
   if (!writerConfigured) {
-    aiGoBtn.disabled = true;
-    aiResult.textContent = "需先配置写作模型（见「写作模型」区，WEWRITE_WRITER_API_KEY）";
+    // 未配置时按钮保持可点击，点击后定位 + 高亮「写作模型」区，不再禁用导致无入口。
+    aiGoBtn.textContent = "去配置写作模型";
+    aiResult.textContent = "尚未配置写作模型：点击上方按钮可直接定位到「写作模型」区";
   }
   aiBox.appendChild(el("div", { class: "preview-controls" }, [aiGoBtn, aiResult]));
   container.appendChild(aiBox);
@@ -1817,6 +1818,13 @@ async function renderConfig() {
   });
 
   aiGoBtn.addEventListener("click", async () => {
+    // 未配置时不做请求，直接定位 + 高亮「写作模型」区（第 7 条要求的可点击入口）。
+    if (!writerConfigured) {
+      highlightWriterSection();
+      aiResult.textContent = "请在上方「写作模型（文章生成）」区填写 API Key 并保存，保存后即可智能生成";
+      aiResult.classList.add("error-block");
+      return;
+    }
     const industry = aiIndustry.value.trim();
     const audience = aiAudience.value.trim();
     const toneHint = aiTone.value.trim();
@@ -1845,7 +1853,8 @@ async function renderConfig() {
       markDirty(yamlEditor.value !== savedRaw);
       aiResult.textContent = "已生成并填入编辑器，请预览修改后点「保存」落盘（未自动保存）";
     } catch (err) {
-      aiResult.textContent = "生成失败：" + (err.code || err.message);
+      // 错误展示优先中文 message，code 只作为附加信息；未配置时同时定位 + 高亮。
+      aiResult.textContent = "生成失败：" + (err.message || err.code);
       aiResult.classList.add("error-block");
       // 未配置时定位并高亮「写作模型」区块，让用户知道去哪填。
       if (err.code === "WRITER_NOT_CONFIGURED") {

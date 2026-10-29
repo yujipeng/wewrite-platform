@@ -68,6 +68,13 @@ class FakeEl {
     this.id = "";
     this.classList = new ClassList();
     this.classList._owner = this;
+    this._scrollCalls = 0;
+    this._lastScroll = null;
+  }
+  scrollIntoView(opts) {
+    // 记录调用（行为断言用），不真正滚动。
+    this._scrollCalls += 1;
+    this._lastScroll = opts;
   }
   set innerHTML(v) {
     this._innerHTML = String(v);
@@ -168,6 +175,19 @@ function findByTag(root, tag) {
 async function clickButton(root, text) {
   const btn = findByText(root, text).find((n) => n.tagName === "BUTTON");
   const handler = btn && btn.listeners && btn.listeners["click"] && btn.listeners["click"][0];
+  if (handler) await Promise.resolve(handler());
+  await new Promise((r) => setTimeout(r, 10));
+  return !!handler;
+}
+
+// 派发含指定文案的按钮 click（精确匹配 textContent，返回按钮元素）。
+function findButton(root, text) {
+  return findByText(root, text).find((n) => n.tagName === "BUTTON");
+}
+
+// 派发 el 上第 index 个 click 处理器并冲刷宿主 macrotask。
+async function dispatchClick(el, index = 0) {
+  const handler = el && el.listeners && el.listeners["click"] && el.listeners["click"][index];
   if (handler) await Promise.resolve(handler());
   await new Promise((r) => setTimeout(r, 10));
   return !!handler;
@@ -641,12 +661,109 @@ async function testPreviewSourceAvailability() {
   }
 }
 
+// ============ 8) 写作模型未配置：可点击引导入口 + 错误文案不被 code 遮蔽（JEE-1955） ============
+async function testWriterNotConfiguredInteraction() {
+  // 8.1 未配置状态：按钮可点击，点击后真实触发 scrollIntoView + config-highlight
+  {
+    const { sandbox, els } = makeContext({
+      hash: "#/config",
+      fetchImpl: async (path) => {
+        if (path === "/api/v1/config") return okJson({
+          theme: "professional-clean",
+          image: { provider: "", model: "", base_url: "", api_key_configured: false },
+          wechat: { appid: "", author: "编辑", appid_configured: false, secret_configured: false },
+          writer: { provider: "deepseek", model: "deepseek-chat", base_url: "https://api.deepseek.com", temperature: 1.0, max_tokens: 4000, api_key_configured: false, writer_configured: false },
+          permissions: { publish: false },
+          env_managed: [],
+        });
+        if (path === "/api/v1/style") return okJson({ raw: "name: ''\n", revision: "r1" });
+        if (path === "/api/v1/image-providers") return okJson({ providers: [] });
+        if (path === "/api/v1/writer-providers") return okJson({ providers: [] });
+        if (path === "/api/v1/themes") return okJson({ themes: [] });
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderConfig()");
+
+    const appEl = els["app"];
+    const btn = findButton(appEl, "去配置写作模型");
+    check("未配置时按钮可点击（文案「去配置写作模型」）", !!btn && btn.disabled !== true);
+
+    // 找到「写作模型（文章生成）」区块对应的 section（按钮点击前先记录 scrollIntoView 是否已装）
+    const writerSection = findWriterSection(appEl);
+    check("存在「写作模型（文章生成）」区块", !!writerSection);
+
+    await dispatchClick(btn);
+    check("点击未配置按钮后真实调用 scrollIntoView", !!writerSection && writerSection._scrollCalls > 0);
+    check("点击未配置按钮后区块加 config-highlight", !!writerSection && writerSection.classList.contains("config-highlight"));
+  }
+
+  // 8.2 WRITER_NOT_CONFIGURED 响应：渲染中文 message，不出现裸 code
+  {
+    let generateCalled = 0;
+    const { sandbox, els } = makeContext({
+      hash: "#/config",
+      fetchImpl: async (path, opts) => {
+        if (path === "/api/v1/config") return okJson({
+          theme: "professional-clean",
+          image: { provider: "", model: "", base_url: "", api_key_configured: false },
+          wechat: { appid: "", author: "编辑", appid_configured: false, secret_configured: false },
+          writer: { provider: "deepseek", model: "deepseek-chat", base_url: "https://api.deepseek.com", temperature: 1.0, max_tokens: 4000, api_key_configured: true, writer_configured: true },
+          permissions: { publish: false },
+          env_managed: [],
+        });
+        if (path === "/api/v1/style") return okJson({ raw: "name: ''\n", revision: "r1" });
+        if (path === "/api/v1/image-providers") return okJson({ providers: [] });
+        if (path === "/api/v1/writer-providers") return okJson({ providers: [] });
+        if (path === "/api/v1/themes") return okJson({ themes: [] });
+        if (path === "/api/v1/bootstrap") return okJson({ csrf_token: "t" });
+        if (path === "/api/v1/style/generate") {
+          generateCalled += 1;
+          return errJson(503, { code: "WRITER_NOT_CONFIGURED", message: "写作模型未配置：请在上方「写作模型」区填写 API Key 并保存" });
+        }
+        throw new Error("unexpected path " + path);
+      },
+    });
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(appJs, ctx, { filename: "app.js" });
+    await runAwait(ctx, "renderConfig()");
+
+    const appEl = els["app"];
+    // 已配置时按钮文案为「生成」，填一项引导信息后点击触发请求
+    const genBtn = findButton(appEl, "生成");
+    check("已配置时按钮文案为「生成」", !!genBtn && genBtn.disabled !== true);
+
+    const industryInput = findByClass(appEl, "style-custom-input")[0];
+    industryInput.value = "科技";
+    await dispatchClick(genBtn);
+
+    check("点击「生成」确实发起了 style/generate 请求", generateCalled === 1);
+
+    const genText = collectText(appEl);
+    check("WRITER_NOT_CONFIGURED 渲染中文可操作提示", genText.includes("写作模型未配置") && genText.includes("API Key"));
+    check("WRITER_NOT_CONFIGURED 渲染不含裸 code", !genText.includes("WRITER_NOT_CONFIGURED"));
+  }
+}
+
+// 找到「写作模型（文章生成）」区块对应的 section 元素。
+// highlightWriterSection 作用于 app.js 里的 writerSection 局部 div，该 div 内是 writerRow(dl.kv)，
+// 其 kv 表单包含「API 密钥」dt。因此从「API 密钥」dt 沿 parentNode 向上三级到 writerSection。
+function findWriterSection(root) {
+  const apiKeyDt = findByText(root, "API 密钥").find((n) => n.tagName === "DT");
+  if (!apiKeyDt || !apiKeyDt.parentNode || !apiKeyDt.parentNode.parentNode) return null;
+  const writerRow = apiKeyDt.parentNode.parentNode; // dt -> dl(kv) -> writerRow(div)
+  return writerRow.parentNode; // writerSection(div)
+}
+
 // ============ 主入口 ============
 (async () => {
   await testFourStates();
   await testPublishConsistency();
   await testDetailPublishConsistency();
   await testPreviewSourceAvailability();
+  await testWriterNotConfiguredInteraction();
 
   const failed = checks.filter((c) => !c.ok);
   const summary = {

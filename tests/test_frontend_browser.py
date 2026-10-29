@@ -642,3 +642,84 @@ def test_p4_confirm_selected_opens_confirm_modal_one_step(browser_session):
     # 弹层里的「确认生成」按钮存在
     assert page.locator("button", has_text="确认生成").count() == 1, "应有「确认生成」按钮"
     assert page_errors == [], f"P4 确认选题一步打开弹层抛 JS 异常：{page_errors}"
+
+
+def test_p4_confirm_selected_no_confirmable_candidate_shows_hint(browser_session):
+    """返修回归（阻断 1 已有候选分支）：该 URL 只有已确认/已关闭候选时，点「确认选题」
+    必须给出明确的「不可确认」中文提示，不得静默退回候选列表。
+
+    用唯一 url 构造快照，避免被共享 browser 上下文中其它 P4 用例生成的开集候选污染。
+    """
+    import json
+
+    ctx = browser_session["ctx"]
+    base = browser_session["base"]
+    home = browser_session["home"]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page_errors: list[str] = []
+    page.on("pageerror", lambda e: page_errors.append(str(e)))
+
+    # 唯一 url，仅本用例使用
+    item = {
+        "title": "唯一热点标题",
+        "source": "微博",
+        "source_id": "weibo",
+        "hot": 999,
+        "url": "https://example.invalid/jee1962-no-confirm",
+        "description": "切入角度",
+    }
+    _write_hotspot_snapshot(home, "2026-10-26", [item])
+
+    # 直写一个「已确认」候选集：source_url 对应该热点，set_status=confirmed（无可确认候选）
+    cand_dir = os.path.join(home, "candidates")
+    os.makedirs(cand_dir, exist_ok=True)
+    cid = "2026-10-26-aaaaaaaacdef"
+    candidate_set = {
+        "version": 1,
+        "candidate_set_id": cid,
+        "set_status": "confirmed",
+        "created_at": "2026-10-26T08:00:00Z",
+        "expires_at": "2026-10-27T08:00:00Z",
+        "timezone": "Asia/Shanghai",
+        "snapshot_sha256": "sha256:deadbeef",
+        "style_revision": "sha256:web-default",
+        "items": [{
+            "id": "c01",
+            "status": "confirmed",
+            "title": "唯一热点标题",
+            "angle": "解读",
+            "scores": {"hot": 999, "hot_normalized": 100.0, "relevance": 80.0, "value": 70.0, "total": 79.0},
+            "framework": "问题-证据-行动",
+            "source": "微博",
+            "source_id": "weibo",
+            "source_url": "https://example.invalid/jee1962-no-confirm",
+            "history_flag": False,
+            "content_hash": "sha256:deadbeef",
+            "run_id": "20261026-120000-abcdef",
+            "job_id": "j-test000001",
+        }],
+    }
+    with open(os.path.join(cand_dir, f"{cid}.json"), "w", encoding="utf-8") as f:
+        json.dump(candidate_set, f, ensure_ascii=False)
+
+    page.goto(f"{base}/#/hotspots", wait_until="networkidle")
+    page.wait_for_timeout(500)
+
+    # 模块级 fixture 共享 JS 状态：先清空残留勾选
+    page.locator("button", has_text="清空选择").click()
+    page.wait_for_timeout(200)
+
+    # 只勾选该热点（其候选已确认、无 open/proposed 候选）
+    checkboxes = page.locator("ul.run-list input[type=checkbox]")
+    checkboxes.nth(0).check()
+    page.wait_for_timeout(200)
+
+    page.locator("button", has_text="确认选题（唯一）").click()
+    page.wait_for_timeout(600)
+
+    # 仍在 P4（未静默跳转），且给出明确的不可确认中文提示
+    assert "#/hotspots" in page.url, f"不应静默跳转，实际 {page.url}"
+    body_text = page.inner_text("#app")
+    assert "无法再次确认" in body_text, "应提示该热点候选均已确认/关闭无法再次确认"
+    assert "选题确认" in body_text or "生成候选" in body_text, "提示应含下一步动作指引"
+    assert page_errors == [], f"P4 不可确认分支抛 JS 异常：{page_errors}"

@@ -256,18 +256,22 @@ class ConfirmGate:
     def _confirmed_run_valid(self, item: dict) -> bool:
         """判定某 confirmed 候选的 run 是否仍有效（需求 3.2 前置条件「run_id 仍有效」）。
 
-        有效性落到磁盘真实存在性：run 的 state.yaml 可读且 run_id 匹配；若带 job_id，
-        job 文件也必须仍存在。run/job 任一被清理即视为失效，不再阻挡确认另一条。
+        有效性落到磁盘真实存在性 + 标识匹配：run 的 state.yaml 可读且 ``state["run_id"]``
+        必须等于候选记录的 ``run_id``；若带 job_id，job 文件必须仍存在且其 ``run_id``
+        也须与候选记录的 ``run_id`` 一致。文件标识与候选记录不符（或任一被清理）即判
+        无效，不再阻挡确认另一条。
         """
         run_id = item.get("run_id")
         if not run_id:
             return False
         state = paths.read_state_yaml(self.home, run_id)
-        if not isinstance(state, dict) or not state.get("run_id"):
+        if not isinstance(state, dict) or state.get("run_id") != run_id:
             return False
         job_id = item.get("job_id")
-        if job_id and self._job_store.load(job_id) is None:
-            return False
+        if job_id:
+            job = self._job_store.load(job_id)
+            if job is None or job.get("run_id") != run_id:
+                return False
         return True
 
     def _has_valid_confirmation(self, data: dict) -> bool:

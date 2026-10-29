@@ -1032,3 +1032,65 @@ def test_confirm_second_still_blocked_when_run_valid(tmp_path, monkeypatch):
     assert r2.status_code == 409
     assert r2.json()["details"]["reason"] == "set_already_confirmed"
     assert adapter.calls == 1
+
+
+def test_confirm_second_allowed_when_state_run_id_mismatch(tmp_path, monkeypatch):
+    """返修回归（阻断 2 标识匹配）：候选记录的 run_id 与 state.yaml 里的 run_id 不符 → 判无效。
+
+    state.yaml 被改写成另一 run_id 后，唯一性规则不再把该确认视为有效，第二条应能正常确认。
+    """
+    import yaml
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-run-mismatch-1").json()
+    run_id = confirmed["run_id"]
+
+    # 篡改 state.yaml 的 run_id，使文件标识与候选记录不符
+    state_path = os.path.join(home, "runs", run_id, "state.yaml")
+    with open(state_path, encoding="utf-8") as f:
+        state = yaml.safe_load(f)
+    state["run_id"] = "20261026-999999-ffffff"
+    with open(state_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(state, f, allow_unicode=True, sort_keys=False)
+
+    # 标识不匹配 → 视为无效，确认第二条成功
+    r2 = _confirm(c, cid, second, "key-run-mismatch-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2
+
+
+def test_confirm_second_allowed_when_job_run_id_mismatch(tmp_path, monkeypatch):
+    """返修回归（阻断 2 标识匹配）：job 文件 run_id 与候选记录不符 → 判无效，第二条可确认。"""
+    import json
+
+    home = str(tmp_path)
+    adapter = FakeWewriteAdapter(home)
+    c = make_client(monkeypatch, home, adapter)
+    body = generate_set(c, home)
+    cid = body["candidate_set_id"]
+    first = body["items"][0]
+    second = body["items"][1]
+
+    confirmed = _confirm(c, cid, first, "key-job-mismatch-1").json()
+    run_id = confirmed["run_id"]
+    job_id = confirmed["job_id"]
+
+    # 篡改 job 文件的 run_id，使文件标识与候选记录不符
+    job_path = os.path.join(home, "jobs", f"{job_id}.json")
+    with open(job_path, encoding="utf-8") as f:
+        job = json.load(f)
+    job["run_id"] = "20261026-888888-eeeeee"
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False)
+
+    # job 标识不匹配 → 视为无效，确认第二条成功
+    r2 = _confirm(c, cid, second, "key-job-mismatch-2")
+    assert r2.status_code == 200, r2.text
+    assert adapter.calls == 2

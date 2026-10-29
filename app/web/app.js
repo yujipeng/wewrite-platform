@@ -1270,14 +1270,21 @@ async function renderHotspots() {
     const hid = Array.from(_hotspotSelections)[0];
     // 精确判定：当前选中的热点是否已有候选（按 url 匹配），并拿到其候选集/候选 id
     const item = (_hotspotCurrentItems || []).find((it) => (it.item_id || "") === hid);
-    const existing = item && item.url && _hotspotExistingCandidates.has(item.url);
-    if (existing) {
-      // 一步进入 P5 并打开该条候选的确认弹层（含图片上限/预算/allow_publish 展示）
+    const hasAnyCandidate = !!(item && item.url && _hotspotExistingCandidates.has(item.url));
+    if (hasAnyCandidate) {
+      // 二选一给确定结果：要么精确打开可确认候选弹层，要么明确提示「不可确认」。
       const target = item && item.url ? _hotspotCandidateByUrl[item.url] : null;
       if (target) {
+        // 一步进入 P5 并打开该条候选的确认弹层（含图片上限/预算/allow_publish 展示）
         location.hash = "#/candidates/" + target.set_id + "/" + target.candidate_id;
       } else {
-        location.hash = "#/candidates";
+        // 该 URL 只有已确认/已关闭候选，无 open/proposed 候选可确认：明确提示，不静默退回
+        container.innerHTML = "";
+        container.appendChild(errorState(
+          "该热点已有候选，但均已确认或已关闭，无法再次确认；请到「选题确认」页查看既有候选，或改用「生成候选」重新生成",
+          () => loadSaved()
+        ));
+        refreshSelectionUI();
       }
       return;
     }

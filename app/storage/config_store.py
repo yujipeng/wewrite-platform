@@ -98,6 +98,23 @@ def writer_configured_value(config: dict) -> bool:
     return bool((writer.get("api_key") or "").strip())
 
 
+def image_effective_values(config: dict) -> dict:
+    """合并「env 优先 → config.yaml」返回图片生效配置（用于审计与实际调用口径一致）。
+
+    - provider/model：env 存在即以其为准（空串=未设置，交上游默认）；env 不存在取 config.yaml。
+    - providers 列表形态：拼接为逗号分隔字符串用于审计展示（与上游多 provider 链一致）。
+    返回不含 api_key（绝不回显）。
+    """
+    image = config.get("image") or {}
+    provider = os.environ.get("WEWRITE_IMAGE_PROVIDER") or image.get("provider") or ""
+    model = os.environ.get("WEWRITE_IMAGE_MODEL") or image.get("model") or ""
+    providers = image.get("providers")
+    if isinstance(providers, list) and providers:
+        provider = ", ".join(str(p.get("provider") or "") for p in providers)
+        model = ", ".join(str(p.get("model") or "") for p in providers)
+    return {"provider": provider, "model": model}
+
+
 # PUT /config 可写的白名单字段（叶字段键），secret/api_key 只写不读。
 WRITABLE_CONFIG_FIELDS = frozenset(
     {

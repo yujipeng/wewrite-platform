@@ -342,16 +342,8 @@ class JobStore:
 
     def _image_provider_model(self) -> tuple[str, str]:
         """读取本次重试生效的图片 provider/model（env 优先，其次 config.yaml）。"""
-        import os
-
-        from app.storage.config_store import ConfigStore
+        from app.storage.config_store import ConfigStore, image_effective_values
 
         cfg = ConfigStore(self.home).load_config()
-        image = cfg.get("image") or {}
-        provider = os.environ.get("WEWRITE_IMAGE_PROVIDER") or image.get("provider") or ""
-        model = os.environ.get("WEWRITE_IMAGE_MODEL") or image.get("model") or ""
-        providers = image.get("providers")
-        if isinstance(providers, list) and providers:
-            provider = ", ".join(str(p.get("provider") or "") for p in providers)
-            model = ", ".join(str(p.get("model") or "") for p in providers)
-        return provider, model
+        effective = image_effective_values(cfg)
+        return effective["provider"], effective["model"]

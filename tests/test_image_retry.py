@@ -188,3 +188,156 @@ def test_sanitize_error_redacts_bearer_and_key():
     out = _sanitize_error("Bearer abcdef1234567890 failed, api_key: sk-secret-abcdef1234567890")
     assert "abcdef1234567890" not in out
     assert "sk-secret-abcdef1234567890" not in out
+
+
+# ---------- JEE-1961 返修：密钥保密 / 状态保持 / 全路径终态 / 模型审计 ----------
+
+def _full_record(home, job_id, run_id) -> str:
+    """整份任务记录 + state.yaml 的 JSON 序列化，用于密钥零命中断言。"""
+    import json as _json
+
+    store = jobs_store.JobStore(home)
+    job = store.load(job_id)
+    state_path = os.path.join(home, "runs", run_id, "state.yaml")
+    with open(state_path, encoding="utf-8") as f:
+        state = yaml.safe_load(f)
+    return _json.dumps({"job": job, "state": state}, ensure_ascii=False)
+
+
+def test_rework_exception_path_redacts_key_in_full_record(tmp_path):
+    """返修 1：后端抛异常路径，合成密钥在整份任务记录里零命中。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png", "error": "old"},
+    ])
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+
+    image = CountingImage(raise_exc=RuntimeError("401 Incorrect API key provided: sk-synthetic123456789"))
+    result = Worker(home, image=image).run_once()
+    assert result["status"] == "failed"
+    assert result["images"][0]["status"] == "failed"
+    assert "sk-synthetic123456789" not in _full_record(home, "j-retry00001", run_id)
+
+
+def test_rework_failed_result_path_redacts_key_in_full_record(tmp_path):
+    """返修 1：失败结果返回路径，合成密钥在整份任务记录里零命中。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png", "error": "old"},
+    ])
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+
+    image = CountingImage([
+        {"output": f"runs/{run_id}/images/0.png", "ok": False,
+         "error": "Incorrect API key provided: sk-synthetic123456789"}
+    ])
+    result = Worker(home, image=image).run_once()
+    assert result["status"] == "failed"
+    assert result["images"][0]["status"] == "failed"
+    assert "sk-synthetic123456789" not in _full_record(home, "j-retry00001", run_id)
+
+
+def test_rework_preserves_publish_state_and_cover(tmp_path):
+    """返修 2：生成期间改 permissions/media_id/cover，执行后三者保持，不写 cover=None。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    state = base_state(run_id)
+    state["permissions"]["publish"] = True
+    state["images"] = {"cover": {"output": "cover.png"}, "figures": []}
+    write_state(home, run_id, state)
+
+    class StateChangingImage:
+        def generate_batch(self, items, **kwargs):
+            changed = dict(state)
+            changed["permissions"] = {"publish": False}
+            changed["media_id"] = "synthetic-new-media-id"
+            write_state(home, run_id, changed)
+            return [{"ok": False, "error": "some provider error"}]
+
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+    Worker(home, image=StateChangingImage()).run_once()
+
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        final = yaml.safe_load(f)
+    assert final["permissions"]["publish"] is False
+    assert final.get("media_id") == "synthetic-new-media-id"
+    assert final["images"].get("cover") is not None
+    assert final["images"]["cover"] == {"output": "cover.png"}
+
+
+def test_rework_budget_overflow_converges_pending(tmp_path):
+    """返修 3：预算超限路径，backend 调用 0 次，pending 图收敛为 failed，不残留。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    state = base_state(run_id, max_cost=0)
+    write_state(home, run_id, state)
+    # 预估成本 > 0 的 max_cost=0 必然超预算
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("image:\n  estimated_cost_per_image: 1\n")
+
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+    image = CountingImage([{"output": f"runs/{run_id}/images/0.png", "ok": True}])
+    result = Worker(home, image=image).run_once()
+    assert len(image.calls) == 0
+    assert result["status"] == "failed"
+    assert result["images"][0]["status"] == "failed"
+    assert result["images"][0]["error_code"] == "IMAGE_QUOTA_EXCEEDED"
+
+
+def test_rework_exception_path_error_code_nonempty_and_publish_kept(tmp_path):
+    """返修 4：异常路径 error_code 非空 + 全文无密钥 + 发布态不变（交叉约束一次判定）。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    state = base_state(run_id)
+    state["permissions"]["publish"] = True
+    state["images"] = {"cover": {"output": "cover.png"}, "figures": []}
+    write_state(home, run_id, state)
+
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+    image = CountingImage(raise_exc=RuntimeError("401 api_key=sk-synthetic123456789 invalid"))
+    result = Worker(home, image=image).run_once()
+    assert result["images"][0]["error_code"] == "IMAGE_AUTH_FAILED"
+    assert "sk-synthetic123456789" not in _full_record(home, "j-retry00001", run_id)
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        final = yaml.safe_load(f)
+    assert final["permissions"]["publish"] is True
+    assert final["images"].get("cover") is not None
+
+
+def test_rework_audit_uses_executed_config(tmp_path, monkeypatch):
+    """返修 5：排队后改 image.provider/model，审计字段等于实际调用配置。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    # 先写 config（provider A），排队
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("image:\n  provider: provider-a\n  model: model-a\n")
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+
+    # 排队后改 config（provider B）
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("image:\n  provider: provider-b\n  model: model-b\n")
+
+    image = CountingImage([{"output": f"runs/{run_id}/images/0.png", "ok": True}])
+    result = Worker(home, image=image).run_once()
+    img0 = result["images"][0]
+    # 审计字段 = 实际调用配置（provider-b），而不是排队时的 provider-a
+    assert img0["executed_provider"] == "provider-b"
+    assert img0["executed_model"] == "model-b"
+    # 排队时的请求记录仍保留（provider-a）
+    assert img0["retry_history"][0]["provider"] == "provider-a"

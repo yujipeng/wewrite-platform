@@ -26,7 +26,7 @@ import tempfile
 from app.domain import errors
 from app.storage import jobs as jobs_store
 from app.storage import paths
-from app.storage.config_store import ConfigStore
+from app.storage.config_store import ConfigStore, image_effective_values
 
 # writer 配置叶字段 → 上游 llm-write 读取的环境变量名（env 优先，其次 config.yaml）。
 _WRITER_ENV_FIELDS = (
@@ -247,7 +247,9 @@ class Worker:
         - 已 succeeded 的图不重跑（避免重复计费）；
         - 每张失败图写入脱敏后的 error 与稳定 error_code；
         - 全部成功 → job 置 succeeded；仍有失败 → job 置 failed；
-        - 不改动 job 既有的 media_id / 发布态字段。
+        - 所有退出路径（正常完成、后端抛异常、预算超限、取消）都把 pending 图
+          收敛到 failed 终态，绝不残留 pending；
+        - 不改动 job 既有的 media_id / 发布态字段，state.yaml 只在锁内更新目标图。
         """
         job_id = job["job_id"]
         run_id = job["run_id"]
@@ -267,11 +269,24 @@ class Worker:
                 self._finish_image_retry_result(job_id)
                 return
 
+            # 协作式取消：调用前检查，取消即把待处理图收敛为 failed
+            if _check_cancel(self.store, job_id):
+                self._settle_pending_as_failed(
+                    job_id, run_id, pending,
+                    code="IMAGE_PROVIDER_ERROR", error="任务已取消",
+                )
+                return
+
             # 预算约束：重试同样受 max_images / max_cost 约束，超预算在调用前失败
             img_cfg = cfg.get("image") or {}
             est = _num(img_cfg.get("estimated_cost_per_image")) * len(pending)
             if max_cost is not None and est > float(max_cost):
-                raise _worker_error("BUDGET_EXCEEDED", "重试配图的预估成本超过预算上限")
+                # 超预算：待处理图收敛为 failed，backend 调用 0 次，不残留 pending
+                self._settle_pending_as_failed(
+                    job_id, run_id, pending,
+                    code="IMAGE_QUOTA_EXCEEDED", error="图片预算超限，未发起生成",
+                )
+                return
 
             items = []
             for idx in pending:
@@ -285,6 +300,19 @@ class Worker:
             results = self.image.generate_batch(
                 items, config=cfg, max_images=max_images, max_cost=max_cost
             )
+
+            # 生成期间取消：在途调用可能已产生费用，但结果收敛为 failed 不残留 pending
+            if _check_cancel(self.store, job_id):
+                self._settle_pending_as_failed(
+                    job_id, run_id, pending,
+                    code="IMAGE_PROVIDER_ERROR", error="任务已取消",
+                )
+                return
+
+            # 执行时按实际生效配置落审计字段（env 优先 → config.yaml），
+            # 并保留排队时的请求记录（retry_history 已有排队记录）。
+            effective = image_effective_values(cfg)
+
             job = self.store.load(job_id)
             images = list(job.get("images") or [])
             for offset, idx in enumerate(pending):
@@ -294,28 +322,68 @@ class Worker:
                     img["status"] = "succeeded"
                     img["error"] = None
                     img["error_code"] = None
+                    img["executed_provider"] = effective["provider"]
+                    img["executed_model"] = effective["model"]
                 else:
                     raw_error = str(r.get("error") or "")
                     img["status"] = "failed"
                     img["error"] = _sanitize_error(raw_error)
                     img["error_code"] = classify_image_error(raw_error)
+                    img["executed_provider"] = effective["provider"]
+                    img["executed_model"] = effective["model"]
                 images[idx] = img
             job["images"] = images
-
-            # 成功图落盘缩略图可读（不伪造新图）；state.images 同步回填
-            _sync_state_images(self.home, run_id, images, state)
             self.store.write(job)
+
+            # 只更新目标图、保留发布态与 cover（锁内读最新 state）
+            _sync_state_images_locked(self.home, run_id, images)
             self._finish_image_retry_result(job_id)
         except errors.ApiError as exc:
-            self.store.finish(
-                job_id, "failed",
-                {"code": exc.code, "message": exc.message},
-            )
+            self._fail_image_retry(job_id, exc.code, exc.message)
         except Exception as exc:  # noqa: BLE001
-            self.store.finish(
-                job_id, "failed",
-                {"code": "WORKER_FAILED", "message": f"{type(exc).__name__}: {exc}"},
-            )
+            self._fail_image_retry(job_id, "WORKER_FAILED", f"{type(exc).__name__}: {exc}")
+
+    def _fail_image_retry(self, job_id: str, code: str, message: str) -> None:
+        """异常退出路径：把 pending 图收敛为 failed（分类+脱敏），job 置 failed。"""
+        job = self.store.load(job_id)
+        if job is None:
+            return
+        run_id = job.get("run_id")
+        images = list(job.get("images") or [])
+        changed = False
+        for idx, img in enumerate(images):
+            if img.get("status") == "pending":
+                images[idx] = dict(img)
+                images[idx]["status"] = "failed"
+                images[idx]["error"] = _sanitize_error(message)
+                images[idx]["error_code"] = classify_image_error(message)
+                changed = True
+        if changed:
+            job["images"] = images
+            self.store.write(job)
+            if run_id:
+                _sync_state_images_locked(self.home, run_id, images)
+        self.store.finish(
+            job_id, "failed",
+            {"code": code, "message": _sanitize_error(message)},
+        )
+
+    def _settle_pending_as_failed(self, job_id: str, run_id: str, pending: list, code: str, error: str) -> None:
+        """把指定 pending 图收敛为 failed（预算超限等调用前失败路径）。"""
+        job = self.store.load(job_id)
+        if job is None:
+            return
+        images = list(job.get("images") or [])
+        for idx in pending:
+            img = dict(images[idx])
+            img["status"] = "failed"
+            img["error"] = _sanitize_error(error)
+            img["error_code"] = code
+            images[idx] = img
+        job["images"] = images
+        self.store.write(job)
+        _sync_state_images_locked(self.home, run_id, images)
+        self._finish_image_retry_result(job_id)
 
     def _finish_image_retry_result(self, job_id: str) -> None:
         """按图片最终结果收敛 job 终态：全成功 succeeded，否则 failed。"""
@@ -546,9 +614,8 @@ class Worker:
         max_cost = visual.get("max_cost")
 
         if max_images <= 0:
-            # 无需配图
-            state["images"] = {"cover": None, "figures": []}
-            _write_run_state(self.home, run_id, state)
+            # 无需配图：保留既有 cover 与发布字段，仅清空 figures
+            _sync_state_images_locked(self.home, run_id, [])
             return
 
         # 预算超限必须在调用前失败
@@ -584,9 +651,8 @@ class Worker:
                     "error": _sanitize_error(raw_error),
                     "error_code": classify_image_error(raw_error),
                 })
-        state = _read_run_state(self.home, run_id)
-        state["images"] = {"cover": None, "figures": figures}
-        _write_run_state(self.home, run_id, state)
+        # 只更新 figures，保留既有 cover 与发布态字段（锁内读最新 state）
+        _sync_state_images_locked(self.home, run_id, figures)
 
         # job 一次性回填每张 succeeded|failed
         job["images"] = [
@@ -657,20 +723,28 @@ def classify_image_error(raw: str) -> str:
 
 
 def _sanitize_error(raw: str) -> str:
-    """错误文本脱敏，绝不保留 api_key 明文；沿用上游 _sanitize_for_log 口径。"""
+    """错误文本脱敏，绝不保留 api_key 明文（统一持久化出口）。
+
+    覆盖两类形态：
+    1. 独立密钥本体：``sk-`` / ``sk_live-`` / ``ak-`` / ``Bearer `` 等前缀后跟
+       长串（字母数字与 ``-_``），任意分隔符（冒号/等号/空格/引号/逗号等）都识别；
+    2. 字段名后跟值：``api_key`` / ``secret`` / ``token`` / ``access_token`` 后
+       任意分隔符再跟长串。
+    """
     import re
 
     text = raw if isinstance(raw, str) else str(raw)
-    # Bearer token 形态整体替换
+
+    # 独立密钥本体（前缀 + 长串），不依赖固定分隔符；含 Bearer 裸 token。
     text = re.sub(
-        r"(bearer\s+)([A-Za-z0-9._~+/=-]{9,})",
+        r"(sk_live-|sk-|ak-|bearer\s+)([A-Za-z0-9_-]{8,})",
         lambda m: m.group(1) + "[REDACTED]",
         text,
         flags=re.IGNORECASE,
     )
-    # api_key / secret / token = 值 或 : 值 形态整体替换（含空格、引号、等号、冒号分隔）
+    # 字段名 + 任意分隔符 + 长串（空格、引号、冒号、等号、逗号等）
     text = re.sub(
-        r"(api[_-]?key|secret|token|access_token)([\"'\s:=]+)([A-Za-z0-9._~+/=-]{9,})",
+        r"(api[_-]?key|secret|token|access_token)([\"'\\s:=,]+)([A-Za-z0-9._~+/=-]{8,})",
         lambda m: m.group(1) + m.group(2) + "[REDACTED]",
         text,
         flags=re.IGNORECASE,
@@ -678,21 +752,38 @@ def _sanitize_error(raw: str) -> str:
     return text
 
 
-def _sync_state_images(home: str, run_id: str, images: list, state: dict | None) -> None:
-    """把 job.images 的结果同步回 state.images.figures（保持缩略图与发布清单一致）。"""
-    if state is None:
+def _sync_state_images_locked(home: str, run_id: str, images: list) -> None:
+    """在 PlatformLock 内读最新 state.yaml，只更新目标图、保留发布态与 cover。
+
+    - 只更新 ``images.figures`` 里对应 index 的条目；
+    - 保留 ``images.cover``、``permissions``、``media_id`` 及其它发布字段；
+    - 绝不写入 ``cover=None``。
+    """
+    from app.storage.atomic import PlatformLock
+
+    with PlatformLock(home):
         state = _read_run_state(home, run_id)
-    figures = []
-    for img in images:
-        figures.append({
-            "index": img.get("index", 0),
-            "output": f"images/{img.get('index', 0)}.png",
-            "status": img.get("status"),
-            "error": img.get("error"),
-            "error_code": img.get("error_code"),
-        })
-    state["images"] = {"cover": None, "figures": figures}
-    _write_run_state(home, run_id, state)
+        images_node = state.get("images") or {}
+        figures = list(images_node.get("figures") or [])
+        by_index = {f.get("index"): f for f in figures}
+        for img in images:
+            idx = img.get("index", 0)
+            by_index[idx] = {
+                "index": idx,
+                "output": f"images/{idx}.png",
+                "status": img.get("status"),
+                "error": img.get("error"),
+                "error_code": img.get("error_code"),
+            }
+        new_figures = [by_index.get(f.get("index"), f) for f in figures]
+        for img in images:
+            idx = img.get("index", 0)
+            if idx not in {f.get("index") for f in figures}:
+                new_figures.append(by_index[idx])
+        images_node["figures"] = new_figures
+        # 保留 cover（不写入 None）；若原本无 cover 键则保持缺失
+        state["images"] = images_node
+        _write_run_state(home, run_id, state)
 
 
 def _unlink_run_file(home: str, run_id: str, relpath: str) -> None:

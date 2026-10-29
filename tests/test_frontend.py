@@ -179,3 +179,15 @@ def test_p1_new_task_entry_present(client):
     js = _app_js(client)
     assert "新建任务" in js
     assert '#/hotspots' in js
+
+
+def test_jee1963_length_warning_banner_present(client):
+    """JEE-1963：P2/P3 字数提示条（含实际与目标字数，非阻断）。"""
+    js = _app_js(client)
+    assert "length_warning" in js
+    assert "lengthWarningBanner" in js
+    # 提示文案：实际字数 + 目标字数，非阻断
+    assert "正文约 " in js
+    assert "低于目标 " in js
+    # 提供重新生成入口
+    assert "重新生成" in js

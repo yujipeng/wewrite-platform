@@ -48,6 +48,27 @@ class FakeWriter:
         return self.exit_code
 
 
+class SequenceWriter:
+    """按调用顺序返回不同结果，用于验证「自动续写一次」确实触发第二次调用。"""
+
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.calls = 0
+
+    def run(self, brief_path, output_path, env=None):
+        idx = self.calls
+        self.calls += 1
+        if idx >= len(self.contents):
+            return 4  # 超出预期次数按失败处理
+        item = self.contents[idx]
+        # item 为字符串 → 写文件返回 0；为 int → 按退出码返回
+        if isinstance(item, str):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(item)
+            return 0
+        return item
+
+
 class FakeReviewer:
     def review(self, run_id, article_text):
         return {"decision": "pass", "publishable": True, "note": "规则审稿桩"}
@@ -79,6 +100,13 @@ def write_config(home, writer: dict):
     os.makedirs(home, exist_ok=True)
     with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+
+def write_style(home, word_count):
+    """写 style.yaml 只含 word_count（模拟网页保存风格配置后的落盘结果）。"""
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "style.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({"version": 1, "word_count": word_count}, f, allow_unicode=True, sort_keys=False)
 
 
 def test_worker_consumes_queued_job_success(tmp_path):
@@ -361,3 +389,80 @@ def test_list_jobs_by_run_id(monkeypatch, tmp_path):
     r = c.get("/api/v1/jobs?run_id=not-a-valid-id")
     assert r.status_code == 400
     assert r.json()["code"] == "RUN_ID_INVALID"
+
+
+# ---------- JEE-1963：目标字数校验 + 自动续写一次 ----------
+
+def test_word_count_auto_extend_twice(tmp_path):
+    """验收第 4 条：首次 300 字、二次 2000 字 → 写作后端调用 2 次，最终正文 >=1600。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    long = "长" * 2000
+    writer = SequenceWriter([short, long])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert len(final.strip()) >= 1600
+
+
+def test_word_count_short_no_extra_call_without_style(tmp_path):
+    """验收第 7 条：style 无 word_count → 只校验 >=200，无额外调用。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    writer = SequenceWriter(["这是生成的正文。" * 40])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 1
+
+
+def test_word_count_still_short_after_extend_warns(tmp_path):
+    """验收第 5 条：两次都返回 300 字 → job 仍成功，length_warning 含实际/目标。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    writer = SequenceWriter([short, short])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    warn = st["length_warning"]
+    assert warn["actual"] == 300
+    assert warn["target_min"] == 1600
+    assert warn["target_max"] == 2400
+    # 原稿保留（300 字正文仍落盘）
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert len(final.strip()) == 300
+
+
+def test_word_count_extend_failure_keeps_original(tmp_path):
+    """验收第 6 条：首次 300 字、二次退出码 4 → 保留首次正文，job 成功，length_warning 存在。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_queued_job(home, run_id)
+    write_style(home, 2000)
+    short = "短" * 300
+    writer = SequenceWriter([short, 4])
+    worker = Worker(home, writer=writer, reviewer=FakeReviewer(), image=FakeImage([]))
+    result = worker.run_once()
+    assert result["status"] == "succeeded"
+    assert writer.calls == 2
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        st = yaml.safe_load(f)
+    assert st["length_warning"]["actual"] == 300
+    with open(os.path.join(home, "runs", run_id, "article.md"), encoding="utf-8") as f:
+        final = f.read()
+    assert "短" in final
+    assert len(final.strip()) == 300

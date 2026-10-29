@@ -163,6 +163,7 @@ def get_run_detail(home: str, run_id: str) -> dict | None:
         "publish": summary.publish,
         "artifacts": summary.artifacts,
         "last_error": state.get("last_error"),
+        "length_warning": state.get("length_warning"),
     }
 
 

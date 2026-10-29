@@ -105,6 +105,28 @@ function forbiddenState() {
   return el("div", { class: "state-block" }, ["本机工作台目录不可读，无法展示任务列表"]);
 }
 
+// JEE-1963：终稿字数低于目标时的提示条（P2 任务详情 / P3 预览页，非阻断）。
+function lengthWarningBanner(d, runId) {
+  const w = d && d.length_warning;
+  if (!w) return null;
+  const actual = w.actual == null ? "?" : w.actual;
+  const goal = w.target == null ? (w.target_min == null ? "?" : w.target_min) : w.target;
+  const tmin = w.target_min == null ? "?" : w.target_min;
+  const tmax = w.target_max == null ? "?" : w.target_max;
+  const banner = el("div", { class: "notice notice-warn" }, [
+    "正文约 " + actual + " 字，低于目标 " + goal + " 字（可接受区间 " + tmin + "–" + tmax + " 字），可重新生成一次以扩写。",
+  ]);
+  if (runId) {
+    const regenBtn = el("a", {
+      class: "btn",
+      href: "#/runs/" + runId + "/job",
+      text: "重新生成",
+    });
+    banner.appendChild(regenBtn);
+  }
+  return banner;
+}
+
 const STATUS_TEXT = {
   active: "进行中",
   failed: "失败",
@@ -490,6 +512,10 @@ function detailBody(d) {
 
   const sections = [infoCard, statusCard, el("div", { class: "preview-controls" }, [previewBtn, jobLink])];
 
+  // JEE-1963：字数低于目标的提示条（非阻断）
+  const lengthWarn = lengthWarningBanner(d, d.run_id);
+  if (lengthWarn) sections.push(lengthWarn);
+
   // P2-F5：失败/取消/未知任务的重试入口
   if (status === "failed" || status === "cancelled" || status === "unknown") {
     const retryBtn = el("button", {
@@ -722,6 +748,19 @@ async function renderPreview(runId) {
   app.appendChild(el("a", { class: "back-link", href: "#/runs/" + runId, text: "← 返回任务详情" }));
   /* 页面标题由顶栏 h1 承载 */
 
+  // 先取 run 详情，据此标注来源可用性、默认选中来源，并渲染字数提示条。
+  let detail = null;
+  try {
+    detail = await api("/api/v1/runs/" + runId);
+  } catch (_) {
+    detail = null;
+  }
+  const artifacts = (detail && detail.artifacts) || {};
+
+  // JEE-1963：字数低于目标的提示条（非阻断）
+  const lengthWarn = lengthWarningBanner(detail, runId);
+  if (lengthWarn) app.appendChild(lengthWarn);
+
   // 常驻口径提示：每个来源/主题切换后提示仍在
   app.appendChild(el("div", { class: "notice" }, [
     "本地预览，图片上传后 URL 会被替换",
@@ -731,15 +770,6 @@ async function renderPreview(runId) {
 
   const controls = el("div", { class: "preview-controls" });
   const sourceSelect = el("select");
-
-  // 先取 run 详情里的 artifacts，据此标注来源可用性并默认选中第一个实际存在的来源。
-  let artifacts = {};
-  try {
-    const detail = await api("/api/v1/runs/" + runId);
-    artifacts = detail.artifacts || {};
-  } catch (_) {
-    artifacts = {};
-  }
 
   // 3.4：来源下拉旁只读产物状态提示（与实际 artifacts 一致）
   const artStatus = el("div", { class: "muted" });

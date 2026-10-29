@@ -115,6 +115,31 @@ def image_effective_values(config: dict) -> dict:
     return {"provider": provider, "model": model}
 
 
+def image_effective_config(config: dict) -> dict:
+    """返回「env 优先 → config.yaml」合并后的完整 config，供实际调用与审计共用同一份。
+
+    - 深拷贝 config，把 ``image.provider`` / ``image.model`` 替换为 env 接管的值
+      （env 存在且非空才接管，空串 = 未设置，保留文件值）；
+    - 不删除 providers 列表（若配置了 providers 则 env 单值不覆盖，以文件列表为准）。
+    返回的 config 含 api_key（仅用于调用后端，绝不落盘/回显）。
+    """
+    import copy
+
+    merged = copy.deepcopy(config)
+    image = merged.setdefault("image", {})
+    providers = image.get("providers")
+    if isinstance(providers, list) and providers:
+        # 多 provider 链形态：env 单值不覆盖列表，直接返回合并后的 config
+        return merged
+    env_provider = os.environ.get("WEWRITE_IMAGE_PROVIDER")
+    env_model = os.environ.get("WEWRITE_IMAGE_MODEL")
+    if env_provider is not None and env_provider != "":
+        image["provider"] = env_provider
+    if env_model is not None and env_model != "":
+        image["model"] = env_model
+    return merged
+
+
 # PUT /config 可写的白名单字段（叶字段键），secret/api_key 只写不读。
 WRITABLE_CONFIG_FIELDS = frozenset(
     {

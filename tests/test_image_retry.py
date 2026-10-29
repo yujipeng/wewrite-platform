@@ -341,3 +341,128 @@ def test_rework_audit_uses_executed_config(tmp_path, monkeypatch):
     assert img0["executed_model"] == "model-b"
     # 排队时的请求记录仍保留（provider-a）
     assert img0["retry_history"][0]["provider"] == "provider-a"
+
+
+# ---------- 第三轮返修：脱敏兜底 / 只同步选中索引 / 配置与审计一致 ----------
+
+def test_sanitize_error_review_forms():
+    """返修 1：验收用具体形态，五条全部零命中。"""
+    secret = "abcdefghijk123456"
+    forms = [
+        f"401 api_key: {secret}",
+        f"api_key:  {secret}",  # 两个空格
+        f"Incorrect API key provided: {secret}",
+        f"token {secret}",
+        f'{{"api_key":"{secret}"}}',
+    ]
+    for text in forms:
+        out = _sanitize_error(text)
+        assert secret not in out, f"泄漏：{text!r} -> {out!r}"
+        assert "[REDACTED]" in out
+
+
+def test_rework_sanitize_full_record_no_key(tmp_path):
+    """返修 1：三个持久化出口（job.last_error / job.images[].error / state.yaml）零命中。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png", "error": "old"},
+    ])
+    jobs_store.JobStore(home).retry_images("j-retry00001", [0])
+    secret = "abcdefghijk123456"
+    # 异常抛出路径
+    image = CountingImage(raise_exc=RuntimeError(f"401 api_key: {secret}"))
+    Worker(home, image=image).run_once()
+    rec = _full_record(home, "j-retry00001", run_id)
+    assert secret not in rec
+    # 失败结果返回路径（重新排队再跑）
+    store = jobs_store.JobStore(home)
+    job = store.load("j-retry00001")
+    job["status"] = "failed"; job["retry_mode"] = None
+    job["images"][0]["status"] = "failed"
+    store.write(job)
+    store.retry_images("j-retry00001", [0])
+    image2 = CountingImage([{"output": f"runs/{run_id}/images/0.png", "ok": False,
+                             "error": f"Incorrect API key provided: {secret}"}])
+    Worker(home, image=image2).run_once()
+    rec2 = _full_record(home, "j-retry00001", run_id)
+    assert secret not in rec2
+
+
+def test_rework_sync_only_selected_indices(tmp_path):
+    """返修 2：只重试图 0，生成期间图 1 被改成 succeeded 且换 output，执行后图 1 保持故障桩值。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png", "error": "e0"},
+        {"index": 1, "status": "failed", "output": f"runs/{run_id}/images/1.png", "error": "e1"},
+        {"index": 2, "status": "succeeded", "output": f"runs/{run_id}/images/2.png", "error": None},
+    ])
+    # 先写 state：图 1 原始为 failed，图 2 succeeded
+    state = base_state(run_id, max_images=3)
+    state["images"] = {"cover": None, "figures": [
+        {"index": 0, "status": "failed", "output": "images/0.png", "error": "e0"},
+        {"index": 1, "status": "failed", "output": "images/1.png", "error": "e1"},
+        {"index": 2, "status": "succeeded", "output": "images/2.png", "error": None},
+    ]}
+    write_state(home, run_id, state)
+
+    class StateChangingImage:
+        def generate_batch(self, items, **kwargs):
+            # 生成期间故障桩把未选中的图 1 改成 succeeded 并换 output
+            changed = dict(state)
+            changed["images"] = {"cover": None, "figures": [
+                {"index": 0, "status": "failed", "output": "images/0.png", "error": "e0"},
+                {"index": 1, "status": "succeeded", "output": "images/new-1.png", "error": None},
+                {"index": 2, "status": "succeeded", "output": "images/2.png", "error": None},
+            ]}
+            write_state(home, run_id, changed)
+            return [{"ok": True, "output": f"runs/{run_id}/images/0.png"}]
+
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+    Worker(home, image=StateChangingImage()).run_once()
+
+    with open(os.path.join(home, "runs", run_id, "state.yaml"), encoding="utf-8") as f:
+        final = yaml.safe_load(f)
+    figs = {f["index"]: f for f in final["images"]["figures"]}
+    # 图 0 被本次重试更新为 succeeded
+    assert figs[0]["status"] == "succeeded"
+    # 图 1 保持故障桩写入的值（succeeded + new-1.png），不被旧 job 快照覆盖
+    assert figs[1]["status"] == "succeeded"
+    assert figs[1]["output"] == "images/new-1.png"
+
+
+def test_rework_config_used_for_call_and_audit(tmp_path, monkeypatch):
+    """返修 3：同一份生效配置用于实际调用与审计，执行历史记录每次实际 provider/model。"""
+    home = str(tmp_path)
+    run_id = "20261026-120000-abcdef"
+    make_failed_images_job(home, run_id, images=[
+        {"index": 0, "status": "failed", "output": f"runs/{run_id}/images/0.png"},
+    ])
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
+        f.write("image:\n  provider: file-provider\n  model: file-model\n")
+    monkeypatch.setenv("WEWRITE_IMAGE_PROVIDER", "env-provider")
+    monkeypatch.setenv("WEWRITE_IMAGE_MODEL", "env-model")
+
+    class RecordingImage:
+        def __init__(self):
+            self.calls = []
+        def generate_batch(self, items, config=None, max_images=None, max_cost=None):
+            self.calls.append(config)
+            return [{"ok": True, "output": f"runs/{run_id}/images/0.png"}]
+
+    store = jobs_store.JobStore(home)
+    store.retry_images("j-retry00001", [0])
+    image = RecordingImage()
+    result = Worker(home, image=image).run_once()
+    # 后端收到的 config.image 与审计字段完全一致（env 优先）
+    received = image.calls[0]["image"]
+    img0 = result["images"][0]
+    assert received["provider"] == "env-provider"
+    assert received["model"] == "env-model"
+    assert img0["executed_provider"] == "env-provider"
+    assert img0["executed_model"] == "env-model"
+    # 执行历史能看出每次实际用的是哪个
+    assert img0["execution_history"][-1]["provider"] == "env-provider"
+    assert img0["execution_history"][-1]["model"] == "env-model"

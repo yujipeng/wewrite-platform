@@ -26,7 +26,7 @@ import tempfile
 from app.domain import errors
 from app.storage import jobs as jobs_store
 from app.storage import paths
-from app.storage.config_store import ConfigStore, image_effective_values
+from app.storage.config_store import ConfigStore, image_effective_config, image_effective_values
 
 # writer 配置叶字段 → 上游 llm-write 读取的环境变量名（env 优先，其次 config.yaml）。
 _WRITER_ENV_FIELDS = (
@@ -297,8 +297,12 @@ class Worker:
                     "size": "article",
                 })
 
+            # 实际调用与审计共用同一份生效配置（env 优先 → config.yaml）。
+            effective_cfg = image_effective_config(cfg)
+            effective = image_effective_values(effective_cfg)
+
             results = self.image.generate_batch(
-                items, config=cfg, max_images=max_images, max_cost=max_cost
+                items, config=effective_cfg, max_images=max_images, max_cost=max_cost
             )
 
             # 生成期间取消：在途调用可能已产生费用，但结果收敛为 failed 不残留 pending
@@ -309,12 +313,9 @@ class Worker:
                 )
                 return
 
-            # 执行时按实际生效配置落审计字段（env 优先 → config.yaml），
-            # 并保留排队时的请求记录（retry_history 已有排队记录）。
-            effective = image_effective_values(cfg)
-
             job = self.store.load(job_id)
             images = list(job.get("images") or [])
+            now = jobs_store._now()
             for offset, idx in enumerate(pending):
                 r = results[offset]
                 img = dict(images[idx])
@@ -322,21 +323,31 @@ class Worker:
                     img["status"] = "succeeded"
                     img["error"] = None
                     img["error_code"] = None
-                    img["executed_provider"] = effective["provider"]
-                    img["executed_model"] = effective["model"]
                 else:
                     raw_error = str(r.get("error") or "")
                     img["status"] = "failed"
                     img["error"] = _sanitize_error(raw_error)
                     img["error_code"] = classify_image_error(raw_error)
-                    img["executed_provider"] = effective["provider"]
-                    img["executed_model"] = effective["model"]
+                img["executed_provider"] = effective["provider"]
+                img["executed_model"] = effective["model"]
+                # 每次实际使用的 provider/model 追加进该图执行历史
+                history = list(img.get("execution_history") or [])
+                history.append({
+                    "provider": effective["provider"],
+                    "model": effective["model"],
+                    "at": now,
+                })
+                img["execution_history"] = history
                 images[idx] = img
             job["images"] = images
             self.store.write(job)
 
-            # 只更新目标图、保留发布态与 cover（锁内读最新 state）
-            _sync_state_images_locked(self.home, run_id, images)
+            # 只同步本次选中索引（pending），未选中索引以锁内最新 state 为准
+            updates = [{"index": idx, "status": images[idx]["status"],
+                        "error": images[idx].get("error"),
+                        "error_code": images[idx].get("error_code")}
+                       for idx in pending]
+            _sync_state_images_locked(self.home, run_id, updates)
             self._finish_image_retry_result(job_id)
         except errors.ApiError as exc:
             self._fail_image_retry(job_id, exc.code, exc.message)
@@ -350,19 +361,21 @@ class Worker:
             return
         run_id = job.get("run_id")
         images = list(job.get("images") or [])
-        changed = False
+        changed: list = []
         for idx, img in enumerate(images):
             if img.get("status") == "pending":
                 images[idx] = dict(img)
                 images[idx]["status"] = "failed"
                 images[idx]["error"] = _sanitize_error(message)
                 images[idx]["error_code"] = classify_image_error(message)
-                changed = True
+                changed.append({"index": idx, "status": "failed",
+                                "error": images[idx]["error"],
+                                "error_code": images[idx]["error_code"]})
         if changed:
             job["images"] = images
             self.store.write(job)
             if run_id:
-                _sync_state_images_locked(self.home, run_id, images)
+                _sync_state_images_locked(self.home, run_id, changed)
         self.store.finish(
             job_id, "failed",
             {"code": code, "message": _sanitize_error(message)},
@@ -374,15 +387,18 @@ class Worker:
         if job is None:
             return
         images = list(job.get("images") or [])
+        updates = []
         for idx in pending:
             img = dict(images[idx])
             img["status"] = "failed"
             img["error"] = _sanitize_error(error)
             img["error_code"] = code
             images[idx] = img
+            updates.append({"index": idx, "status": "failed",
+                            "error": img["error"], "error_code": code})
         job["images"] = images
         self.store.write(job)
-        _sync_state_images_locked(self.home, run_id, images)
+        _sync_state_images_locked(self.home, run_id, updates)
         self._finish_image_retry_result(job_id)
 
     def _finish_image_retry_result(self, job_id: str) -> None:
@@ -725,37 +741,64 @@ def classify_image_error(raw: str) -> str:
 def _sanitize_error(raw: str) -> str:
     """错误文本脱敏，绝不保留 api_key 明文（统一持久化出口）。
 
-    覆盖两类形态：
-    1. 独立密钥本体：``sk-`` / ``sk_live-`` / ``ak-`` / ``Bearer `` 等前缀后跟
-       长串（字母数字与 ``-_``），任意分隔符（冒号/等号/空格/引号/逗号等）都识别；
-    2. 字段名后跟值：``api_key`` / ``secret`` / ``token`` / ``access_token`` 后
-       任意分隔符再跟长串。
+    覆盖：
+    1. 独立密钥本体：``sk-`` / ``sk_live-`` / ``ak-`` / ``Bearer `` 前缀 + 长串；
+    2. 字段名后跟值：``api_key`` / ``api key`` / ``apikey`` / ``secret`` /
+       ``token`` / ``access_token`` / ``key`` 字段名之后（允许夹说明文字）的
+       首个「密钥形态」长串。
+    密钥形态判定：长度 >= 8 且（含数字 或 长度 >= 16），避免把 provided 等
+    普通英文词误当密钥。
     """
     import re
 
     text = raw if isinstance(raw, str) else str(raw)
 
-    # 独立密钥本体（前缀 + 长串），不依赖固定分隔符；含 Bearer 裸 token。
+    # 1) 独立密钥本体（前缀 + 长串），任意分隔符都不依赖
     text = re.sub(
         r"(sk_live-|sk-|ak-|bearer\s+)([A-Za-z0-9_-]{8,})",
         lambda m: m.group(1) + "[REDACTED]",
         text,
         flags=re.IGNORECASE,
     )
-    # 字段名 + 任意分隔符 + 长串（空格、引号、冒号、等号、逗号等）
-    text = re.sub(
-        r"(api[_-]?key|secret|token|access_token)([\"'\\s:=,]+)([A-Za-z0-9._~+/=-]{8,})",
-        lambda m: m.group(1) + m.group(2) + "[REDACTED]",
-        text,
-        flags=re.IGNORECASE,
+
+    # 2) 字段名锚点 + 其后首个密钥形态长串（允许零到多个分隔符/空白与说明文字）
+    field_re = re.compile(
+        r"(api[_-]?key|api\s+key|secret|token|access_token|\bkey\b)",
+        re.IGNORECASE,
     )
-    return text
+    token_re = re.compile(r"[A-Za-z0-9._~+/=-]{8,}")
+
+    def _is_secret_like(tok: str) -> bool:
+        return any(c.isdigit() for c in tok) or len(tok) >= 16
+
+    out: list[str] = []
+    pos = 0
+    for m in field_re.finditer(text):
+        if m.start() < pos:
+            continue  # 已被前一个字段的窗口覆盖，跳过
+        out.append(text[pos:m.end()])
+        window = text[m.end():m.end() + 120]
+        matched = None
+        for tm in token_re.finditer(window):
+            if _is_secret_like(tm.group(0)):
+                matched = tm
+                break
+        if matched is not None:
+            out.append(window[:matched.start()] + "[REDACTED]" + window[matched.end():])
+        else:
+            out.append(window)
+        pos = m.end() + len(window)
+    out.append(text[pos:])
+    return "".join(out)
 
 
-def _sync_state_images_locked(home: str, run_id: str, images: list) -> None:
-    """在 PlatformLock 内读最新 state.yaml，只更新目标图、保留发布态与 cover。
+def _sync_state_images_locked(home: str, run_id: str, updates: list) -> None:
+    """在 PlatformLock 内读最新 state.yaml，只更新本次处理的目标图，保留发布态与 cover。
 
-    - 只更新 ``images.figures`` 里对应 index 的条目；
+    - ``updates`` 只含本次实际处理的 index（图片重试= pending 索引；视觉= 本次生成索引），
+      每个元素为 ``{index, status, error, error_code}``；
+    - 未出现在 ``updates`` 的索引一律以锁内读到的**最新** state 为准，绝不把 job 里的
+      旧快照写回；
     - 保留 ``images.cover``、``permissions``、``media_id`` 及其它发布字段；
     - 绝不写入 ``cover=None``。
     """
@@ -766,18 +809,21 @@ def _sync_state_images_locked(home: str, run_id: str, images: list) -> None:
         images_node = state.get("images") or {}
         figures = list(images_node.get("figures") or [])
         by_index = {f.get("index"): f for f in figures}
-        for img in images:
-            idx = img.get("index", 0)
+        touched = set()
+        for up in updates:
+            idx = up.get("index", 0)
+            touched.add(idx)
             by_index[idx] = {
                 "index": idx,
                 "output": f"images/{idx}.png",
-                "status": img.get("status"),
-                "error": img.get("error"),
-                "error_code": img.get("error_code"),
+                "status": up.get("status"),
+                "error": up.get("error"),
+                "error_code": up.get("error_code"),
             }
+        # 已存在的 figures 保持原位（未选中索引维持最新 state 值）
         new_figures = [by_index.get(f.get("index"), f) for f in figures]
-        for img in images:
-            idx = img.get("index", 0)
+        # 本次新出现的索引追加到末尾
+        for idx in sorted(touched):
             if idx not in {f.get("index") for f in figures}:
                 new_figures.append(by_index[idx])
         images_node["figures"] = new_figures

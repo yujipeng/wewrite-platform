@@ -26,16 +26,11 @@ import tempfile
 from app.domain import errors
 from app.storage import jobs as jobs_store
 from app.storage import paths
-from app.storage.config_store import ConfigStore, image_effective_config, image_effective_values
-
-# writer 配置叶字段 → 上游 llm-write 读取的环境变量名（env 优先，其次 config.yaml）。
-_WRITER_ENV_FIELDS = (
-    ("api_key", "WEWRITE_WRITER_API_KEY"),
-    ("provider", "WEWRITE_WRITER_PROVIDER"),
-    ("base_url", "WEWRITE_WRITER_BASE_URL"),
-    ("model", "WEWRITE_WRITER_MODEL"),
-    ("temperature", "WEWRITE_WRITER_TEMPERATURE"),
-    ("max_tokens", "WEWRITE_WRITER_MAX_TOKENS"),
+from app.storage.config_store import (
+    ConfigStore,
+    WRITER_ENV_OF,
+    image_effective_config,
+    image_effective_values,
 )
 
 
@@ -45,12 +40,15 @@ def _writer_env(config: dict | None) -> dict[str, str]:
     llm-write 只读环境变量，因此 worker 启动子进程时必须把 env 优先、其次
     ``config.yaml`` 的最终值显式注入 ``env``，否则网页改了 model 也不生效。
     不覆盖已由环境变量注入的值（env 优先是安全底线，config 不越权）。
+
+    字段 → 环境变量映射复用 ``config_store.WRITER_ENV_OF`` 的唯一来源，
+    不再在 executor 里单独维护一份。
     """
     env: dict[str, str] = {}
     if config is None:
         return env
     writer = config.get("writer") or {}
-    for key, env_var in _WRITER_ENV_FIELDS:
+    for key, env_var in WRITER_ENV_OF.items():
         if env_var in os.environ:
             continue  # 环境变量接管，config 不覆盖
         value = writer.get(key)

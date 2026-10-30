@@ -214,6 +214,33 @@ def test_writer_env_maps_fields_without_overriding_environment(tmp_path, monkeyp
     assert env2["WEWRITE_WRITER_BASE_URL"] == "https://x"
 
 
+def test_writer_env_uses_config_store_single_source(monkeypatch):
+    """映射一致性回归：executor._writer_env 注入的字段集合与 config_store 映射相等。
+
+    writer 字段 → 环境变量的映射必须以 config_store 为唯一来源；新增字段只改
+    config_store.WRITER_ENV_OF 时，本用例会因 executor 漏同步而失败。
+    """
+    from app.storage import config_store
+
+    # 清掉可能残留的 WEWRITE_WRITER_* 环境变量，避免 env 优先导致字段被跳过
+    for env_var in config_store.WRITER_ENV_OF.values():
+        monkeypatch.delenv(env_var, raising=False)
+
+    # 给每个字段一个非空 config 值，使 _writer_env 实际注入每个字段
+    full_config = {
+        "writer": {
+            "api_key": "sk-test",
+            "provider": "p",
+            "base_url": "https://x",
+            "model": "m",
+            "temperature": 0.5,
+            "max_tokens": 1000,
+        }
+    }
+    env = _writer_env(full_config)
+    assert set(env.keys()) == set(config_store.WRITER_ENV_OF.values())
+
+
 def test_writer_backend_passes_env_to_subprocess(tmp_path, monkeypatch):
     """WriterBackend.run 把注入的 env 传给子进程（不因空 env 丢失父进程环境）。"""
     backend = WriterBackend()

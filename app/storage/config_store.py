@@ -43,26 +43,23 @@ ENV_FIELD_MAP: dict[str, tuple[str, ...]] = {
     "WEWRITE_WRITER_MAX_TOKENS": ("writer", "max_tokens"),
 }
 
-# writer 运行时字段 → 环境变量名。与 ENV_FIELD_MAP 的 writer.* 段、worker
-# `_writer_env()` 的 `_WRITER_ENV_FIELDS` 保持同一套口径（env 优先，其次 config.yaml）。
-WRITER_ENV_OF: dict[str, str] = {
-    "api_key": "WEWRITE_WRITER_API_KEY",
-    "provider": "WEWRITE_WRITER_PROVIDER",
-    "base_url": "WEWRITE_WRITER_BASE_URL",
-    "model": "WEWRITE_WRITER_MODEL",
-    "temperature": "WEWRITE_WRITER_TEMPERATURE",
-    "max_tokens": "WEWRITE_WRITER_MAX_TOKENS",
-}
+# writer 运行时字段的**唯一**映射来源：字段名 → (环境变量名, 上游默认值)。
+# worker `_writer_env()`、writer 适配器与 config 投影共用这一份，避免两处漂移；
+# 与 ENV_FIELD_MAP 的 writer.* 段保持同一套口径（env 优先，其次 config.yaml）。
+WRITER_FIELDS: tuple[tuple[str, str, object], ...] = (
+    ("api_key", "WEWRITE_WRITER_API_KEY", ""),
+    ("provider", "WEWRITE_WRITER_PROVIDER", "deepseek"),
+    ("base_url", "WEWRITE_WRITER_BASE_URL", "https://api.deepseek.com"),
+    ("model", "WEWRITE_WRITER_MODEL", "deepseek-chat"),
+    ("temperature", "WEWRITE_WRITER_TEMPERATURE", 1.0),
+    ("max_tokens", "WEWRITE_WRITER_MAX_TOKENS", 4000),
+)
 
-# writer 运行时字段默认值（env 与 config.yaml 都没有时才生效的上游默认）。
-WRITER_DEFAULTS: dict = {
-    "provider": "deepseek",
-    "model": "deepseek-chat",
-    "base_url": "https://api.deepseek.com",
-    "temperature": 1.0,
-    "max_tokens": 4000,
-    "api_key": "",
-}
+# 字段名 → 环境变量名（自 WRITER_FIELDS 派生，保留既有引用兼容）。
+WRITER_ENV_OF: dict[str, str] = {field: env for field, env, _default in WRITER_FIELDS}
+
+# 字段名 → 上游默认值（自 WRITER_FIELDS 派生；env 与 config.yaml 都没有时才生效）。
+WRITER_DEFAULTS: dict = {field: default for field, _env, default in WRITER_FIELDS}
 
 
 def writer_effective_values(config: dict) -> dict:
